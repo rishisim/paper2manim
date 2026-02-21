@@ -1,6 +1,7 @@
 import os
 import subprocess
 
+
 def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -> dict:
     """
     Stitches an mp4 video and a wav/mp3 audio file together using ffmpeg.
@@ -21,19 +22,28 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
     cmd = [
         "ffmpeg",
         "-y",
-        "-i", video_path,
-        "-i", audio_path,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
-        "-movflags", "+faststart",
-        output_path
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        output_path,
     ]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
-            return {"success": True, "output_path": output_path, "error": None, "command": " ".join(cmd)}
+            return {
+                "success": True,
+                "output_path": output_path,
+                "error": None,
+                "command": " ".join(cmd),
+            }
         return {
             "success": False,
             "output_path": None,
@@ -41,4 +51,9 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
             "command": " ".join(cmd),
         }
     except Exception as exc:
-        return {"success": False, "output_path": None, "error": str(exc), "command": " ".join(cmd)}
+        return {
+            "success": False,
+            "output_path": None,
+            "error": str(exc),
+            "command": " ".join(cmd),
+        }
