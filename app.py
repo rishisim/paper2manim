@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import html
 from dotenv import load_dotenv
 
 # Load env vars
@@ -43,6 +44,15 @@ if "concept" not in st.session_state:
 def get_css_toggle():
     return """
     <style>
+    /* Toggle behavior */
+    .stApp:has(#css-toggle:not(:checked)) .code-view-container {
+        display: none !important;
+    }
+    .stApp:has(#css-toggle:checked) .skeleton-view-container {
+        display: none !important;
+    }
+
+    /* Toggle switch */
     .switch-wrapper {
         display: flex;
         align-items: center;
@@ -80,24 +90,6 @@ def get_css_toggle():
     }
     input:checked + .slider { background-color: #FF4B4B; }
     input:checked + .slider:before { transform: translateX(16px); }
-
-    /* Hide code views when unchecked: look for the element containing .code-marker, and hide its next sibling (the expander) */
-    .stApp:has(#css-toggle:not(:checked)) div[data-testid="stElementContainer"]:has(.code-marker) + div[data-testid="stElementContainer"],
-    .stApp:has(#css-toggle:not(:checked)) .element-container:has(.code-marker) + .element-container { 
-        display: none !important; 
-    }
-    
-    /* Also hide the marker itself to prevent empty spacing */
-    .stApp:has(#css-toggle:not(:checked)) div[data-testid="stElementContainer"]:has(.code-marker),
-    .stApp:has(#css-toggle:not(:checked)) .element-container:has(.code-marker) { 
-        display: none !important; 
-    }
-
-    /* Hide skeleton when checked */
-    .stApp:has(#css-toggle:checked) div[data-testid="stElementContainer"]:has(.skeleton-view-container),
-    .stApp:has(#css-toggle:checked) .element-container:has(.skeleton-view-container) { 
-        display: none !important; 
-    }
     </style>
     <div class="switch-wrapper">
         <label class="switch">
@@ -135,6 +127,42 @@ def get_skeleton_html():
       <div class="skeleton-text" style="width: 60%;"></div>
       <div class="skeleton-text" style="width: 80%;"></div>
       <div class="skeleton-text" style="width: 50%;"></div>
+    </div>
+    """
+
+
+def get_code_view_html(code: str) -> str:
+    safe_code = html.escape(code)
+    return f"""
+    <style>
+    .code-view-container {{
+        border: 1px solid rgba(49, 51, 63, 0.2);
+        border-radius: 0.5rem;
+        overflow: hidden;
+    }}
+    .code-view-header {{
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: #666;
+        background: rgba(169, 169, 169, 0.06);
+        padding: 0.5rem 0.75rem;
+        border-bottom: 1px solid rgba(49, 51, 63, 0.1);
+    }}
+    .code-view-container pre {{
+        margin: 0;
+        padding: 0.85rem;
+        max-height: 420px;
+        overflow: auto;
+        white-space: pre;
+        font-family: "Source Code Pro", Menlo, Monaco, Consolas, "Courier New", monospace;
+        font-size: 0.83rem;
+        line-height: 1.35;
+        background: rgba(249, 250, 251, 0.7);
+    }}
+    </style>
+    <div class="code-view-container">
+      <div class="code-view-header">Live Manim Script</div>
+      <pre><code>{safe_code}</code></pre>
     </div>
     """
 
@@ -211,27 +239,29 @@ if generate_pressed and concept:
 
             final_video_path = None
             current_code = ""
+            last_status = None
+            status_placeholder = st.empty()
+            error_placeholder = st.empty()
+            code_placeholder = st.empty()
 
             # Always render the skeleton (CSS handles hiding it if toggle is checked)
             st.markdown(get_skeleton_html(), unsafe_allow_html=True)
 
             for update in coder_generator:
-                st.write(f"**Step**: {update['status']}")
+                if update["status"] != last_status:
+                    status_placeholder.markdown(f"**Step**: {update['status']}")
+                    last_status = update["status"]
 
                 if "error" in update and update["error"]:
-                    with st.expander("Show Diagnostic Error Logs"):
-                        st.code(update["error"], language="bash")
+                    with error_placeholder.container():
+                        with st.expander("Show Diagnostic Error Logs"):
+                            st.code(update["error"], language="bash")
 
                 if "code" in update:
                     current_code = update["code"]
-                    # Add our hidden marker right before the code expander
-                    st.markdown(
-                        "<div class='code-marker' style='display:none;'></div>",
-                        unsafe_allow_html=True,
+                    code_placeholder.markdown(
+                        get_code_view_html(current_code), unsafe_allow_html=True
                     )
-                    # Create the actual code expander
-                    with st.expander("View Code Written So Far", expanded=False):
-                        st.code(current_code, language="python")
 
                 if update.get("final"):
                     final_video_path = update.get("video_path")

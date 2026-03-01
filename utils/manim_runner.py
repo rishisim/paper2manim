@@ -16,12 +16,20 @@ def run_manim_code(code: str, class_name: str) -> dict:
         with open(script_path, "w") as f:
             f.write(code)
             
-        # The command to execute Manim
-        # We use -qm for medium quality/speed. Add --format=mp4.
-        cmd = ["manim", "-qm", "--media_dir", temp_dir, script_path, class_name]
+        # The command to execute Manim.
+        # Default to low quality for faster iterative repair loops.
+        quality_flag = os.getenv("MANIM_QUALITY_FLAG", "-ql")
+        timeout_seconds = int(os.getenv("MANIM_RENDER_TIMEOUT_SECONDS", "120"))
+        cmd = ["manim", quality_flag, "--media_dir", temp_dir, script_path, class_name]
         
         try:
-            result = subprocess.run(cmd, cwd=temp_dir, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(
+                cmd,
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
             if result.returncode == 0:
                 # Find the generated mp4 video
                 video_dir = os.path.join(temp_dir, "videos", "scene", "480p15") # -qm is 480p15 or 720p30 depending on version, let's just find the file
