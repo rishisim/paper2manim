@@ -4,7 +4,7 @@ import tempfile
 import json
 import ast
 
-def run_manim_code(code: str, class_name: str) -> dict:
+def run_manim_code(code: str, class_name: str, quality_flag: str = "-ql", timeout_seconds: int = 120) -> dict:
     """
     Executes a Manim python script in a temporary directory and captures output.
     Returns a dict with 'success', 'video_path', and 'error' strings.
@@ -17,9 +17,12 @@ def run_manim_code(code: str, class_name: str) -> dict:
             f.write(code)
             
         # The command to execute Manim.
-        # Default to low quality for faster iterative repair loops.
-        quality_flag = os.getenv("MANIM_QUALITY_FLAG", "-ql")
-        timeout_seconds = int(os.getenv("MANIM_RENDER_TIMEOUT_SECONDS", "120"))
+        # Fallback to env variables if not provided
+        if not quality_flag:
+            quality_flag = os.getenv("MANIM_QUALITY_FLAG", "-ql")
+        if timeout_seconds <= 0:
+            timeout_seconds = int(os.getenv("MANIM_RENDER_TIMEOUT_SECONDS", "120"))
+            
         cmd = ["manim", quality_flag, "--media_dir", temp_dir, script_path, class_name]
         
         try:

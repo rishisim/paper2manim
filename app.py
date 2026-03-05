@@ -220,6 +220,11 @@ if generate_pressed and concept:
                 st.code(str(exc), language="text")
                 st.stop()
             st.json(storyboard)
+            if storyboard.get("clarifying_questions"):
+                st.warning("The planner has some clarifying questions:")
+                for q in storyboard["clarifying_questions"]:
+                    st.write(f"- {q}")
+                st.info("You can stop here and adjust your prompt, or continue if you're happy with the current plan.")
             plan_status.update(label="✅ Storyboard planned", state="complete")
 
         with st.status("🎙️ Generating voiceover...") as rtts_status:
@@ -244,14 +249,17 @@ if generate_pressed and concept:
                         st.code(tts_result["error"], language="text")
                 st.stop()
             audio_path = tts_result.get("audio_path", audio_path)
-            st.audio(audio_path, format="audio/wav")
-            rtts_status.update(label="✅ Voiceover generated", state="complete")
+            audio_duration = tts_result.get("duration", 0.0)
 
         with st.status("💻 Coding Manim script (Agentic Loop)...") as coder_status:
             # Render our custom HTML CSS-only toggle
             st.markdown(get_css_toggle(), unsafe_allow_html=True)
 
-            coder_generator = run_coder_agent(storyboard["visual_instructions"])
+            coder_generator = run_coder_agent(
+                storyboard["visual_instructions"],
+                audio_script=storyboard.get("audio_script", ""),
+                audio_duration=audio_duration
+            )
 
             final_video_path = None
             current_code = ""

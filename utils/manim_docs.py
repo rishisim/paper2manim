@@ -108,7 +108,7 @@ def _fetch_raw(path: str) -> Optional[str]:
     """Fetch a single file from the Manim repo.  Returns None on failure."""
     url = f"{REPO_BASE}/{path}"
     try:
-        resp = requests.get(url, timeout=_FETCH_TIMEOUT)
+        resp = requests.get(url, timeout=5) # Reduced timeout to 5s
         resp.raise_for_status()
         return resp.text
     except Exception:

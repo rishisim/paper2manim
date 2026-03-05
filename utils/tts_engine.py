@@ -92,6 +92,25 @@ def _extract_inline_audio(response) -> Tuple[Optional[bytes], Optional[str]]:
             return raw_data, getattr(inline_data, "mime_type", None)
     return None, None
 
+def _get_audio_duration(path: str) -> Optional[float]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return float(result.stdout.strip())
+    except Exception:
+        pass
+    return None
+
 def generate_voiceover(text: str, output_path: str) -> Iterator[dict]:
     """
     Generates a voiceover from text using Gemini's audio capability.
@@ -149,8 +168,10 @@ def generate_voiceover(text: str, output_path: str) -> Iterator[dict]:
         if not _is_valid_audio_file(output_path):
             yield {"final": True, "success": False, "audio_path": None, "mime_type": mime_type, "error": "Generated audio file is invalid after normalization."}
             return
+            
+        duration = _get_audio_duration(output_path)
 
-        yield {"final": True, "success": True, "audio_path": output_path, "mime_type": mime_type, "error": None}
+        yield {"final": True, "success": True, "audio_path": output_path, "mime_type": mime_type, "duration": duration, "error": None}
     except Exception as exc:
         gemini_error = str(exc)
         yield {"status": "Gemini TTS failed, falling back to gTTS..."}
@@ -171,6 +192,7 @@ def generate_voiceover(text: str, output_path: str) -> Iterator[dict]:
                 yield {"final": True, "success": False, "audio_path": None, "mime_type": None, "error": f"Gemini TTS failed: {gemini_error}. gTTS fallback produced invalid audio."}
                 return
 
-            yield {"final": True, "success": True, "audio_path": output_path, "mime_type": "audio/mpeg", "error": f"Gemini TTS failed, used gTTS fallback: {gemini_error}"}
+            duration = _get_audio_duration(output_path)
+            yield {"final": True, "success": True, "audio_path": output_path, "mime_type": "audio/mpeg", "duration": duration, "error": f"Gemini TTS failed, used gTTS fallback: {gemini_error}"}
         except Exception as fallback_exc:
             yield {"final": True, "success": False, "audio_path": None, "mime_type": None, "error": f"Gemini TTS failed: {gemini_error}. gTTS fallback unavailable/failed: {fallback_exc}"}

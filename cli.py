@@ -303,6 +303,16 @@ def main() -> None:
         # Show storyboard in panels
         _print_storyboard(storyboard)
 
+        if storyboard.get("clarifying_questions"):
+            console.print()
+            console.print(Panel(
+                "\n".join(f"  [white]•[/white] {q}" for q in storyboard["clarifying_questions"]),
+                title="[bold yellow]Clarifying Questions[/bold yellow]",
+                title_align="left",
+                border_style=WARN,
+                padding=(1, 2),
+            ))
+
         ok = Confirm.ask(f"  [{ACCENT}]?[/{ACCENT}] [bold]Proceed with this storyboard?[/bold]", default=True)
         if ok:
             break
@@ -342,10 +352,16 @@ def main() -> None:
     spinner = _Spinner("starting…")
     spinner.start()
 
+    audio_duration = 0.0
+    if not args.skip_audio and 'tts_result' in locals() and tts_result:
+        audio_duration = tts_result.get("duration", 0.0)
+
     try:
         for update in run_coder_agent(
             storyboard["visual_instructions"],
             max_retries=max(0, args.max_retries),
+            audio_script=storyboard.get("audio_script", ""),
+            audio_duration=audio_duration
         ):
             status = update.get("status", "")
             if status:
