@@ -1,14 +1,18 @@
 import os
 import subprocess
+from typing import Iterator
 
 
-def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -> dict:
+def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -> Iterator[dict]:
     """
     Stitches an mp4 video and a wav/mp3 audio file together using ffmpeg.
+    Yields status updates and finally a result dictionary.
     """
     # Ensure paths exist
+    yield {"status": "Checking input files for stitching..."}
     if not os.path.exists(video_path) or not os.path.exists(audio_path):
-        return {
+        yield {
+            "final": True,
             "success": False,
             "output_path": None,
             "error": (
@@ -18,6 +22,7 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
             ),
             "command": None,
         }
+        return
 
     cmd = [
         "ffmpeg",
@@ -35,23 +40,28 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
         output_path,
     ]
 
+    yield {"status": "Executing ffmpeg command to stitch audio tracks..."}
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
-            return {
+            yield {
+                "final": True,
                 "success": True,
                 "output_path": output_path,
                 "error": None,
                 "command": " ".join(cmd),
             }
-        return {
+            return
+        yield {
+            "final": True,
             "success": False,
             "output_path": None,
             "error": result.stderr or result.stdout,
             "command": " ".join(cmd),
         }
     except Exception as exc:
-        return {
+        yield {
+            "final": True,
             "success": False,
             "output_path": None,
             "error": str(exc),

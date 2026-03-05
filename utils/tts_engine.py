@@ -3,7 +3,7 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Iterator
 from google import genai
 from google.genai import types
 
@@ -92,14 +92,16 @@ def _extract_inline_audio(response) -> Tuple[Optional[bytes], Optional[str]]:
             return raw_data, getattr(inline_data, "mime_type", None)
     return None, None
 
-def generate_voiceover(text: str, output_path: str) -> dict:
+def generate_voiceover(text: str, output_path: str) -> Iterator[dict]:
     """
     Generates a voiceover from text using Gemini's audio capability.
     Assumes GEMINI_API_KEY is natively available in the environment.
     """
     try:
+        yield {"status": "Initializing Gemini TTS client..."}
         client = genai.Client()
 
+        yield {"status": "Requesting audio generation from LLM..."}
         response = client.models.generate_content(
             model="gemini-2.5-flash-preview-tts",
             contents=f"Please read the following text aloud in a clear, educational, and engaging tone, like a lecture: {text}",
@@ -115,47 +117,60 @@ def generate_voiceover(text: str, output_path: str) -> dict:
             )
         )
 
+        yield {"status": "Extracting audio data from response..."}
         audio_bytes, mime_type = _extract_inline_audio(response)
         if not audio_bytes:
-            return {"success": False, "audio_path": None, "mime_type": None, "error": "No audio data found in Gemini response."}
+            yield {"final": True, "success": False, "audio_path": None, "mime_type": None, "error": "No audio data found in Gemini response."}
+            return
 
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = os.path.join(temp_dir, "tts_audio_input.bin")
             with open(input_path, "wb") as f:
                 f.write(audio_bytes)
 
+            yield {"status": f"Normalizing {mime_type or 'unknown'} audio format..."}
             if mime_type and "audio/pcm" in mime_type.lower():
                 success, error = _wrap_pcm_to_wav(input_path, output_path, _parse_sample_rate(mime_type))
                 if not success:
-                    return {"success": False, "audio_path": None, "mime_type": mime_type, "error": f"Failed to wrap PCM audio to WAV: {error}"}
+                    yield {"final": True, "success": False, "audio_path": None, "mime_type": mime_type, "error": f"Failed to wrap PCM audio to WAV: {error}"}
+                    return
             elif _looks_like_container_audio(audio_bytes):
                 success, error = _normalize_to_wav(input_path, output_path)
                 if not success:
-                    return {"success": False, "audio_path": None, "mime_type": mime_type, "error": f"Failed to normalize container audio: {error}"}
+                    yield {"final": True, "success": False, "audio_path": None, "mime_type": mime_type, "error": f"Failed to normalize container audio: {error}"}
+                    return
             else:
                 success, error = _wrap_pcm_to_wav(input_path, output_path, _parse_sample_rate(mime_type))
                 if not success:
-                    return {"success": False, "audio_path": None, "mime_type": mime_type, "error": f"Unknown audio format and PCM wrapping failed: {error}"}
+                    yield {"final": True, "success": False, "audio_path": None, "mime_type": mime_type, "error": f"Unknown audio format and PCM wrapping failed: {error}"}
+                    return
 
+        yield {"status": "Validating finalized audio file..."}
         if not _is_valid_audio_file(output_path):
-            return {"success": False, "audio_path": None, "mime_type": mime_type, "error": "Generated audio file is invalid after normalization."}
+            yield {"final": True, "success": False, "audio_path": None, "mime_type": mime_type, "error": "Generated audio file is invalid after normalization."}
+            return
 
-        return {"success": True, "audio_path": output_path, "mime_type": mime_type, "error": None}
+        yield {"final": True, "success": True, "audio_path": output_path, "mime_type": mime_type, "error": None}
     except Exception as exc:
         gemini_error = str(exc)
+        yield {"status": "Gemini TTS failed, falling back to gTTS..."}
         try:
             from gtts import gTTS
             with tempfile.TemporaryDirectory() as temp_dir:
                 fallback_mp3 = os.path.join(temp_dir, "fallback.mp3")
                 tts = gTTS(text)
+                yield {"status": "Generating fallback mp3..."}
                 tts.save(fallback_mp3)
+                yield {"status": "Normalizing fallback audio..."}
                 success, error = _normalize_to_wav(fallback_mp3, output_path)
                 if not success:
-                    return {"success": False, "audio_path": None, "mime_type": None, "error": f"Gemini TTS failed: {gemini_error}. gTTS fallback failed: {error}"}
+                    yield {"final": True, "success": False, "audio_path": None, "mime_type": None, "error": f"Gemini TTS failed: {gemini_error}. gTTS fallback failed: {error}"}
+                    return
 
             if not _is_valid_audio_file(output_path):
-                return {"success": False, "audio_path": None, "mime_type": None, "error": f"Gemini TTS failed: {gemini_error}. gTTS fallback produced invalid audio."}
+                yield {"final": True, "success": False, "audio_path": None, "mime_type": None, "error": f"Gemini TTS failed: {gemini_error}. gTTS fallback produced invalid audio."}
+                return
 
-            return {"success": True, "audio_path": output_path, "mime_type": "audio/mpeg", "error": f"Gemini TTS failed, used gTTS fallback: {gemini_error}"}
+            yield {"final": True, "success": True, "audio_path": output_path, "mime_type": "audio/mpeg", "error": f"Gemini TTS failed, used gTTS fallback: {gemini_error}"}
         except Exception as fallback_exc:
-            return {"success": False, "audio_path": None, "mime_type": None, "error": f"Gemini TTS failed: {gemini_error}. gTTS fallback unavailable/failed: {fallback_exc}"}
+            yield {"final": True, "success": False, "audio_path": None, "mime_type": None, "error": f"Gemini TTS failed: {gemini_error}. gTTS fallback unavailable/failed: {fallback_exc}"}

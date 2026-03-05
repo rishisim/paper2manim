@@ -204,7 +204,15 @@ if generate_pressed and concept:
     with st.status("Generating video pipeline...", expanded=True) as status:
         with st.status("🧠 Researching and planning storyboard...") as plan_status:
             try:
-                storyboard = plan_video_concept(concept)
+                storyboard_generator = plan_video_concept(concept)
+                storyboard = None
+                for update in storyboard_generator:
+                    if "status" in update:
+                        plan_status.update(label=f"🧠 {update['status']}", state="running")
+                    if update.get("final"):
+                        if "error" in update:
+                            raise Exception(update["error"])
+                        storyboard = update.get("storyboard")
             except Exception as exc:
                 plan_status.update(label="❌ Storyboard planning failed", state="error")
                 status.update(label="Failed", state="error", expanded=True)
@@ -216,14 +224,22 @@ if generate_pressed and concept:
 
         with st.status("🎙️ Generating voiceover...") as rtts_status:
             audio_path = os.path.join("output", "voiceover.wav")
-            tts_result = generate_voiceover(storyboard["audio_script"], audio_path)
-            if not tts_result.get("success"):
+            
+            tts_generator = generate_voiceover(storyboard["audio_script"], audio_path)
+            tts_result = None
+            for update in tts_generator:
+                if "status" in update:
+                    rtts_status.update(label=f"🎙️ {update['status']}", state="running")
+                if update.get("final"):
+                    tts_result = update
+
+            if not tts_result or not tts_result.get("success"):
                 rtts_status.update(
                     label="❌ Voiceover generation failed", state="error"
                 )
                 status.update(label="Failed", state="error", expanded=True)
                 st.error("Voiceover generation failed.")
-                if tts_result.get("error"):
+                if tts_result and tts_result.get("error"):
                     with st.expander("Show Voiceover Error Logs"):
                         st.code(tts_result["error"], language="text")
                 st.stop()
@@ -277,9 +293,16 @@ if generate_pressed and concept:
         if final_video_path:
             with st.status("🎬 Stitching audio and video...") as stitch_status:
                 final_output = os.path.join("output", "final_output.mp4")
-                stitch_result = stitch_video_and_audio(
+                stitch_generator = stitch_video_and_audio(
                     final_video_path, audio_path, final_output
                 )
+                
+                stitch_result = None
+                for update in stitch_generator:
+                    if "status" in update:
+                        stitch_status.update(label=f"🎬 {update['status']}", state="running")
+                    if update.get("final"):
+                        stitch_result = update
 
                 if stitch_result.get("success"):
                     stitch_status.update(
