@@ -24,6 +24,10 @@ from agents.coder import run_coder_agent
 from agents.planner import plan_video_concept
 from utils.media_assembler import stitch_video_and_audio
 from utils.tts_engine import generate_voiceover
+from utils.project_state import (
+    create_project, load_project, save_project, 
+    mark_stage_done, is_stage_done, list_all_projects, delete_project, mark_project_complete
+)
 
 load_dotenv()
 console = Console(highlight=False)
@@ -158,6 +162,10 @@ def parse_args() -> argparse.Namespace:
                         help="Show detailed diagnostics for failures")
     parser.add_argument("--skip-audio", action="store_true",
                         help="Skip TTS and stitching; render animation only")
+    parser.add_argument("--workspace", action="store_true", 
+                        help="Open the interactive workspace dashboard to view, resume or delete projects.")
+    parser.add_argument("--resume", type=str, metavar="DIR",
+                        help="Path to an existing project output directory to resume from.")
     return parser.parse_args()
 
 
@@ -237,6 +245,82 @@ def _print_output(path: str) -> None:
         padding=(0, 2),
     ))
 
+# ── Workspace Dashboard ─────────────────────────────────────────────
+def manage_workspace() -> str | None:
+    """Displays the interactive workspace dashboard and returns a directory to resume, or None."""
+    while True:
+        console.clear()
+        console.print(LOGO)
+        console.print("\n  [bold]🗂️  Project Workspace[/bold]")
+        console.print(f"  [{DIM}]Resume or delete existing video projects.[/{DIM}]\n")
+        
+        projects = list_all_projects("output")
+        if not projects:
+            console.print(f"  [{WARN}]No projects found in the workspace yet.[/{WARN}]\n")
+            return None
+
+        table = Table(
+            box=box.SIMPLE_HEAVY,
+            show_header=True,
+            header_style="bold",
+            padding=(0, 2),
+        )
+        table.add_column("ID", justify="right", style=ACCENT_B)
+        table.add_column("Concept", style="bold white")
+        table.add_column("Status", justify="left")
+        table.add_column("Directory Name", style=DIM)
+        table.add_column("Last Updated", style=DIM)
+
+        for idx, (pdir, state) in enumerate(projects, 1):
+            concept = state.get("concept", "Unknown")
+            folder = os.path.basename(pdir)
+            updated = state.get("updated_at", "Unknown")
+            
+            # Simple CLI single-segment exact match calculations
+            stages = state.get("stages", {})
+            status_text = f"[{SUCCESS}]Completed[/{SUCCESS}]" if state.get("status") == "completed" else f"[{WARN}]In Progress[/{WARN}]"
+            
+            # Rough progress estimate (Max 4 stages: plan, tts, code, stitch)
+            done_count = sum(1 for s in stages.values() if s.get("done"))
+            progress = f"({done_count}/4 stages)" if state.get("status") != "completed" else ""
+            
+            table.add_row(str(idx), concept, f"{status_text} {progress}", folder, updated)
+
+        console.print(table)
+        console.print()
+        
+        choice = Prompt.ask(f"  [{ACCENT}]>[/{ACCENT}] Select project ID to manage, or [dim](q)[/dim]uit", default="q")
+        if choice.lower() in ("q", "quit", "exit"):
+            return None
+            
+        try:
+            choice_idx = int(choice) - 1
+            if 0 <= choice_idx < len(projects):
+                target_dir, state = projects[choice_idx]
+                concept_name = state.get("concept", target_dir)
+                
+                action = Prompt.ask(
+                    f"  [{ACCENT}]>[/{ACCENT}] Project: [bold]{concept_name}[/bold]. Choose action: ([bold]r[/bold])esume, ([bold]d[/bold])elete, or ([bold]c[/bold])ancel", 
+                    choices=["r", "d", "c"], 
+                    default="c"
+                )
+                
+                if action == "r":
+                    return target_dir
+                elif action == "d":
+                    if Confirm.ask(f"  [{FAIL}]![/{FAIL}] Are you sure you want to delete [bold]{concept_name}[/bold]?", default=False):
+                        if delete_project(target_dir):
+                            console.print(f"  [{SUCCESS}]Deleted successfully.[/{SUCCESS}]")
+                        else:
+                            console.print(f"  [{FAIL}]Failed to delete.[/{FAIL}]")
+                        time.sleep(1)
+            else:
+                console.print(f"  [{FAIL}]Invalid ID.[/{FAIL}]")
+                time.sleep(1)
+        except ValueError:
+            console.print(f"  [{FAIL}]Invalid input.[/{FAIL}]")
+            time.sleep(1)
+
 
 # ── Main ──────────────────────────────────────────────────────────────
 def main() -> None:
@@ -254,14 +338,66 @@ def main() -> None:
     os.makedirs("output", exist_ok=True)
 
     # ── Banner ────────────────────────────────────────────────────
-    console.print(LOGO)
-    console.print()
-
-    # ── Concept input ─────────────────────────────────────────────
-    concept = " ".join(args.concept).strip()
-    if not concept:
-        concept = Prompt.ask(f"  [{ACCENT}]>[/{ACCENT}] [bold]What concept would you like to visualize?[/bold]")
+    if not args.workspace:
+        console.print(LOGO)
         console.print()
+
+    output_dir = None
+    project_state = None
+    concept = ""
+    concept_slug = ""
+
+    # ── Workspace / Resume Handling ───────────────────────────────
+    if args.workspace:
+        selected_dir = manage_workspace()
+        if not selected_dir:
+            sys.exit(0)
+        output_dir = selected_dir
+        project_state = load_project(output_dir)
+        if not project_state:
+            _print_error("Failed to load project state", output_dir)
+            sys.exit(1)
+        concept = project_state.get("concept", "")
+        concept_slug = project_state.get("slug", os.path.basename(output_dir))
+        console.print(f"\n  [{SUCCESS}]✔[/{SUCCESS}] Resuming project: [bold]{concept}[/bold]")
+        
+    elif args.resume:
+        output_dir = os.path.abspath(args.resume)
+        project_state = load_project(output_dir)
+        if not project_state:
+            _print_error(f"Cannot resume: {output_dir} does not contain a valid project state.")
+            sys.exit(1)
+        concept = project_state.get("concept", "")
+        concept_slug = project_state.get("slug", os.path.basename(output_dir))
+        console.print(f"\n  [{SUCCESS}]✔[/{SUCCESS}] Resuming project: [bold]{concept}[/bold]")
+
+    else:
+        # ── Concept input ─────────────────────────────────────────────
+        concept = " ".join(args.concept).strip()
+        if not concept:
+            concept = Prompt.ask(f"  [{ACCENT}]>[/{ACCENT}] [bold]What concept would you like to visualize?[/bold]")
+            console.print()
+
+        import re
+        import time
+        from google import genai
+        try:
+            client = genai.Client()
+            response = client.models.generate_content(
+                model="gemini-flash-latest",
+                contents=f"Generate a short (2-4 words), clean, snake_case filename slug for this topic: {concept}. Return ONLY the snake_case string, nothing else."
+            )
+            concept_slug = response.text.strip().lower()
+            # Failsafe local sanitize
+            concept_slug = re.sub(r'[^\w\s-]', '', concept_slug).strip()
+            concept_slug = re.sub(r'[-\s]+', '_', concept_slug)
+            if not concept_slug:
+                concept_slug = "video"
+        except Exception:
+            concept_slug = "video"
+            
+        output_dir = os.path.join("output", f"{concept_slug}_{int(time.time())}")
+        project_state = create_project(output_dir, concept, concept_slug)
 
     console.print(Rule(style=MUTED))
 
