@@ -1,7 +1,18 @@
 import streamlit as st
 import os
 
-from utils.project_state import list_all_projects, delete_project
+from utils.project_state import list_all_projects, delete_project, calculate_progress
+
+
+def _read_pipeline_summary(project_dir: str) -> str | None:
+    summary_path = os.path.join(project_dir, "pipeline_summary.txt")
+    if not os.path.exists(summary_path):
+        return None
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
 
 def render_workspace():
     st.markdown("## 🗂️ Project Workspace")
@@ -17,22 +28,24 @@ def render_workspace():
         concept = state.get("concept", "Unknown Concept")
         created_at = state.get("created_at", "Unknown Date")
         updated_at = state.get("updated_at", "Unknown Date")
-        total_segments = state.get("total_segments", 1)
-        stages = state.get("stages", {})
         status = state.get("status", "in_progress")
         
-        # Calculate rough progress safely
-        completed_stages = sum(1 for s in stages.values() if s.get("done", False))
-        # Approximate total stages: outline + (storyboard + tts + code + stitch) per segment + concat
-        approx_total_stages = 1 + (4 * total_segments) + (1 if total_segments > 1 else 0)
-        progress = min(1.0, completed_stages / max(1, approx_total_stages)) if status != "completed" else 1.0
+        done, total, desc = calculate_progress(state)
+        progress = min(1.0, done / max(1, total))
 
         with st.container(border=True):
             col1, col2 = st.columns([3, 1])
             with col1:
                 st.subheader(f"{concept}")
                 st.caption(f"Last updated: {updated_at}")
-                st.progress(progress, text=f"Progress: {int(progress * 100)}%")
+                st.progress(progress, text=f"Progress: {int(progress * 100)}% — {desc}")
+
+                summary = _read_pipeline_summary(project_dir)
+                with st.expander("ℹ️ Pipeline summary", expanded=False):
+                    if summary:
+                        st.text(summary)
+                    else:
+                        st.caption("No pipeline summary available yet.")
                 
             with col2:
                 st.markdown("<br>", unsafe_allow_html=True)
@@ -42,7 +55,6 @@ def render_workspace():
                     slug = state.get("slug", "video")
                     final_vid = os.path.join(project_dir, f"{slug}.mp4")
                     if os.path.exists(final_vid):
-                         # Streamlit download button or abstract just the success state
                          if st.button("Download / View Video", key=f"dl_{project_dir}", use_container_width=True):
                              st.session_state.current_video_to_view = final_vid
                              st.rerun()

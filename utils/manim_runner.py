@@ -4,10 +4,14 @@ import tempfile
 import json
 import ast
 
-def run_manim_code(code: str, class_name: str, quality_flag: str = "-ql", timeout_seconds: int = 120) -> dict:
+def run_manim_code(code: str, class_name: str, quality_flag: str = "-ql", timeout_seconds: int = 120, output_dir: str | None = None) -> dict:
     """
     Executes a Manim python script in a temporary directory and captures output.
     Returns a dict with 'success', 'video_path', and 'error' strings.
+
+    Args:
+        output_dir: If provided, the rendered video is copied here instead of
+                    the default ``output/`` directory.
     """
     # Create a temporary directory for execution
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -45,11 +49,13 @@ def run_manim_code(code: str, class_name: str, quality_flag: str = "-ql", timeou
                             break
                             
                 if video_path:
-                    # In a real app we need to copy this out of the temp dir before it gets deleted!
-                    # For now just return path, but we'll copy it to a static output dir.
-                    output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "output"))
-                    os.makedirs(output_dir, exist_ok=True)
-                    final_path = os.path.join(output_dir, f"{class_name}.mp4")
+                    # Copy the rendered video to a persistent output directory
+                    if output_dir:
+                        dest_dir = os.path.abspath(output_dir)
+                    else:
+                        dest_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "output"))
+                    os.makedirs(dest_dir, exist_ok=True)
+                    final_path = os.path.join(dest_dir, f"{class_name}_render.mp4")
                     import shutil
                     shutil.copy2(video_path, final_path)
                     

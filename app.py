@@ -8,6 +8,7 @@ load_dotenv()
 
 from agents.planner import plan_video_concept
 from agents.coder import run_coder_agent
+from agents.pipeline import run_segmented_pipeline
 from utils.tts_engine import generate_voiceover
 from utils.media_assembler import stitch_video_and_audio
 
@@ -194,6 +195,13 @@ with st.container():
             st.rerun()
 
     st.write("")  # Spacer
+    col_mode1, col_mode2 = st.columns(2)
+    with col_mode1:
+        use_segmented = st.toggle("⚡ Segmented Pipeline (parallel)", value=True,
+                                   help="Break the video into segments and generate them in parallel. Much faster for longer videos.")
+    with col_mode2:
+        pass
+
     generate_pressed = st.button(
         "Generate Video", type="primary", use_container_width=True
     )
@@ -201,6 +209,94 @@ with st.container():
 if generate_pressed and concept:
     st.session_state.concept = concept
 
+    if use_segmented:
+        # ── Segmented parallel pipeline ───────────────────────────────
+        with st.status("⚡ Running segmented pipeline...", expanded=True) as status:
+            pipeline = run_segmented_pipeline(concept)
+            
+            storyboard_data = None
+            final_video_path = None
+            num_segments = 0
+            
+            # Create placeholders for live updates
+            stage_placeholder = st.empty()
+            detail_placeholder = st.empty()
+            progress_placeholder = st.empty()
+            
+            stage_labels = {
+                "plan": "🧠 Planning",
+                "tts": "🎙️ Voiceovers",
+                "code": "💻 Coding",
+                "stitch": "🎬 Stitching",
+                "concat": "🔗 Concatenating",
+                "done": "✅ Complete",
+            }
+            
+            for update in pipeline:
+                stage = update.get("stage", "")
+                stage_label = stage_labels.get(stage, stage)
+                update_status = update.get("status", "")
+                
+                stage_placeholder.markdown(f"**{stage_label}**: {update_status}")
+                
+                # Show storyboard when planned
+                if "storyboard" in update:
+                    storyboard_data = update["storyboard"]
+                    num_segments = update.get("num_segments", 0)
+                    with detail_placeholder.container():
+                        st.json(storyboard_data)
+                        if storyboard_data.get("clarifying_questions"):
+                            st.warning("The planner has some clarifying questions:")
+                            for q in storyboard_data["clarifying_questions"]:
+                                st.write(f"- {q}")
+                
+                # Show TTS results
+                if "tts_results" in update:
+                    tts_results = update["tts_results"]
+                    ok = sum(1 for r in tts_results.values() if r.get("success"))
+                    progress_placeholder.progress(ok / max(num_segments, 1),
+                                                   text=f"TTS: {ok}/{num_segments}")
+                
+                # Show code results
+                if "code_results" in update:
+                    code_results = update["code_results"]
+                    ok = sum(1 for r in code_results.values() if r.get("video_path"))
+                    progress_placeholder.progress(ok / max(num_segments, 1),
+                                                   text=f"Segments rendered: {ok}/{num_segments}")
+                
+                # Show errors
+                if "error" in update and update["error"] and not update.get("final"):
+                    with st.expander(f"⚠️ Error in {stage_label}"):
+                        st.code(update["error"], language="text")
+                
+                # Final result
+                if update.get("final"):
+                    final_video_path = update.get("video_path")
+                    
+                    if update.get("stitch_errors"):
+                        with st.expander("⚠️ Stitch warnings"):
+                            for e in update["stitch_errors"]:
+                                st.write(f"- {e}")
+                    
+                    if final_video_path:
+                        status.update(
+                            label=f"🎉 Video generation complete! ({num_segments} segments)",
+                            state="complete",
+                            expanded=False,
+                        )
+                        st.success(f"Successfully generated {num_segments}-segment video!")
+                        st.video(final_video_path)
+                    else:
+                        status.update(label="❌ Pipeline failed", state="error", expanded=True)
+                        st.error(f"Pipeline failed: {update.get('error', 'Unknown error')}")
+
+    else:
+        # ── Legacy single-segment pipeline ────────────────────────────
+        _run_legacy_pipeline(concept)
+
+
+def _run_legacy_pipeline(concept: str):
+    """Original single-segment pipeline (kept for backward compatibility)."""
     with st.status("Generating video pipeline...", expanded=True) as status:
         with st.status("🧠 Researching and planning storyboard...") as plan_status:
             try:
@@ -229,7 +325,7 @@ if generate_pressed and concept:
 
         with st.status("🎙️ Generating voiceover...") as rtts_status:
             audio_path = os.path.join("output", "voiceover.wav")
-            
+
             tts_generator = generate_voiceover(storyboard["audio_script"], audio_path)
             tts_result = None
             for update in tts_generator:
@@ -252,13 +348,12 @@ if generate_pressed and concept:
             audio_duration = tts_result.get("duration", 0.0)
 
         with st.status("💻 Coding Manim script (Agentic Loop)...") as coder_status:
-            # Render our custom HTML CSS-only toggle
             st.markdown(get_css_toggle(), unsafe_allow_html=True)
 
             coder_generator = run_coder_agent(
                 storyboard["visual_instructions"],
                 audio_script=storyboard.get("audio_script", ""),
-                audio_duration=audio_duration
+                audio_duration=audio_duration,
             )
 
             final_video_path = None
@@ -268,7 +363,6 @@ if generate_pressed and concept:
             error_placeholder = st.empty()
             code_placeholder = st.empty()
 
-            # Always render the skeleton (CSS handles hiding it if toggle is checked)
             st.markdown(get_skeleton_html(), unsafe_allow_html=True)
 
             for update in coder_generator:
@@ -304,7 +398,7 @@ if generate_pressed and concept:
                 stitch_generator = stitch_video_and_audio(
                     final_video_path, audio_path, final_output
                 )
-                
+
                 stitch_result = None
                 for update in stitch_generator:
                     if "status" in update:

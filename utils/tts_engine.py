@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import os
 import re
@@ -196,3 +197,24 @@ def generate_voiceover(text: str, output_path: str) -> Iterator[dict]:
             yield {"final": True, "success": True, "audio_path": output_path, "mime_type": "audio/mpeg", "duration": duration, "error": f"Gemini TTS failed, used gTTS fallback: {gemini_error}"}
         except Exception as fallback_exc:
             yield {"final": True, "success": False, "audio_path": None, "mime_type": None, "error": f"Gemini TTS failed: {gemini_error}. gTTS fallback unavailable/failed: {fallback_exc}"}
+
+
+# ── Async variant for parallel segment TTS ────────────────────────────
+
+async def generate_voiceover_async(text: str, output_path: str) -> dict:
+    """Async wrapper around ``generate_voiceover``.
+
+    Runs the synchronous generator in a thread-pool so multiple segments'
+    TTS can be generated concurrently via ``asyncio.gather()``.
+
+    Returns the final result dict (the one with ``"final": True``).
+    """
+    loop = asyncio.get_event_loop()
+
+    def _run_sync() -> dict:
+        last: dict = {}
+        for update in generate_voiceover(text, output_path):
+            last = update
+        return last
+
+    return await loop.run_in_executor(None, _run_sync)

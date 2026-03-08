@@ -26,7 +26,8 @@ from utils.media_assembler import stitch_video_and_audio
 from utils.tts_engine import generate_voiceover
 from utils.project_state import (
     create_project, load_project, save_project, 
-    mark_stage_done, is_stage_done, list_all_projects, delete_project, mark_project_complete
+    mark_stage_done, is_stage_done, list_all_projects, delete_project,
+    mark_project_complete, calculate_progress,
 )
 
 load_dotenv()
@@ -197,6 +198,36 @@ def print_pipeline_summary(stages: list[tuple[str, str, float]]) -> None:
     console.print()
 
 
+def save_pipeline_summary(
+    stages: list[tuple[str, str, float]],
+    output_dir: str,
+    concept: str = "",
+) -> str:
+    """Write a plain-text pipeline summary to ``output_dir/pipeline_summary.txt``."""
+    total = sum(e for _, _, e in stages)
+    lines: list[str] = []
+    lines.append("Pipeline Summary")
+    lines.append("=" * 50)
+    if concept:
+        lines.append(f"Concept : {concept}")
+    lines.append(f"Date    : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    lines.append(f"{'Status':<8} {'Stage':<25} {'Time':>8}")
+    lines.append("-" * 50)
+    for name, status, elapsed in stages:
+        tag = "OK" if status == "ok" else "ERR"
+        lines.append(f"{tag:<8} {name:<25} {elapsed:>7.1f}s")
+    lines.append("-" * 50)
+    lines.append(f"{'':8} {'Total':<25} {total:>7.1f}s")
+    lines.append("")
+
+    os.makedirs(output_dir, exist_ok=True)
+    summary_path = os.path.join(output_dir, "pipeline_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return summary_path
+
+
 # ── Storyboard display ───────────────────────────────────────────────
 def _print_storyboard(storyboard: dict) -> None:
     """Render storyboard in styled panels."""
@@ -245,6 +276,18 @@ def _print_output(path: str) -> None:
         padding=(0, 2),
     ))
 
+
+def _load_pipeline_summary_text(project_dir: str) -> str | None:
+    """Load a project's plain-text pipeline summary if present."""
+    summary_path = os.path.join(project_dir, "pipeline_summary.txt")
+    if not os.path.exists(summary_path):
+        return None
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
 # ── Workspace Dashboard ─────────────────────────────────────────────
 def manage_workspace() -> str | None:
     """Displays the interactive workspace dashboard and returns a directory to resume, or None."""
@@ -276,13 +319,14 @@ def manage_workspace() -> str | None:
             folder = os.path.basename(pdir)
             updated = state.get("updated_at", "Unknown")
             
-            # Simple CLI single-segment exact match calculations
-            stages = state.get("stages", {})
-            status_text = f"[{SUCCESS}]Completed[/{SUCCESS}]" if state.get("status") == "completed" else f"[{WARN}]In Progress[/{WARN}]"
-            
-            # Rough progress estimate (Max 4 stages: plan, tts, code, stitch)
-            done_count = sum(1 for s in stages.values() if s.get("done"))
-            progress = f"({done_count}/4 stages)" if state.get("status") != "completed" else ""
+            done, total, desc = calculate_progress(state)
+            if state.get("status") == "completed":
+                status_text = f"[{SUCCESS}]Completed[/{SUCCESS}]"
+                progress = ""
+            else:
+                pct = int(100 * done / max(1, total))
+                status_text = f"[{WARN}]In Progress[/{WARN}]"
+                progress = f"({pct}% — {desc})"
             
             table.add_row(str(idx), concept, f"{status_text} {progress}", folder, updated)
 
@@ -300,12 +344,27 @@ def manage_workspace() -> str | None:
                 concept_name = state.get("concept", target_dir)
                 
                 action = Prompt.ask(
-                    f"  [{ACCENT}]>[/{ACCENT}] Project: [bold]{concept_name}[/bold]. Choose action: ([bold]r[/bold])esume, ([bold]d[/bold])elete, or ([bold]c[/bold])ancel", 
-                    choices=["r", "d", "c"], 
+                    f"  [{ACCENT}]>[/{ACCENT}] Project: [bold]{concept_name}[/bold]. Choose action: ([bold]v[/bold])iew info, ([bold]r[/bold])esume, ([bold]d[/bold])elete, or ([bold]c[/bold])ancel", 
+                    choices=["v", "r", "d", "c"], 
                     default="c"
                 )
+
+                if action == "v":
+                    summary_text = _load_pipeline_summary_text(target_dir)
+                    if summary_text:
+                        console.print()
+                        console.print(Panel(
+                            summary_text,
+                            title="[bold]Pipeline Summary[/bold]",
+                            title_align="left",
+                            border_style=ACCENT,
+                            padding=(1, 2),
+                        ))
+                    else:
+                        console.print(f"  [{WARN}]No pipeline summary found for this project yet.[/{WARN}]")
+                    Prompt.ask(f"  [{ACCENT}]>[/{ACCENT}] Press Enter to return")
                 
-                if action == "r":
+                elif action == "r":
                     return target_dir
                 elif action == "d":
                     if Confirm.ask(f"  [{FAIL}]![/{FAIL}] Are you sure you want to delete [bold]{concept_name}[/bold]?", default=False):
@@ -458,9 +517,10 @@ def main() -> None:
         console.print()
 
     stages.append(("Plan", "ok", plan_elapsed_total))
+    mark_stage_done(output_dir, "plan", artifacts=[])
 
     # ── Voiceover ─────────────────────────────────────────────────
-    audio_path = os.path.join("output", "voiceover.wav")
+    audio_path = os.path.join(output_dir, "voiceover.wav")
     if not args.skip_audio:
         tts_result, elapsed = run_stage(
             "Generating voiceover",
@@ -477,6 +537,7 @@ def main() -> None:
             sys.exit(1)
         _log_stage_done("Generating voiceover", elapsed)
         audio_path = tts_result.get("audio_path", audio_path)
+        mark_stage_done(output_dir, "voiceover", artifacts=[audio_path])
         stages.append(("Voiceover", "ok", elapsed))
 
     # ── Code Generation + Render ──────────────────────────────────
@@ -497,7 +558,8 @@ def main() -> None:
             storyboard["visual_instructions"],
             max_retries=max(0, args.max_retries),
             audio_script=storyboard.get("audio_script", ""),
-            audio_duration=audio_duration
+            audio_duration=audio_duration,
+            output_dir=output_dir,
         ):
             status = update.get("status", "")
             if status:
@@ -529,17 +591,20 @@ def main() -> None:
         sys.exit(1)
 
     _log_stage_done("Generating Manim code", code_elapsed)
+    mark_stage_done(output_dir, "code", artifacts=[final_video_path])
     stages.append(("Code + Render", "ok", code_elapsed))
 
     # ── Skip-audio shortcut ───────────────────────────────────────
     if args.skip_audio:
+        mark_project_complete(output_dir)
         print_pipeline_summary(stages)
+        save_pipeline_summary(stages, output_dir, concept)
         _print_output(final_video_path)
         _open_file(final_video_path)
         return
 
     # ── Stitching ─────────────────────────────────────────────────
-    final_output = os.path.join("output", "final_output.mp4")
+    final_output = os.path.join(output_dir, f"{concept_slug}.mp4")
     stitch_result, elapsed = run_stage(
         "Stitching video + audio",
         stitch_video_and_audio,
@@ -549,14 +614,18 @@ def main() -> None:
     )
     if stitch_result and stitch_result.get("success"):
         _log_stage_done("Stitching video + audio", elapsed)
+        mark_stage_done(output_dir, "stitch", artifacts=[final_output])
+        mark_project_complete(output_dir)
         stages.append(("Stitch", "ok", elapsed))
         print_pipeline_summary(stages)
+        save_pipeline_summary(stages, output_dir, concept)
         _print_output(final_output)
         _open_file(final_output)
     else:
         _log_stage_fail("Stitching video + audio", elapsed)
         stages.append(("Stitch", "failed", elapsed))
         print_pipeline_summary(stages)
+        save_pipeline_summary(stages, output_dir, concept)
         console.print(f"  [{WARN}]⚠  Stitching failed — opening raw animation instead.[/{WARN}]")
         if args.verbose and stitch_result and stitch_result.get("error"):
             console.print(f"  [{DIM}]{stitch_result['error']}[/{DIM}]")

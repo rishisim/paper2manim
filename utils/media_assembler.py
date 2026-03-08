@@ -1,5 +1,6 @@
 import os
 import subprocess
+import tempfile
 from typing import Iterator
 
 
@@ -66,4 +67,117 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
             "output_path": None,
             "error": str(exc),
             "command": " ".join(cmd),
+        }
+
+
+# ── Segment concatenation ────────────────────────────────────────────
+
+def concatenate_segments(
+    segment_video_paths: list[str],
+    output_path: str,
+) -> Iterator[dict]:
+    """Concatenate multiple per-segment stitched videos into one final video.
+
+    Uses ``ffmpeg -f concat`` (demuxer) which is a fast remux operation
+    — no re-encoding is needed as long as all inputs share the same codec
+    and resolution.
+
+    Yields status dicts and finally ``{"final": True, ...}``.
+    """
+    yield {"status": f"Concatenating {len(segment_video_paths)} segments..."}
+
+    # Validate inputs
+    missing = [p for p in segment_video_paths if not os.path.exists(p)]
+    if missing:
+        yield {
+            "final": True,
+            "success": False,
+            "output_path": None,
+            "error": f"Missing segment videos: {missing}",
+        }
+        return
+
+    if len(segment_video_paths) == 1:
+        # Nothing to concatenate — just copy/rename
+        import shutil
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        shutil.copy2(segment_video_paths[0], output_path)
+        yield {
+            "final": True,
+            "success": True,
+            "output_path": output_path,
+            "error": None,
+        }
+        return
+
+    try:
+        # First, re-encode all segments to a consistent format to avoid
+        # concat issues from different resolutions/codecs/frame-rates
+        with tempfile.TemporaryDirectory() as temp_dir:
+            normalized_paths: list[str] = []
+            for i, vp in enumerate(segment_video_paths):
+                norm_path = os.path.join(temp_dir, f"seg_{i:03d}.mp4")
+                norm_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", vp,
+                    "-c:v", "libx264", "-preset", "fast",
+                    "-c:a", "aac",
+                    "-r", "30",          # consistent frame rate
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    norm_path,
+                ]
+                yield {"status": f"Normalizing segment {i + 1}/{len(segment_video_paths)}..."}
+                res = subprocess.run(norm_cmd, capture_output=True, text=True)
+                if res.returncode != 0:
+                    yield {
+                        "final": True,
+                        "success": False,
+                        "output_path": None,
+                        "error": f"Failed to normalize segment {i + 1}: {res.stderr}",
+                    }
+                    return
+                normalized_paths.append(norm_path)
+
+            # Build the ffmpeg concat list file
+            list_path = os.path.join(temp_dir, "concat_list.txt")
+            with open(list_path, "w") as f:
+                for p in normalized_paths:
+                    f.write(f"file '{p}'\n")
+
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_path,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                output_path,
+            ]
+
+            yield {"status": "Running ffmpeg concat..."}
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                yield {
+                    "final": True,
+                    "success": True,
+                    "output_path": output_path,
+                    "error": None,
+                }
+            else:
+                yield {
+                    "final": True,
+                    "success": False,
+                    "output_path": None,
+                    "error": result.stderr or result.stdout,
+                }
+    except Exception as exc:
+        yield {
+            "final": True,
+            "success": False,
+            "output_path": None,
+            "error": str(exc),
         }

@@ -1,12 +1,13 @@
-"""Agentic Manim code generator with live documentation access.
+"""Agentic Manim code generator with live documentation access and web search.
 
-The model can call ``fetch_manim_docs`` and ``fetch_manim_file`` during
-generation to read real source code and docstrings straight from the
-official Manim GitHub repository — no scraping, just raw text.
+The model can call ``fetch_manim_docs``, ``fetch_manim_file``, ``search_web``
+during generation to read real source code, docstrings, and community
+examples — enabling higher-quality animations.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Iterator
 
@@ -19,10 +20,16 @@ from utils.manim_docs import (
     get_topic_index_description,
 )
 from utils.golden_scenes import fetch_golden_scenes
+from utils.web_search import search_web
 from utils.manim_runner import run_manim_code, extract_class_name
 
 
-MODEL_NAME = "gemini-3.1-pro-preview"
+# ── Model configuration ──────────────────────────────────────────────
+
+MODEL_PRO = "gemini-3.1-pro-preview"          # complex segments
+MODEL_FLASH = "gemini-flash-latest"            # simple segments (fast)
+
+MAX_TOOL_CALLS = 10  # bumped from 5 → 10
 
 # ── helpers ───────────────────────────────────────────────────────────
 
@@ -69,6 +76,7 @@ Here is the Manim documentation topic index:
 IMPORTANT RULES:
 - Call `fetch_golden_scenes()` to get concrete examples of beautiful 3b1b-style animations. Model your approach on these examples.
 - Look up documentation for at most 1 or 2 complex classes you are unsure about BEFORE writing the code. Do not do excessive lookups that will blow up the context window.
+- Use `search_web(query)` to find code examples, Python libraries, or community solutions when you need help with a specific animation technique or effect. This is especially useful for finding Manim plugins, mathematical visualization patterns, or code snippets from StackOverflow/GitHub.
 - Output ONLY raw Python code.  No markdown fences, no prose.
 - Import manim: `from manim import *`
 - Define exactly one class inheriting from `Scene`, named `GeneratedScene`.
@@ -83,12 +91,20 @@ IMPORTANT RULES:
 """
 
 
-def _build_config() -> types.GenerateContentConfig:
+def _get_model_for_complexity(complexity: str = "complex") -> str:
+    """Return the appropriate model name based on segment complexity."""
+    if complexity == "simple":
+        return MODEL_FLASH
+    return MODEL_PRO
+
+
+def _build_config(complexity: str = "complex") -> types.GenerateContentConfig:
     return types.GenerateContentConfig(
         tools=[
             fetch_manim_docs,
             fetch_manim_file,
             fetch_golden_scenes,
+            search_web,
         ],
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         system_instruction=SYSTEM_INSTRUCTION,
@@ -96,33 +112,39 @@ def _build_config() -> types.GenerateContentConfig:
     )
 
 
+def _dispatch_tool_call(fc) -> str:
+    """Execute a single tool call and return the result string."""
+    try:
+        if fc.name == "fetch_manim_docs":
+            return fetch_manim_docs(**fc.args)
+        elif fc.name == "fetch_manim_file":
+            return fetch_manim_file(**fc.args)
+        elif fc.name == "fetch_golden_scenes":
+            return fetch_golden_scenes()
+        elif fc.name == "search_web":
+            return search_web(**fc.args)
+        else:
+            return f"Unknown tool: {fc.name}"
+    except Exception as e:
+        return f"Error executing tool: {e}"
+
+
 def _send_and_extract(chat, message: str) -> str:
     """Send a message through the chat (which handles tool calls
     automatically) and return the final text with code fences stripped."""
-    MAX_CALLS = 5
     calls = 0
     
     print(f"\n[Coder] Prompting model...")
     response = chat.send_message(message)
     
-    while response.function_calls and calls < MAX_CALLS:
+    while response.function_calls and calls < MAX_TOOL_CALLS:
         calls += 1
         tool_responses = []
         for fc in response.function_calls:
-            print(f"  [Coder] Tool usage ({calls}/{MAX_CALLS}): {fc.name}({fc.args})")
-            try:
-                if fc.name == "fetch_manim_docs":
-                    res = fetch_manim_docs(**fc.args)
-                elif fc.name == "fetch_manim_file":
-                    res = fetch_manim_file(**fc.args)
-                elif fc.name == "fetch_golden_scenes":
-                    res = fetch_golden_scenes()
-                else:
-                    res = f"Unknown tool: {fc.name}"
-            except Exception as e:
-                res = f"Error executing tool: {e}"
+            print(f"  [Coder] Tool usage ({calls}/{MAX_TOOL_CALLS}): {fc.name}({fc.args})")
+            res = _dispatch_tool_call(fc)
                 
-            if calls >= MAX_CALLS:
+            if calls >= MAX_TOOL_CALLS:
                 res += "\n\nCRITICAL SYSTEM WARNING: You have exhausted all tool calls. Do NOT call any more functions. You MUST output the complete final Manim code NOW based on the information you have gathered."
                 
             tool_responses.append(
@@ -146,15 +168,24 @@ def _send_and_extract(chat, message: str) -> str:
 
 # ── public generators ─────────────────────────────────────────────────
 
-def generate_manim_script(instructions: str, audio_script: str = "", audio_duration: float = 0.0) -> Iterator[str]:
+def generate_manim_script(
+    instructions: str,
+    audio_script: str = "",
+    audio_duration: float = 0.0,
+    complexity: str = "complex",
+    scene_class_name: str = "GeneratedScene",
+) -> Iterator[str]:
     """Yield the final generated code (single yield after tool calls resolve)."""
+    model = _get_model_for_complexity(complexity)
     client = genai.Client()
-    chat = client.chats.create(model=MODEL_NAME, config=_build_config())
+    chat = client.chats.create(model=model, config=_build_config(complexity))
 
     prompt = (
         "Write a complete Manim script for the following visual instructions.\n"
         "Before writing any code, look up the documentation for the main "
-        "classes and animations you plan to use.\n\n"
+        "classes and animations you plan to use.\n"
+        "If you're unsure about a technique, use search_web() to find code examples.\n\n"
+        f"The scene class MUST be named `{scene_class_name}`.\n\n"
         f"Instructions:\n{instructions}\n\n"
     )
     if audio_script and audio_duration > 0:
@@ -169,22 +200,23 @@ def generate_manim_script(instructions: str, audio_script: str = "", audio_durat
 
     code = _send_and_extract(chat, prompt)
     if not code:
-        print("Falling back to tool-less code generation due to empty response.")
-        fallback_config = _build_config()
+        print(f"Falling back to tool-less code generation due to empty response (model={model}).")
+        fallback_config = _build_config(complexity)
         fallback_config.tools = None
         fallback_config.automatic_function_calling = None
         
-        fallback_chat = client.chats.create(model=MODEL_NAME, config=fallback_config)
+        fallback_chat = client.chats.create(model=model, config=fallback_config)
         code = _send_and_extract(fallback_chat, prompt)
 
     if code:
         yield code
 
 
-def fix_manim_script(code: str, error: str) -> Iterator[str]:
+def fix_manim_script(code: str, error: str, complexity: str = "complex") -> Iterator[str]:
     """Yield the corrected code after consulting docs."""
+    model = _get_model_for_complexity(complexity)
     client = genai.Client()
-    chat = client.chats.create(model=MODEL_NAME, config=_build_config())
+    chat = client.chats.create(model=model, config=_build_config(complexity))
 
     compact = _compact_error(error)
     prompt = (
@@ -204,15 +236,32 @@ def fix_manim_script(code: str, error: str) -> Iterator[str]:
 
 # ── orchestrator ──────────────────────────────────────────────────────
 
-def run_coder_agent(visual_instructions: str, max_retries: int = 3, audio_script: str = "", audio_duration: float = 0.0):
+def run_coder_agent(
+    visual_instructions: str,
+    max_retries: int = 3,
+    audio_script: str = "",
+    audio_duration: float = 0.0,
+    complexity: str = "complex",
+    scene_class_name: str = "GeneratedScene",
+    output_dir: str | None = None,
+):
     """Generate a Manim script, execute it, self-correct up to *max_retries*.
 
     Yields status dicts consumed by the CLI or Streamlit front-end.
+
+    Args:
+        complexity: "simple" or "complex" — controls which model is used.
+        scene_class_name: The Manim Scene class name to generate.
+        output_dir: Optional custom output directory for the rendered video.
     """
+    model_label = _get_model_for_complexity(complexity)
     code = ""
 
-    yield {"status": "Generating initial Manim script (consulting docs)..."}
-    for chunk in generate_manim_script(visual_instructions, audio_script, audio_duration):
+    yield {"status": f"Generating Manim script [{complexity}] via {model_label}..."}
+    for chunk in generate_manim_script(
+        visual_instructions, audio_script, audio_duration,
+        complexity=complexity, scene_class_name=scene_class_name,
+    ):
         if chunk == "looking up docs":
             yield {"status": "Looking up Manim documentation..."}
             continue
@@ -231,12 +280,12 @@ def run_coder_agent(visual_instructions: str, max_retries: int = 3, audio_script
         class_name = extract_class_name(code)
         yield {"status": f"Attempt {attempt + 1}: Executing code (Fast render -ql)...", "code": code}
 
-        result = run_manim_code(code, class_name, quality_flag="-ql")
+        result = run_manim_code(code, class_name, quality_flag="-ql", output_dir=output_dir)
 
         if result["success"]:
             yield {"status": "Code successful! Rendering final HD video (-qh)...", "code": code}
             
-            hd_result = run_manim_code(code, class_name, quality_flag="-qh", timeout_seconds=300)
+            hd_result = run_manim_code(code, class_name, quality_flag="-qh", timeout_seconds=300, output_dir=output_dir)
             
             if hd_result["success"]:
                 yield {
@@ -262,7 +311,7 @@ def run_coder_agent(visual_instructions: str, max_retries: int = 3, audio_script
                 "error": result["error"],
             }
             updated_code = ""
-            for chunk in fix_manim_script(code, result["error"]):
+            for chunk in fix_manim_script(code, result["error"], complexity=complexity):
                 if chunk == "looking up docs":
                     yield {"status": f"Looking up docs for fix (attempt {attempt + 1})..."}
                     continue
@@ -288,3 +337,40 @@ def run_coder_agent(visual_instructions: str, max_retries: int = 3, audio_script
                 "final": True,
             }
             return
+
+
+# ── Async variant for parallel segment processing ────────────────────
+
+async def run_coder_agent_async(
+    visual_instructions: str,
+    max_retries: int = 3,
+    audio_script: str = "",
+    audio_duration: float = 0.0,
+    complexity: str = "complex",
+    scene_class_name: str = "GeneratedScene",
+    output_dir: str | None = None,
+) -> dict:
+    """Async wrapper around ``run_coder_agent``.
+
+    Runs the synchronous generator in a thread-pool so multiple segments
+    can be generated concurrently via ``asyncio.gather()``.
+
+    Returns the final result dict (the one with ``"final": True``).
+    """
+    loop = asyncio.get_event_loop()
+
+    def _run_sync() -> dict:
+        last_update: dict = {}
+        for update in run_coder_agent(
+            visual_instructions,
+            max_retries=max_retries,
+            audio_script=audio_script,
+            audio_duration=audio_duration,
+            complexity=complexity,
+            scene_class_name=scene_class_name,
+            output_dir=output_dir,
+        ):
+            last_update = update
+        return last_update
+
+    return await loop.run_in_executor(None, _run_sync)

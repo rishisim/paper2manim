@@ -21,7 +21,8 @@ def create_project(output_dir: str, concept: str, concept_slug: str, total_segme
         "updated_at": now,
         "status": "in_progress",
         "total_segments": total_segments,
-        "stages": {}
+        "stages": {},
+        "segments": {},  # per-segment tracking
     }
     
     save_project(output_dir, state)
@@ -62,6 +63,63 @@ def mark_stage_done(output_dir: str, stage_name: str, artifacts: list[str] = Non
     save_project(output_dir, state)
     return state
 
+
+# ── Per-segment stage tracking ────────────────────────────────────────
+
+def mark_segment_stage(
+    output_dir: str,
+    segment_id: int,
+    stage: str,
+    done: bool = True,
+    artifacts: list[str] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Mark a per-segment stage (tts, code, render, stitch) as done/failed.
+
+    State structure:
+        ``state["segments"]["1"]["tts"] = {"done": True, "artifacts": [...]}``
+    """
+    state = load_project(output_dir)
+    if not state:
+        raise ValueError(f"No project state found in {output_dir}")
+
+    seg_key = str(segment_id)
+    if "segments" not in state:
+        state["segments"] = {}
+    if seg_key not in state["segments"]:
+        state["segments"][seg_key] = {}
+
+    entry: dict[str, Any] = {"done": done}
+    if artifacts:
+        entry["artifacts"] = artifacts
+    if error:
+        entry["error"] = error
+
+    state["segments"][seg_key][stage] = entry
+    save_project(output_dir, state)
+    return state
+
+
+def is_segment_stage_done(state: dict[str, Any], segment_id: int, stage: str) -> bool:
+    """Check whether a specific segment stage has completed successfully."""
+    seg_key = str(segment_id)
+    seg = state.get("segments", {}).get(seg_key, {})
+    return seg.get(stage, {}).get("done", False)
+
+
+def get_segment_progress(state: dict[str, Any]) -> dict[str, dict]:
+    """Return a summary of per-segment progress.
+
+    Returns:
+        ``{segment_id: {"tts": bool, "code": bool, "render": bool, "stitch": bool}}``
+    """
+    result = {}
+    for seg_key, stages in state.get("segments", {}).items():
+        result[seg_key] = {
+            stage: info.get("done", False) for stage, info in stages.items()
+        }
+    return result
+
 def mark_project_complete(output_dir: str) -> dict[str, Any]:
     state = load_project(output_dir)
     if not state:
@@ -77,6 +135,78 @@ def is_stage_done(state: dict[str, Any], stage_name: str) -> bool:
         return False
     stage_info = state["stages"].get(stage_name, {})
     return stage_info.get("done", False)
+
+
+def calculate_progress(state: dict[str, Any]) -> tuple[int, int, str]:
+    """Calculate overall project progress from state.
+
+    Handles both single-segment CLI projects (top-level stages only) and
+    segmented pipeline projects (top-level stages + per-segment stages).
+
+    Returns:
+        ``(done_count, total_count, description)``
+    """
+    if not state:
+        return 0, 1, "Unknown"
+
+    if state.get("status") == "completed":
+        return 1, 1, "Completed"
+
+    stages = state.get("stages", {})
+    segments = state.get("segments", {})
+    total_segments = state.get("total_segments", 1)
+
+    # Detect segmented pipeline: has per-segment tracking or total_segments > 1
+    is_segmented = total_segments > 1 or len(segments) > 0
+
+    if is_segmented:
+        # Segmented pipeline stages:
+        #   top-level: plan (1) + concat (1)
+        #   per-segment: tts, code, render, stitch (4 each)
+        total = 1 + (4 * total_segments) + 1  # plan + per-seg + concat
+        done = 0
+
+        # Top-level stages
+        for s in stages.values():
+            if s.get("done"):
+                done += 1
+
+        # Per-segment stages
+        for seg_stages in segments.values():
+            for info in seg_stages.values():
+                if isinstance(info, dict) and info.get("done"):
+                    done += 1
+
+        # Build description
+        if done == 0:
+            desc = "Starting"
+        elif is_stage_done(state, "plan") and done <= 1:
+            desc = "Planned"
+        elif done < 1 + (4 * total_segments):
+            desc = "Generating segments"
+        elif done < total:
+            desc = "Stitching"
+        else:
+            desc = "Almost done"
+
+        return done, total, desc
+    else:
+        # CLI single-segment: plan, voiceover, code, stitch (4 stages)
+        total = 4
+        done = sum(1 for s in stages.values() if s.get("done"))
+
+        if done == 0:
+            desc = "Starting"
+        elif done == 1:
+            desc = "Planned"
+        elif done == 2:
+            desc = "Voice generated"
+        elif done == 3:
+            desc = "Code rendered"
+        else:
+            desc = "Stitching"
+
+        return done, total, desc
 
 
 def list_all_projects(base_dir: str = "output") -> list[tuple[str, dict[str, Any]]]:
