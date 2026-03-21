@@ -1,8 +1,0 @@
-streamlit
-manim
-google-genai
-ffmpeg-python
-pydantic
-python-dotenv
-requests
-rich

@@ -1,9 +1,12 @@
 manim
 google-genai
+anthropic
 pydantic
 rich
+rich-argparse
 python-dotenv
 edge-tts
 beautifulsoup4
 requests
 moviepy
+questionary

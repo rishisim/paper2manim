@@ -12,6 +12,11 @@ paper2manim.egg-info/dependency_links.txt
 paper2manim.egg-info/entry_points.txt
 paper2manim.egg-info/requires.txt
 paper2manim.egg-info/top_level.txt
+tests/test_api.py
+tests/test_css.py
+tests/test_frag.py
+tests/test_pipeline_progress_streaming.py
+tests/test_scene.py
 utils/css_toggle.py
 utils/golden_scenes.py
 utils/manim_docs.py

@@ -10,13 +10,16 @@ requires-python = ">=3.9"
 dependencies = [
     "manim",
     "google-genai",
+    "anthropic",
     "pydantic",
     "rich",
+    "rich-argparse",
     "python-dotenv",
     "edge-tts",
     "beautifulsoup4",
     "requests",
-    "moviepy"
+    "moviepy",
+    "questionary"
 ]
 
 [project.scripts]

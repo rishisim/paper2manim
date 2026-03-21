@@ -5,10 +5,13 @@ Summary: Generate an educational video from a concept using Manim.
 Requires-Python: >=3.9
 Requires-Dist: manim
 Requires-Dist: google-genai
+Requires-Dist: anthropic
 Requires-Dist: pydantic
 Requires-Dist: rich
+Requires-Dist: rich-argparse
 Requires-Dist: python-dotenv
 Requires-Dist: edge-tts
 Requires-Dist: beautifulsoup4
 Requires-Dist: requests
 Requires-Dist: moviepy
+Requires-Dist: questionary
