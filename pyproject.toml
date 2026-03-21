@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paper2manim"
+version = "0.1.0"
+description = "Generate an educational video from a concept using Manim."
+requires-python = ">=3.9"
+dependencies = [
+    "manim",
+    "google-genai",
+    "pydantic",
+    "rich",
+    "python-dotenv",
+    "edge-tts",
+    "beautifulsoup4",
+    "requests",
+    "moviepy"
+]
+
+[project.scripts]
+paper2manim = "cli:main"
+
+[tool.setuptools]
+packages = ["agents", "utils"]
+py-modules = ["cli", "workspace"]

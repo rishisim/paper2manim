@@ -1,0 +1,246 @@
+{
+  "concept": "The Fourier Transform 3 min video",
+  "slug": "the_fourier_transform_3_min_video",
+  "created_at": "2026-03-09T00:13:37",
+  "updated_at": "2026-03-09T00:20:08",
+  "status": "completed",
+  "total_segments": 7,
+  "stages": {
+    "plan": {
+      "done": true,
+      "artifacts": []
+    },
+    "concat": {
+      "done": true,
+      "artifacts": [
+        "output/the_fourier_transform_3_min_video_1472/the_fourier_transform_3_min_video.mp4"
+      ]
+    }
+  },
+  "segments": {
+    "1": {
+      "tts": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_1_audio.wav"
+        ]
+      },
+      "code": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_1/Segment1Scene_render.mp4"
+        ]
+      },
+      "render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_1/Segment1Scene_render.mp4"
+        ]
+      },
+      "hd_render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_1/Segment1Scene_render.mp4"
+        ]
+      },
+      "stitch": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_1_stitched.mp4"
+        ]
+      }
+    },
+    "2": {
+      "tts": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_2_audio.wav"
+        ]
+      },
+      "code": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_2/Segment2Scene_render.mp4"
+        ]
+      },
+      "render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_2/Segment2Scene_render.mp4"
+        ]
+      },
+      "hd_render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_2/Segment2Scene_render.mp4"
+        ]
+      },
+      "stitch": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_2_stitched.mp4"
+        ]
+      }
+    },
+    "3": {
+      "tts": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_3_audio.wav"
+        ]
+      },
+      "code": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_3/Segment3Scene_render.mp4"
+        ]
+      },
+      "render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_3/Segment3Scene_render.mp4"
+        ]
+      },
+      "hd_render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_3/Segment3Scene_render.mp4"
+        ]
+      },
+      "stitch": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_3_stitched.mp4"
+        ]
+      }
+    },
+    "4": {
+      "tts": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_4_audio.wav"
+        ]
+      },
+      "code": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_4/Segment4Scene_render.mp4"
+        ]
+      },
+      "render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_4/Segment4Scene_render.mp4"
+        ]
+      },
+      "hd_render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_4/Segment4Scene_render.mp4"
+        ]
+      },
+      "stitch": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_4_stitched.mp4"
+        ]
+      }
+    },
+    "5": {
+      "tts": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_5_audio.wav"
+        ]
+      },
+      "code": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_5/Segment5Scene_render.mp4"
+        ]
+      },
+      "render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_5/Segment5Scene_render.mp4"
+        ]
+      },
+      "hd_render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_5/Segment5Scene_render.mp4"
+        ]
+      },
+      "stitch": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_5_stitched.mp4"
+        ]
+      }
+    },
+    "6": {
+      "tts": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_6_audio.wav"
+        ]
+      },
+      "code": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_6/Segment6Scene_render.mp4"
+        ]
+      },
+      "render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_6/Segment6Scene_render.mp4"
+        ]
+      },
+      "hd_render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_6/Segment6Scene_render.mp4"
+        ]
+      },
+      "stitch": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_6_stitched.mp4"
+        ]
+      }
+    },
+    "7": {
+      "tts": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_7_audio.wav"
+        ]
+      },
+      "code": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_7/Segment7Scene_render.mp4"
+        ]
+      },
+      "render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_7/Segment7Scene_render.mp4"
+        ]
+      },
+      "hd_render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_fourier_transform_3_min_video_1472/segment_7/Segment7Scene_render.mp4"
+        ]
+      },
+      "stitch": {
+        "done": true,
+        "artifacts": [
+          "output/the_fourier_transform_3_min_video_1472/segment_7_stitched.mp4"
+        ]
+      }
+    }
+  }
+}

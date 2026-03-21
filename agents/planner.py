@@ -16,9 +16,9 @@ class Storyboard(BaseModel):
     )
 
 
-# ── New segmented storyboard models ──────────────────────────────────
+# ── New segmented storyboard models (Lite) ──────────────────────────
 
-class Segment(BaseModel):
+class SegmentLite(BaseModel):
     id: int = Field(ge=1)
     title: str = Field(min_length=1)
     visual_instructions: str = Field(min_length=1)
@@ -31,13 +31,40 @@ class Segment(BaseModel):
         ),
     )
 
-
-class SegmentedStoryboard(BaseModel):
-    segments: list[Segment] = Field(min_length=1)
+class SegmentedStoryboardLite(BaseModel):
+    segments: list[SegmentLite] = Field(min_length=1)
     clarifying_questions: list[str] = Field(
         default_factory=list,
         description="Optional clarifying questions to ask the user if the topic is too broad or ambiguous."
     )
+
+# ── New segmented storyboard models (Pro) ───────────────────────────
+
+class ProSegment(BaseModel):
+    id: int = Field(ge=1)
+    title: str = Field(description="e.g. 'Prerequisite: The Dot Product' or 'Core Proof'")
+    
+    # Mathematical Rigor
+    equations_latex: list[str] = Field(description="Raw LaTeX strings (double backslashes)")
+    variable_definitions: dict[str, str] = Field(description="Maps LaTeX symbols to physical/math meanings")
+    
+    # Visual Design
+    elements: list[str] = Field(description="Visual objects like 'graph', 'axes', 'triangle'")
+    element_colors: dict[str, str] = Field(description="Map elements/variables to specific palette colors")
+    animations: list[str] = Field(description="Specific Manim animations (e.g., TransformMatchingTex)")
+    layout_instructions: str = Field(description="Spatial arrangement on screen")
+    visual_instructions: str = Field(description="Very specific, step-by-step chronological instructions for how the scene should unfold visually. Tie all the elements and animations together.")
+    
+    # Timing and Audio
+    audio_script: str = Field()
+    duration_hint_seconds: int = Field(description="Minimum time needed to digest the visuals")
+    complexity: Literal["simple", "complex"] = Field(default="complex")
+
+class ProSegmentedStoryboard(BaseModel):
+    theme_name: str = Field(description="e.g. 'Classic 3b1b', 'Dark Neon', 'Blueprint'")
+    color_palette: dict[str, str] = Field(description="Dictionary of 5-7 hex colors representing the theme")
+    segments: list[ProSegment] = Field(min_length=1)
+    clarifying_questions: list[str] = Field(default_factory=list)
 
 
 def _extract_json_text(raw_text: str) -> str:
@@ -121,9 +148,9 @@ Return ONLY the JSON. No markdown formatting.
     yield {"final": True, "error": f"Failed to generate a valid storyboard after {max_retries} attempts: {last_error}"}
 
 
-# ── New segmented planner ─────────────────────────────────────────────
+# ── Lite segmented planner ─────────────────────────────────────────────
 
-def plan_segmented_storyboard(
+def plan_segmented_storyboard_lite(
     concept: str,
     max_retries: int = 3,
     previous_storyboard: dict | None = None,
@@ -195,7 +222,7 @@ Return ONLY the JSON. No markdown formatting.
         try:
             yield {"status": "Validating segmented storyboard against schema..."}
             payload = json.loads(text)
-            storyboard = SegmentedStoryboard.model_validate(payload)
+            storyboard = SegmentedStoryboardLite.model_validate(payload)
             yield {"final": True, "storyboard": storyboard.model_dump()}
             return
         except (json.JSONDecodeError, ValidationError) as exc:
@@ -210,3 +237,93 @@ Return ONLY the JSON. No markdown formatting.
             )
 
     yield {"final": True, "error": f"Failed to generate a valid segmented storyboard after {max_retries} attempts: {last_error}"}
+
+# ── Pro segmented planner ─────────────────────────────────────────────
+
+def plan_segmented_storyboard(
+    concept: str,
+    max_retries: int = 3,
+    previous_storyboard: dict | None = None,
+    feedback: str | None = None,
+) -> Iterator[dict]:
+    """Generate a multi-segment structured storyboard (PRO version).
+    Yields status dicts and finally ``{"final": True, "storyboard": {...}}``.
+    """
+    client = genai.Client()
+
+    base_prompt = f"""
+You are an expert educational video planner and pedagogical expert.
+The user wants to create a Manim educational video about the following concept: "{concept}"
+    """
+
+    if previous_storyboard and feedback:
+        base_prompt += f"""
+Here is the previous storyboard you generated:
+{json.dumps(previous_storyboard, indent=2)}
+
+The user provided the following feedback to improve it:
+"{feedback}"
+
+Please revise the storyboard according to the feedback.
+"""
+
+    base_prompt += """
+Please create a highly structured, pedagogical **segmented** storyboard.
+Break the video into logical segments.
+CRITICAL PEDAGOGICAL PROGRESSION: The very first segment MUST establish foundational prerequisites. Build complexity progressively.
+
+Provide your response as a JSON object matching the requested schema with these keys:
+1. "theme_name": A creative theme (e.g. 'Classic 3b1b', 'Dark Neon', 'Blueprint').
+2. "color_palette": A dictionary of 5-7 meaningful hex colors representing the theme.
+3. "segments": A JSON array where each element has:
+   - "id": An integer starting from 1.
+   - "title": A short descriptive title (e.g. 'Prerequisite: The Dot Product', 'Core Proof').
+   - "equations_latex": Array of raw LaTeX strings with double backslashes for ALL math.
+   - "variable_definitions": Dictionary mapping LaTeX symbols to their meanings.
+   - "elements": Array of visual objects to draw (e.g. 'graph', 'function curve', 'unit circle').
+   - "element_colors": Dictionary mapping elements/variables to specific colors from your theme.
+   - "animations": Array of specific Manim animations (e.g. 'TransformMatchingTex', 'Create').
+   - "layout_instructions": Description of spatial arrangement on the screen.
+   - "visual_instructions": Very specific, step-by-step chronological instructions for how the scene should unfold visually.
+   - "audio_script": The words the narrator will say.
+   - "duration_hint_seconds": Minimum time needed to digest the visuals (allow extra time for complex math pauses).
+   - "complexity": "simple" or "complex".
+
+4. "clarifying_questions": (Optional)
+
+Return ONLY the JSON. No markdown formatting.
+    """
+    prompt = base_prompt
+    last_error = "unknown validation error"
+
+    for attempt in range(max_retries):
+        if previous_storyboard and feedback:
+            yield {"status": f"Refining PRO structured storyboard (Attempt {attempt + 1})..."}
+        else:
+            yield {"status": f"Drafting PRO structured storyboard (Attempt {attempt + 1})..."}
+
+        response = client.models.generate_content(
+            model="gemini-3.1-pro-preview",
+            contents=prompt,
+        )
+        yield {"status": "Parsing generated content..."}
+        raw_text = response.text or ""
+        text = _extract_json_text(raw_text)
+
+        try:
+            yield {"status": "Validating PRO storyboard against schema..."}
+            payload = json.loads(text)
+            storyboard = ProSegmentedStoryboard.model_validate(payload)
+            yield {"final": True, "storyboard": storyboard.model_dump()}
+            return
+        except (json.JSONDecodeError, ValidationError) as exc:
+            yield {"status": f"Validation failed, preparing correction (Attempt {attempt + 1})..."}
+            last_error = str(exc)
+            prompt = (
+                f"{base_prompt}\n\n"
+                "Your previous response was invalid JSON for this schema.\n"
+                f"Validation/parsing error: {last_error}\n"
+                "Return ONLY a valid JSON object matching the requested fields."
+            )
+
+    yield {"final": True, "error": f"Failed to generate a valid PRO storyboard after {max_retries} attempts: {last_error}"}

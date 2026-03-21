@@ -1,0 +1,152 @@
+{
+  "concept": "The Dot Product",
+  "slug": "the_dot_product",
+  "created_at": "2026-03-07T21:14:34",
+  "updated_at": "2026-03-07T21:20:22",
+  "status": "completed",
+  "total_segments": 5,
+  "stages": {
+    "plan": {
+      "done": true,
+      "artifacts": []
+    },
+    "concat": {
+      "done": true,
+      "artifacts": [
+        "output/the_dot_product_5168/the_dot_product.mp4"
+      ]
+    }
+  },
+  "segments": {
+    "1": {
+      "tts": {
+        "done": true,
+        "artifacts": [
+          "output/the_dot_product_5168/segment_1_audio.wav"
+        ]
+      },
+      "code": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_dot_product_5168/segment_1/Segment1Scene_render.mp4"
+        ]
+      },
+      "render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_dot_product_5168/segment_1/Segment1Scene_render.mp4"
+        ]
+      },
+      "stitch": {
+        "done": true,
+        "artifacts": [
+          "output/the_dot_product_5168/segment_1_stitched.mp4"
+        ]
+      }
+    },
+    "2": {
+      "tts": {
+        "done": true,
+        "artifacts": [
+          "output/the_dot_product_5168/segment_2_audio.wav"
+        ]
+      },
+      "code": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_dot_product_5168/segment_2/Segment2Scene_render.mp4"
+        ]
+      },
+      "render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_dot_product_5168/segment_2/Segment2Scene_render.mp4"
+        ]
+      },
+      "stitch": {
+        "done": true,
+        "artifacts": [
+          "output/the_dot_product_5168/segment_2_stitched.mp4"
+        ]
+      }
+    },
+    "3": {
+      "tts": {
+        "done": true,
+        "artifacts": [
+          "output/the_dot_product_5168/segment_3_audio.wav"
+        ]
+      },
+      "code": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_dot_product_5168/segment_3/Segment3Scene_render.mp4"
+        ]
+      },
+      "render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_dot_product_5168/segment_3/Segment3Scene_render.mp4"
+        ]
+      },
+      "stitch": {
+        "done": true,
+        "artifacts": [
+          "output/the_dot_product_5168/segment_3_stitched.mp4"
+        ]
+      }
+    },
+    "4": {
+      "tts": {
+        "done": true,
+        "artifacts": [
+          "output/the_dot_product_5168/segment_4_audio.wav"
+        ]
+      },
+      "code": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_dot_product_5168/segment_4/Segment4Scene_render.mp4"
+        ]
+      },
+      "render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_dot_product_5168/segment_4/Segment4Scene_render.mp4"
+        ]
+      },
+      "stitch": {
+        "done": true,
+        "artifacts": [
+          "output/the_dot_product_5168/segment_4_stitched.mp4"
+        ]
+      }
+    },
+    "5": {
+      "tts": {
+        "done": true,
+        "artifacts": [
+          "output/the_dot_product_5168/segment_5_audio.wav"
+        ]
+      },
+      "code": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_dot_product_5168/segment_5/Segment5Scene_render.mp4"
+        ]
+      },
+      "render": {
+        "done": true,
+        "artifacts": [
+          "/Users/rishisim/Documents/projects/paper2manim/output/the_dot_product_5168/segment_5/Segment5Scene_render.mp4"
+        ]
+      },
+      "stitch": {
+        "done": true,
+        "artifacts": [
+          "output/the_dot_product_5168/segment_5_stitched.mp4"
+        ]
+      }
+    }
+  }
+}

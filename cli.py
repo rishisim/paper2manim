@@ -21,7 +21,8 @@ from rich.rule import Rule
 from rich import box
 
 from agents.coder import run_coder_agent
-from agents.planner import plan_video_concept
+from agents.planner import plan_segmented_storyboard, plan_segmented_storyboard_lite
+from agents.pipeline import run_segmented_pipeline
 from utils.media_assembler import stitch_video_and_audio
 from utils.tts_engine import generate_voiceover
 from utils.project_state import (
@@ -163,6 +164,8 @@ def parse_args() -> argparse.Namespace:
                         help="Show detailed diagnostics for failures")
     parser.add_argument("--skip-audio", action="store_true",
                         help="Skip TTS and stitching; render animation only")
+    parser.add_argument("--lite", action="store_true",
+                        help="Use the faster, less detailed original pipeline instead of the Math-To-Manim structured pipeline")
     parser.add_argument("--workspace", action="store_true", 
                         help="Open the interactive workspace dashboard to view, resume or delete projects.")
     parser.add_argument("--resume", type=str, metavar="DIR",
@@ -202,6 +205,7 @@ def save_pipeline_summary(
     stages: list[tuple[str, str, float]],
     output_dir: str,
     concept: str = "",
+    tool_call_counts: dict[str, int] | None = None,
 ) -> str:
     """Write a plain-text pipeline summary to ``output_dir/pipeline_summary.txt``."""
     total = sum(e for _, _, e in stages)
@@ -220,6 +224,21 @@ def save_pipeline_summary(
     lines.append("-" * 50)
     lines.append(f"{'':8} {'Total':<25} {total:>7.1f}s")
     lines.append("")
+
+    lines.append("Tool Calls")
+    lines.append("=" * 50)
+    tool_call_counts = tool_call_counts or {}
+    total_tool_calls = sum(tool_call_counts.values())
+    lines.append(f"Total  : {total_tool_calls}")
+    lines.append("")
+    if tool_call_counts:
+        for tool_name, count in sorted(tool_call_counts.items()):
+            lines.append(f"- {tool_name}")
+            lines.append(f"  Calls : {count}")
+            lines.append("")
+    else:
+        lines.append("No tool calls recorded.")
+        lines.append("")
 
     os.makedirs(output_dir, exist_ok=True)
     summary_path = os.path.join(output_dir, "pipeline_summary.txt")
@@ -462,175 +481,61 @@ def main() -> None:
 
     stages: list[tuple[str, str, float]] = []
 
-    # ── Planning ──────────────────────────────────────────────────
-    storyboard = None
-    previous_storyboard = None
-    feedback = None
-    plan_elapsed_total = 0.0
-
-    while True:
-        try:
-            result, elapsed = run_stage(
-                "Planning storyboard",
-                plan_video_concept,
-                concept,
-                previous_storyboard=previous_storyboard,
-                feedback=feedback,
-            )
-            plan_elapsed_total += elapsed
-            if result and "error" in result:
-                _log_stage_fail("Planning storyboard", plan_elapsed_total)
-                stages.append(("Plan", "failed", plan_elapsed_total))
-                print_pipeline_summary(stages)
-                _print_error(result["error"])
-                sys.exit(1)
-            storyboard = result.get("storyboard") if result else None
-        except Exception as exc:
-            _log_stage_fail("Planning storyboard", plan_elapsed_total)
-            stages.append(("Plan", "failed", plan_elapsed_total))
-            print_pipeline_summary(stages)
-            _print_error(str(exc))
-            sys.exit(1)
-
-        _log_stage_done("Planning storyboard", plan_elapsed_total)
-        console.print()
-
-        # Show storyboard in panels
-        _print_storyboard(storyboard)
-
-        if storyboard.get("clarifying_questions"):
-            console.print()
-            console.print(Panel(
-                "\n".join(f"  [white]•[/white] {q}" for q in storyboard["clarifying_questions"]),
-                title="[bold yellow]Clarifying Questions[/bold yellow]",
-                title_align="left",
-                border_style=WARN,
-                padding=(1, 2),
-            ))
-
-        ok = Confirm.ask(f"  [{ACCENT}]?[/{ACCENT}] [bold]Proceed with this storyboard?[/bold]", default=True)
-        if ok:
-            break
-
-        feedback = Prompt.ask(f"  [{ACCENT}]>[/{ACCENT}] [bold]What should be changed?[/bold]")
-        previous_storyboard = storyboard
-        console.print()
-
-    stages.append(("Plan", "ok", plan_elapsed_total))
-    mark_stage_done(output_dir, "plan", artifacts=[])
-
-    # ── Voiceover ─────────────────────────────────────────────────
-    audio_path = os.path.join(output_dir, "voiceover.wav")
-    if not args.skip_audio:
-        tts_result, elapsed = run_stage(
-            "Generating voiceover",
-            generate_voiceover,
-            storyboard["audio_script"],
-            audio_path,
-        )
-        if not tts_result or not tts_result.get("success"):
-            _log_stage_fail("Generating voiceover", elapsed)
-            stages.append(("Voiceover", "failed", elapsed))
-            print_pipeline_summary(stages)
-            detail = tts_result.get("error") if args.verbose and tts_result else None
-            _print_error("Voiceover generation failed.", detail)
-            sys.exit(1)
-        _log_stage_done("Generating voiceover", elapsed)
-        audio_path = tts_result.get("audio_path", audio_path)
-        mark_stage_done(output_dir, "voiceover", artifacts=[audio_path])
-        stages.append(("Voiceover", "ok", elapsed))
-
-    # ── Code Generation + Render ──────────────────────────────────
-    _log_stage_header("Generating Manim code")
-    code_started = time.perf_counter()
+    # ── Segmented Pipeline Runner ─────────────────────────────────
+    _log_stage_header(f"Running {'Lite' if args.lite else 'Pro'} Segmented Pipeline")
+    pipeline_generator = run_segmented_pipeline(concept, output_base="output", max_retries=args.max_retries, is_lite=args.lite)
+    
     final_video_path = None
-    final_error = None
-    coder_steps: list[str] = []
+    output_dir = None
+    
     spinner = _Spinner("starting…")
     spinner.start()
-
-    audio_duration = 0.0
-    if not args.skip_audio and 'tts_result' in locals() and tts_result:
-        audio_duration = tts_result.get("duration", 0.0)
-
+    
+    last_stage = None
+    stage_start_time = time.perf_counter()
+    
     try:
-        for update in run_coder_agent(
-            storyboard["visual_instructions"],
-            max_retries=max(0, args.max_retries),
-            audio_script=storyboard.get("audio_script", ""),
-            audio_duration=audio_duration,
-            output_dir=output_dir,
-        ):
+        for update in pipeline_generator:
+            current_stage = update.get("stage", "unknown")
+            if current_stage != last_stage:
+                if last_stage:
+                    elapsed = time.perf_counter() - stage_start_time
+                    spinner.stop()
+                    _log_stage_done(f"Stage: {last_stage}", elapsed)
+                    stages.append((last_stage, "ok", elapsed))
+                    spinner.start()
+                last_stage = current_stage
+                stage_start_time = time.perf_counter()
+
             status = update.get("status", "")
             if status:
-                if coder_steps:
-                    spinner.stop()
-                    _log_step(coder_steps[-1])
-                    spinner.start()
-                coder_steps.append(status)
                 spinner.update(status)
-
+                
             if update.get("final"):
                 final_video_path = update.get("video_path")
-                final_error = update.get("error")
-                break
+                output_dir = update.get("project_dir", output_dir)
+                if "error" in update and update["error"]:
+                    spinner.stop()
+                    elapsed = time.perf_counter() - stage_start_time
+                    _log_stage_fail(f"Stage: {last_stage}", elapsed)
+                    stages.append((last_stage, "failed", elapsed))
+                    _print_error("Pipeline failed", update["error"])
+                    sys.exit(1)
     finally:
         spinner.stop()
 
-    if coder_steps:
-        _log_step(coder_steps[-1], last=True)
-
-    code_elapsed = time.perf_counter() - code_started
+    if last_stage:
+        elapsed = time.perf_counter() - stage_start_time
+        _log_stage_done(f"Stage: {last_stage}", elapsed)
+        stages.append((last_stage, "ok", elapsed))
 
     if not final_video_path:
-        _log_stage_fail("Generating Manim code", code_elapsed)
-        stages.append(("Code + Render", "failed", code_elapsed))
-        print_pipeline_summary(stages)
-        detail = final_error if args.verbose else None
-        _print_error("Manim generation failed after retries.", detail)
+        _print_error("Pipeline completed but no final video was produced.")
         sys.exit(1)
 
-    _log_stage_done("Generating Manim code", code_elapsed)
-    mark_stage_done(output_dir, "code", artifacts=[final_video_path])
-    stages.append(("Code + Render", "ok", code_elapsed))
-
-    # ── Skip-audio shortcut ───────────────────────────────────────
-    if args.skip_audio:
-        mark_project_complete(output_dir)
-        print_pipeline_summary(stages)
-        save_pipeline_summary(stages, output_dir, concept)
-        _print_output(final_video_path)
-        _open_file(final_video_path)
-        return
-
-    # ── Stitching ─────────────────────────────────────────────────
-    final_output = os.path.join(output_dir, f"{concept_slug}.mp4")
-    stitch_result, elapsed = run_stage(
-        "Stitching video + audio",
-        stitch_video_and_audio,
-        final_video_path,
-        audio_path,
-        final_output,
-    )
-    if stitch_result and stitch_result.get("success"):
-        _log_stage_done("Stitching video + audio", elapsed)
-        mark_stage_done(output_dir, "stitch", artifacts=[final_output])
-        mark_project_complete(output_dir)
-        stages.append(("Stitch", "ok", elapsed))
-        print_pipeline_summary(stages)
-        save_pipeline_summary(stages, output_dir, concept)
-        _print_output(final_output)
-        _open_file(final_output)
-    else:
-        _log_stage_fail("Stitching video + audio", elapsed)
-        stages.append(("Stitch", "failed", elapsed))
-        print_pipeline_summary(stages)
-        save_pipeline_summary(stages, output_dir, concept)
-        console.print(f"  [{WARN}]⚠  Stitching failed — opening raw animation instead.[/{WARN}]")
-        if args.verbose and stitch_result and stitch_result.get("error"):
-            console.print(f"  [{DIM}]{stitch_result['error']}[/{DIM}]")
-        _print_output(final_video_path)
-        _open_file(final_video_path)
+    print_pipeline_summary(stages)
+    _print_output(final_video_path)
+    _open_file(final_video_path)
 
 
 def _open_file(path: str) -> None:

@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: paper2manim
+Version: 0.1.0
+Summary: Generate an educational video from a concept using Manim.
+Requires-Python: >=3.9
+Requires-Dist: manim
+Requires-Dist: google-genai
+Requires-Dist: pydantic
+Requires-Dist: rich
+Requires-Dist: python-dotenv
+Requires-Dist: edge-tts
+Requires-Dist: beautifulsoup4
+Requires-Dist: requests
+Requires-Dist: moviepy

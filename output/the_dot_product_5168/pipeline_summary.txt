@@ -1,0 +1,28 @@
+Pipeline Summary
+==================================================
+Concept : The Dot Product
+Date    : 2026-03-07 21:20:22
+
+Status   Stage                         Time
+--------------------------------------------------
+OK       Plan                         36.0s
+OK       Voiceover                    11.5s
+OK       Code + Render               320.9s
+OK       Stitch                        1.2s
+OK       Concat                       13.5s
+--------------------------------------------------
+         Total                       383.1s
+
+Tool Calls
+==================================================
+Total  : 10
+
+- fetch_golden_scenes
+  Calls : 1
+
+- fetch_manim_docs
+  Calls : 7
+
+- search_web
+  Calls : 2
+

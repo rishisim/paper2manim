@@ -1,0 +1,2 @@
+[console_scripts]
+paper2manim = cli:main

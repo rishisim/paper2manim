@@ -30,12 +30,17 @@ def run_manim_code(code: str, class_name: str, quality_flag: str = "-ql", timeou
         cmd = ["manim", quality_flag, "--media_dir", temp_dir, script_path, class_name]
         
         try:
+            env = os.environ.copy()
+            if "/Library/TeX/texbin" not in env.get("PATH", ""):
+                env["PATH"] = f"/Library/TeX/texbin:{env.get('PATH', '')}"
+                
             result = subprocess.run(
                 cmd,
                 cwd=temp_dir,
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
+                env=env,
             )
             if result.returncode == 0:
                 # Find the generated mp4 video

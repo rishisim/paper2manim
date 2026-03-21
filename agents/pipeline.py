@@ -18,11 +18,12 @@ import re
 import time
 from typing import Any, Callable, Iterator, Optional
 
-from agents.planner import plan_segmented_storyboard
+from agents.planner import plan_segmented_storyboard, plan_segmented_storyboard_lite
+from agents.planner_math2manim import run_math2manim_planner
 from agents.coder import run_coder_agent, run_coder_agent_async
 from utils.tts_engine import generate_voiceover, generate_voiceover_async
 from utils.media_assembler import stitch_video_and_audio, concatenate_segments
-from utils.parallel_renderer import RenderJob, render_two_pass
+from utils.parallel_renderer import RenderJob, render_two_pass, render_parallel
 from utils.project_state import (
     create_project,
     load_project,
@@ -43,6 +44,7 @@ def _save_pipeline_summary(
     timings: list[tuple[str, str, float]],
     project_dir: str,
     concept: str = "",
+    tool_call_counts: dict[str, int] | None = None,
 ) -> str:
     """Write a plain-text pipeline summary to ``project_dir/pipeline_summary.txt``."""
     import time as _time
@@ -64,6 +66,21 @@ def _save_pipeline_summary(
     lines.append(f"{'':8} {'Total':<25} {total:>7.1f}s")
     lines.append("")
 
+    lines.append("Tool Calls")
+    lines.append("=" * 50)
+    tool_call_counts = tool_call_counts or {}
+    total_tool_calls = sum(tool_call_counts.values())
+    lines.append(f"Total  : {total_tool_calls}")
+    lines.append("")
+    if tool_call_counts:
+        for tool_name, count in sorted(tool_call_counts.items()):
+            lines.append(f"- {tool_name}")
+            lines.append(f"  Calls : {count}")
+            lines.append("")
+    else:
+        lines.append("No tool calls recorded.")
+        lines.append("")
+
     os.makedirs(project_dir, exist_ok=True)
     summary_path = os.path.join(project_dir, "pipeline_summary.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -79,6 +96,7 @@ def run_segmented_pipeline(
     max_retries: int = 3,
     previous_storyboard: dict | None = None,
     feedback: str | None = None,
+    is_lite: bool = False,
 ) -> Iterator[dict]:
     """Run the full segmented pipeline, yielding progress updates.
 
@@ -92,7 +110,8 @@ def run_segmented_pipeline(
     plan_start = time.perf_counter()
 
     storyboard = None
-    for update in plan_segmented_storyboard(
+    planner_func = plan_segmented_storyboard_lite if is_lite else run_math2manim_planner
+    for update in planner_func(
         concept,
         max_retries=max_retries,
         previous_storyboard=previous_storyboard,
@@ -169,22 +188,40 @@ def run_segmented_pipeline(
     code_start = time.perf_counter()
 
     code_results: dict[int, dict] = {}
+    tool_call_counts: dict[str, int] = {}
+
+    def _merge_tool_calls(counts: dict[str, int] | None) -> None:
+        if not counts:
+            return
+        for tool_name, count in counts.items():
+            if not isinstance(count, int):
+                continue
+            tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + count
 
     async def _run_all_coder():
         tasks = []
+        theme_name = storyboard.get("theme_name", "")
+        color_palette = storyboard.get("color_palette", {})
+        
         for seg in segments:
             seg_id = seg["id"]
             seg_output_dir = os.path.join(project_dir, f"segment_{seg_id}")
             os.makedirs(seg_output_dir, exist_ok=True)
             tts_r = tts_results.get(seg_id, {})
+            
+            # Pass simple string for Lite, pass full segment dict for Pro
+            coder_instructions = seg["visual_instructions"] if is_lite else seg
+            
             tasks.append(run_coder_agent_async(
-                visual_instructions=seg["visual_instructions"],
+                instructions=coder_instructions,
                 max_retries=max_retries,
                 audio_script=seg.get("audio_script", ""),
                 audio_duration=tts_r.get("duration", 0.0) or 0.0,
                 complexity=seg.get("complexity", "complex"),
                 scene_class_name=f"Segment{seg_id}Scene",
                 output_dir=seg_output_dir,
+                theme_name=theme_name,
+                color_palette=color_palette,
             ))
         return await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -197,6 +234,7 @@ def run_segmented_pipeline(
             mark_segment_stage(project_dir, seg_id, "code", done=False, error=str(result))
         else:
             code_results[seg_id] = result
+            _merge_tool_calls(result.get("tool_call_counts"))
             has_video = result.get("video_path") is not None
             if has_video:
                 mark_segment_stage(project_dir, seg_id, "code", done=True,
@@ -209,12 +247,49 @@ def run_segmented_pipeline(
 
     code_ok = sum(1 for r in code_results.values() if r.get("video_path"))
     code_elapsed = time.perf_counter() - code_start
-    timings.append(("Code + Render", "ok" if code_ok > 0 else "failed", code_elapsed))
+    timings.append(("Code + Draft Render", "ok" if code_ok > 0 else "failed", code_elapsed))
     yield {
         "stage": "code",
         "status": f"Code generation complete: {code_ok}/{num_segments} have videos",
         "code_results": code_results,
     }
+
+    # ── Step 3.5: Parallel HD Rendering ───────────────────────────
+    if code_ok > 0:
+        yield {"stage": "render", "status": f"Rendering final HD videos for {code_ok} segments in parallel..."}
+        render_start = time.perf_counter()
+        
+        hd_jobs = []
+        for seg in segments:
+            seg_id = seg["id"]
+            if code_results.get(seg_id, {}).get("code") and code_results.get(seg_id, {}).get("video_path"):
+                seg_output_dir = os.path.join(project_dir, f"segment_{seg_id}")
+                hd_jobs.append(RenderJob(
+                    segment_id=seg_id,
+                    code=code_results[seg_id]["code"],
+                    quality_flag="-qh",
+                    timeout_seconds=300,
+                    output_dir=seg_output_dir,
+                ))
+        
+        hd_results = render_parallel(hd_jobs)
+        hd_ok = 0
+        for res in hd_results:
+            seg_id = res.segment_id
+            if res.success and res.video_path:
+                code_results[seg_id]["video_path"] = res.video_path
+                hd_ok += 1
+                mark_segment_stage(project_dir, seg_id, "hd_render", done=True, artifacts=[res.video_path])
+            else:
+                mark_segment_stage(project_dir, seg_id, "hd_render", done=False, error=res.error or "Unknown error")
+                
+        render_elapsed = time.perf_counter() - render_start
+        timings.append(("HD Render", "ok" if hd_ok == code_ok else "partial", render_elapsed))
+        yield {
+            "stage": "render",
+            "status": f"HD Rendering complete: {hd_ok}/{code_ok} succeeded",
+            "code_results": code_results,
+        }
 
     # ── Step 4: Stitch audio+video per segment ────────────────────────
 
@@ -281,8 +356,10 @@ def run_segmented_pipeline(
             "final": True,
             "project_dir": project_dir,
             "timings": timings,
+            "tool_call_counts": dict(sorted(tool_call_counts.items())),
+            "total_tool_calls": sum(tool_call_counts.values()),
         }
-        _save_pipeline_summary(timings, project_dir, concept)
+        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts)
         return
 
     final_output = os.path.join(project_dir, f"{slug}.mp4")
@@ -302,7 +379,7 @@ def run_segmented_pipeline(
         timings.append(("Concat", "ok", concat_elapsed))
         mark_stage_done(project_dir, "concat", artifacts=[final_output])
         mark_project_complete(project_dir)
-        _save_pipeline_summary(timings, project_dir, concept)
+        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts)
         yield {
             "stage": "done",
             "status": "Pipeline complete!",
@@ -312,11 +389,13 @@ def run_segmented_pipeline(
             "num_segments": num_segments,
             "stitch_errors": stitch_errors,
             "timings": timings,
+            "tool_call_counts": dict(sorted(tool_call_counts.items())),
+            "total_tool_calls": sum(tool_call_counts.values()),
         }
     else:
         err = concat_result.get("error", "unknown") if concat_result else "unknown"
         timings.append(("Concat", "failed", concat_elapsed))
-        _save_pipeline_summary(timings, project_dir, concept)
+        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts)
         # If concat fails but we have segments, return the first one
         yield {
             "stage": "done",
@@ -327,4 +406,6 @@ def run_segmented_pipeline(
             "project_dir": project_dir,
             "num_segments": num_segments,
             "timings": timings,
+            "tool_call_counts": dict(sorted(tool_call_counts.items())),
+            "total_tool_calls": sum(tool_call_counts.values()),
         }

@@ -1,0 +1,9 @@
+manim
+google-genai
+pydantic
+rich
+python-dotenv
+edge-tts
+beautifulsoup4
+requests
+moviepy

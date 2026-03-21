@@ -1,0 +1,26 @@
+Pipeline Summary
+==================================================
+Concept : The Fourier Transform 3 min video
+Date    : 2026-03-09 00:20:08
+
+Status   Stage                         Time
+--------------------------------------------------
+OK       Plan                        126.0s
+OK       Voiceover                    26.5s
+OK       Code + Draft Render         206.9s
+OK       HD Render                   125.6s
+OK       Stitch                        1.6s
+OK       Concat                       30.6s
+--------------------------------------------------
+         Total                       517.2s
+
+Tool Calls
+==================================================
+Total  : 16
+
+- fetch_manim_docs
+  Calls : 15
+
+- search_web
+  Calls : 1
+

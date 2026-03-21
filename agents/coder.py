@@ -29,7 +29,7 @@ from utils.manim_runner import run_manim_code, extract_class_name
 MODEL_PRO = "gemini-3.1-pro-preview"          # complex segments
 MODEL_FLASH = "gemini-flash-latest"            # simple segments (fast)
 
-MAX_TOOL_CALLS = 10  # bumped from 5 → 10
+MAX_TOOL_CALLS = 3  # reduced from 10 to speed up execution and prevent infinite loops
 
 # ── helpers ───────────────────────────────────────────────────────────
 
@@ -81,12 +81,13 @@ IMPORTANT RULES:
 - Import manim: `from manim import *`
 - Define exactly one class inheriting from `Scene`, named `GeneratedScene`.
 - **AESTHETICS & QUALITY:** 
-  - Set the background to dark: `self.camera.background_color = "#141414"`.
-  - Use vibrant 3b1b-style accent colors (e.g., TEAL (`#5CD0B3`), YELLOW (`#E8C11C`), RED (`#FC6255`), BLUE (`#58C4DD`), GREEN (`#83C167`)).
-  - Use elegant and sophisticated animations: `TransformMatchingTex`, `TransformMatchingShapes`, `LaggedStart`, `AnimationGroup`, `FadeIn(..., shift=UP)`. Avoid having elements just pop into existence.
+  - Set the background to dark: `self.camera.background_color = "#141414"` (unless a different instruction overrides this).
+  - Use the color palette and styling instructions provided in the prompt.
+  - Use elegant and sophisticated animations: `TransformMatchingTex`, `TransformMatchingShapes`, `LaggedStart`, `AnimationGroup`, `FadeIn`. Avoid having elements just pop into existence.
   - Utilize rate functions like `rate_func=smooth` or `rate_func=there_and_back` to make movement feel organic.
 - No external assets (SVGs, images, audio files). Everything must be generated via code.
 - Avoid `MathTex`/`Tex` unless the visual instructions explicitly require LaTeX equations. If you do use them, look up their docs first.
+- If you receive `FileNotFoundError` mentioning `tex_to_svg_file`, DO NOT stretch into tool searches to find out why! This is a known Manim quirk: it simply means YOUR LaTeX code failed to compile due to a syntax error. Fix your LaTeX string instead (e.g., check for missing `\\`, unescaped characters, or undefined commands like `\\mathrm`).
 - Keep code deterministic — no randomness.
 """
 
@@ -129,7 +130,11 @@ def _dispatch_tool_call(fc) -> str:
         return f"Error executing tool: {e}"
 
 
-def _send_and_extract(chat, message: str) -> str:
+def _send_and_extract(
+    chat,
+    message: str,
+    tool_call_counts: dict[str, int] | None = None,
+) -> str:
     """Send a message through the chat (which handles tool calls
     automatically) and return the final text with code fences stripped."""
     calls = 0
@@ -142,6 +147,8 @@ def _send_and_extract(chat, message: str) -> str:
         tool_responses = []
         for fc in response.function_calls:
             print(f"  [Coder] Tool usage ({calls}/{MAX_TOOL_CALLS}): {fc.name}({fc.args})")
+            if tool_call_counts is not None:
+                tool_call_counts[fc.name] = tool_call_counts.get(fc.name, 0) + 1
             res = _dispatch_tool_call(fc)
                 
             if calls >= MAX_TOOL_CALLS:
@@ -169,36 +176,81 @@ def _send_and_extract(chat, message: str) -> str:
 # ── public generators ─────────────────────────────────────────────────
 
 def generate_manim_script(
-    instructions: str,
+    instructions: str | dict,
     audio_script: str = "",
     audio_duration: float = 0.0,
     complexity: str = "complex",
     scene_class_name: str = "GeneratedScene",
+    tool_call_counts: dict[str, int] | None = None,
+    theme_name: str = "",
+    color_palette: dict[str, str] | None = None,
 ) -> Iterator[str]:
     """Yield the final generated code (single yield after tool calls resolve)."""
     model = _get_model_for_complexity(complexity)
     client = genai.Client()
     chat = client.chats.create(model=model, config=_build_config(complexity))
 
-    prompt = (
-        "Write a complete Manim script for the following visual instructions.\n"
-        "Before writing any code, look up the documentation for the main "
-        "classes and animations you plan to use.\n"
-        "If you're unsure about a technique, use search_web() to find code examples.\n\n"
-        f"The scene class MUST be named `{scene_class_name}`.\n\n"
-        f"Instructions:\n{instructions}\n\n"
-    )
+    # Build the prompt dynamically based on whether it's Lite (str) or Pro (dict)
+    if isinstance(instructions, str):
+        prompt = (
+            "Write a complete Manim script for the following visual instructions.\n"
+            "Before writing any code, look up the documentation for the main "
+            "classes and animations you plan to use.\n"
+            "If you're unsure about a technique, use search_web() to find code examples.\n\n"
+            f"The scene class MUST be named `{scene_class_name}`.\n\n"
+            f"Instructions:\n{instructions}\n\n"
+        )
+    else:
+        # Structured Pro segment
+        seg = instructions
+        
+        # Merge theme and segment-specific colors
+        palette_str = "No specific palette provided."
+        if color_palette:
+            palette_str = "\n".join([f"- {k}: {v}" for k, v in color_palette.items()])
+            
+        equations_str = "\n".join([f"- {eq}" for eq in seg.get('equations_latex', [])])
+        vars_str = "\n".join([f"- {k}: {v}" for k, v in seg.get('variable_definitions', {}).items()])
+        elements_str = "\n".join([f"- {el}" for el in seg.get('elements', [])])
+        element_colors_str = "\n".join([f"- {k}: {v}" for k, v in seg.get('element_colors', {}).items()])
+        animations_str = "\n".join([f"- {a}" for a in seg.get('animations', [])])
+        
+        prompt = (
+            "Write a complete Manim script for the following highly structured scene specification.\n"
+            "Before writing any code, look up the documentation for the main "
+            "classes and animations you plan to use.\n"
+            "If you're unsure about a technique, use search_web() to find code examples.\n\n"
+            f"The scene class MUST be named `{scene_class_name}`.\n\n"
+            f"### Visual Theme: {theme_name or 'Default'}\n"
+            f"Global Color Palette:\n{palette_str}\n\n"
+            f"### Mathematical Content (CRITICAL)\n"
+            f"You MUST use THESE EXACT LaTeX strings using double backslashes (e.g. r\"$\\frac{{1}}{{2}}$\"):\n{equations_str}\n\n"
+            f"Variable Meanings (for your understanding):\n{vars_str}\n\n"
+            f"### Visual Layout & Elements\n"
+            f"Layout Instructions: {seg.get('layout_instructions', '')}\n"
+            f"Elements to draw:\n{elements_str}\n\n"
+            f"Element Color Mapping:\n{element_colors_str}\n\n"
+            f"### Visual & Animation Flow\n"
+            f"Narrative Flow Instructions:\n{seg.get('visual_instructions', '')}\n\n"
+            f"Required Animations:\n{animations_str}\n\n"
+        )
+
     if audio_script and audio_duration > 0:
+        duration_hint = ""
+        if isinstance(instructions, dict) and instructions.get("duration_hint_seconds"):
+            duration_hint = f"\nNote: The planner also suggested a minimum digest time of {instructions['duration_hint_seconds']} seconds for the visuals to breathe. Add `self.wait()` padding if necessary to allow math comprehension.\n"
+
         prompt += (
             f"CRITICAL TIMING MATCH: The generated voiceover for this segment is exactly {audio_duration:.1f} seconds long.\n"
             f"The narrator will say: \"{audio_script}\"\n"
-            "You MUST time your animations (using `run_time` and `self.wait()`) so that the total scene duration perfectly matches the audio duration. "
+            "You MUST time your animations (using `run_time` and `self.wait()`) so that the total scene duration perfectly matches or slightly exceeds the audio duration. "
             "Pace the visuals rhythmically to match the spoken sentences. DO NOT rush through the animations.\n"
+            f"{duration_hint}"
         )
 
     yield "looking up docs"  # signal to caller
 
-    code = _send_and_extract(chat, prompt)
+    code = _send_and_extract(chat, prompt, tool_call_counts=tool_call_counts)
     if not code:
         print(f"Falling back to tool-less code generation due to empty response (model={model}).")
         fallback_config = _build_config(complexity)
@@ -206,13 +258,18 @@ def generate_manim_script(
         fallback_config.automatic_function_calling = None
         
         fallback_chat = client.chats.create(model=model, config=fallback_config)
-        code = _send_and_extract(fallback_chat, prompt)
+        code = _send_and_extract(fallback_chat, prompt, tool_call_counts=tool_call_counts)
 
     if code:
         yield code
 
 
-def fix_manim_script(code: str, error: str, complexity: str = "complex") -> Iterator[str]:
+def fix_manim_script(
+    code: str,
+    error: str,
+    complexity: str = "complex",
+    tool_call_counts: dict[str, int] | None = None,
+) -> Iterator[str]:
     """Yield the corrected code after consulting docs."""
     model = _get_model_for_complexity(complexity)
     client = genai.Client()
@@ -229,7 +286,7 @@ def fix_manim_script(code: str, error: str, complexity: str = "complex") -> Iter
 
     yield "looking up docs"
 
-    fixed = _send_and_extract(chat, prompt)
+    fixed = _send_and_extract(chat, prompt, tool_call_counts=tool_call_counts)
     if fixed:
         yield fixed
 
@@ -237,13 +294,15 @@ def fix_manim_script(code: str, error: str, complexity: str = "complex") -> Iter
 # ── orchestrator ──────────────────────────────────────────────────────
 
 def run_coder_agent(
-    visual_instructions: str,
+    instructions: str | dict,
     max_retries: int = 3,
     audio_script: str = "",
     audio_duration: float = 0.0,
     complexity: str = "complex",
     scene_class_name: str = "GeneratedScene",
     output_dir: str | None = None,
+    theme_name: str = "",
+    color_palette: dict[str, str] | None = None,
 ):
     """Generate a Manim script, execute it, self-correct up to *max_retries*.
 
@@ -256,11 +315,21 @@ def run_coder_agent(
     """
     model_label = _get_model_for_complexity(complexity)
     code = ""
+    tool_call_counts: dict[str, int] = {}
+
+    def _attach_tool_usage(payload: dict) -> dict:
+        counts = dict(sorted(tool_call_counts.items()))
+        payload["tool_call_counts"] = counts
+        payload["total_tool_calls"] = sum(counts.values())
+        return payload
 
     yield {"status": f"Generating Manim script [{complexity}] via {model_label}..."}
     for chunk in generate_manim_script(
-        visual_instructions, audio_script, audio_duration,
+        instructions, audio_script, audio_duration,
         complexity=complexity, scene_class_name=scene_class_name,
+        tool_call_counts=tool_call_counts,
+        theme_name=theme_name,
+        color_palette=color_palette,
     ):
         if chunk == "looking up docs":
             yield {"status": "Looking up Manim documentation..."}
@@ -269,11 +338,11 @@ def run_coder_agent(
         yield {"status": "Generating initial Manim script...", "code": code}
 
     if not code:
-        yield {
+        yield _attach_tool_usage({
             "status": "Failed to generate the initial Manim script.",
             "error": "Empty model response.",
             "final": True,
-        }
+        })
         return
 
     for attempt in range(max_retries + 1):
@@ -283,26 +352,12 @@ def run_coder_agent(
         result = run_manim_code(code, class_name, quality_flag="-ql", output_dir=output_dir)
 
         if result["success"]:
-            yield {"status": "Code successful! Rendering final HD video (-qh)...", "code": code}
-            
-            hd_result = run_manim_code(code, class_name, quality_flag="-qh", timeout_seconds=300, output_dir=output_dir)
-            
-            if hd_result["success"]:
-                yield {
-                    "status": "Success! HD Video generated.",
-                    "video_path": hd_result["video_path"],
-                    "code": code,
-                    "final": True,
-                }
-            else:
-                 yield {
-                    "status": "HD Render failed, falling back to low-res video.",
-                    "video_path": result["video_path"],
-                    "error": hd_result["error"],
-                    "code": code,
-                    "final": True,
-                }
-                
+            yield _attach_tool_usage({
+                "status": "Success! Low-res preview generated (-ql).",
+                "video_path": result["video_path"],
+                "code": code,
+                "final": True,
+            })
             return
 
         if attempt < max_retries:
@@ -311,7 +366,12 @@ def run_coder_agent(
                 "error": result["error"],
             }
             updated_code = ""
-            for chunk in fix_manim_script(code, result["error"], complexity=complexity):
+            for chunk in fix_manim_script(
+                code,
+                result["error"],
+                complexity=complexity,
+                tool_call_counts=tool_call_counts,
+            ):
                 if chunk == "looking up docs":
                     yield {"status": f"Looking up docs for fix (attempt {attempt + 1})..."}
                     continue
@@ -322,33 +382,35 @@ def run_coder_agent(
                 }
 
             if not updated_code:
-                yield {
+                yield _attach_tool_usage({
                     "status": "Failed to receive corrected code from model.",
                     "error": "Empty model response while self-correcting.",
                     "final": True,
-                }
+                })
                 return
 
             code = updated_code
         else:
-            yield {
+            yield _attach_tool_usage({
                 "status": "Failed to generate a working script after max retries.",
                 "error": result["error"],
                 "final": True,
-            }
+            })
             return
 
 
 # ── Async variant for parallel segment processing ────────────────────
 
 async def run_coder_agent_async(
-    visual_instructions: str,
+    instructions: str | dict,
     max_retries: int = 3,
     audio_script: str = "",
     audio_duration: float = 0.0,
     complexity: str = "complex",
     scene_class_name: str = "GeneratedScene",
     output_dir: str | None = None,
+    theme_name: str = "",
+    color_palette: dict[str, str] | None = None,
 ) -> dict:
     """Async wrapper around ``run_coder_agent``.
 
@@ -362,13 +424,15 @@ async def run_coder_agent_async(
     def _run_sync() -> dict:
         last_update: dict = {}
         for update in run_coder_agent(
-            visual_instructions,
+            instructions,
             max_retries=max_retries,
             audio_script=audio_script,
             audio_duration=audio_duration,
             complexity=complexity,
             scene_class_name=scene_class_name,
             output_dir=output_dir,
+            theme_name=theme_name,
+            color_palette=color_palette,
         ):
             last_update = update
         return last_update
