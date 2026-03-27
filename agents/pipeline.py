@@ -203,7 +203,15 @@ def run_segmented_pipeline(
                 tasks.append(coro)
             return await asyncio.gather(*tasks, return_exceptions=True)
 
-        raw_tts = asyncio.run(_run_all_tts())
+        # C10: asyncio.run() crashes if an event loop is already running (e.g. in
+        # Jupyter / Streamlit). Use get_event_loop().run_until_complete() which
+        # works in both contexts.
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        raw_tts = loop.run_until_complete(_run_all_tts())
 
         for seg, result in zip(segments, raw_tts):
             seg_id = seg["id"]

@@ -135,8 +135,11 @@ def generate_voiceover(text: str, output_path: str) -> Iterator[dict]:
         client = genai.Client()
 
         yield {"status": "Requesting audio generation from LLM..."}
+        # L5: Allow model override via env var so callers aren't broken when the
+        # preview model is promoted or renamed (e.g. gemini-2.5-flash-tts).
+        tts_model = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
         response = client.models.generate_content(
-            model="gemini-2.5-flash-preview-tts",
+            model=tts_model,
             contents=f"Speak in a calm, clear, and instructional tone. Maintain a steady, measured pace. Use a thoughtful and inquisitive intonation as if explaining a complex mathematical concept to a curious student. Read the following text: {text}",
             config=types.GenerateContentConfig(
                 response_modalities=["AUDIO"],

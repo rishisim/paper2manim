@@ -3,8 +3,8 @@
  * All ~35 commands mapped to paper2manim context.
  */
 
-import { execSync, exec } from 'node:child_process';
-import { existsSync, writeFileSync } from 'node:fs';
+import { execSync, execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { SlashCommand, AppDispatch, ThemeName } from './types.js';
@@ -95,7 +95,8 @@ export const COMMANDS: SlashCommand[] = [
         return;
       }
       try {
-        execSync(`rm -rf "${dir.replace(/"/g, '\\"')}"`);
+        // C4: Use execFileSync (no shell) to avoid injection via backticks/$()
+        execFileSync('rm', ['-rf', dir]);
         dispatch.showMessage(`Deleted: ${dir}`, undefined);
       } catch {
         dispatch.showMessage(`Failed to delete: ${dir}`, undefined);
@@ -280,8 +281,8 @@ export const COMMANDS: SlashCommand[] = [
     description: 'Export session log to a text file',
     args: '[filename]',
     handler: (args, dispatch) => {
-      const path = dispatch.exportSession(args[0]);
-      dispatch.showMessage(`Session exported.`, undefined);
+      dispatch.exportSession(args[0]);
+      dispatch.showMessage('Session exported to ~/.paper2manim/exports/', undefined);
     },
   },
 
@@ -336,7 +337,8 @@ export const COMMANDS: SlashCommand[] = [
       const memPath = 'PAPER2MANIM.md';
       const editor = process.env['EDITOR'] ?? process.env['VISUAL'] ?? 'nano';
       try {
-        execSync(`${editor} "${memPath}"`, { stdio: 'inherit' });
+        // M5: Use spawnSync (no shell) to avoid problems with spaces/special chars in EDITOR
+        spawnSync(editor, [memPath], { stdio: 'inherit' });
       } catch {
         dispatch.showMessage(`Could not open editor. Edit ${memPath} manually.`, undefined);
       }
@@ -389,7 +391,7 @@ export const COMMANDS: SlashCommand[] = [
       const changelogPath = join(process.cwd(), 'CHANGELOG.md');
       if (existsSync(changelogPath)) {
         try {
-          const { readFileSync } = require('node:fs');
+          // M6: Use top-level ESM import (readFileSync imported at top of file)
           dispatch.showMessage(readFileSync(changelogPath, 'utf8').slice(0, 500), undefined);
         } catch {
           dispatch.showMessage('paper2manim v0.1.0 — See CHANGELOG.md', undefined);

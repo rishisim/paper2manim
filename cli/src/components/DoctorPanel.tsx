@@ -5,7 +5,10 @@
 
 import React, { useState, useEffect } from 'react';
 import { Box, Text, useInput } from 'ink';
-import { execSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { useAppContext } from '../context/AppContext.js';
 
 interface CheckResult {
@@ -36,42 +39,47 @@ export function DoctorPanel({ onBack }: DoctorPanelProps) {
     const results: CheckResult[] = [];
 
     // Node.js version
+    // M8: Use process.versions.node (always numeric, no 'v' prefix) instead of process.version.slice(1)
     results.push(runCheck('Node.js ≥18', () => {
-      const version = process.version;
-      const major = parseInt(version.slice(1));
-      return { ok: major >= 18, message: version };
+      const nodeVer = process.versions.node;
+      const major = parseInt(nodeVer.split('.')[0] ?? '0', 10);
+      return { ok: major >= 18, message: `v${nodeVer}` };
     }));
+
+    // M7: Helper — spawnSync with timeout, treating timed-out processes (status===null, error set) as failures
+    const syncCheck = (cmd: string, args: string[], timeoutMs = 5000): { ok: boolean; out: string } => {
+      const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: timeoutMs, stdio: 'pipe' });
+      const ok = r.status === 0 && r.error == null;
+      const out = ((r.stdout || '') + (r.stderr || '')).trim();
+      return { ok, out: out || (r.error ? String(r.error.message) : 'Not found') };
+    };
 
     // Python
     results.push(runCheck('Python', () => {
       const python = process.env['PAPER2MANIM_PYTHON'] ?? 'python3';
-      const r = spawnSync(python, ['--version'], { encoding: 'utf8', timeout: 3000 });
-      const version = (r.stdout || r.stderr || '').trim();
-      return { ok: r.status === 0, message: version || 'Not found' };
+      const { ok, out } = syncCheck(python, ['--version']);
+      return { ok, message: out };
     }));
 
     // Manim
     results.push(runCheck('Manim', () => {
       const python = process.env['PAPER2MANIM_PYTHON'] ?? 'python3';
-      const r = spawnSync(python, ['-c', 'import manim; print(manim.__version__)'], {
-        encoding: 'utf8', timeout: 5000,
-      });
-      const version = (r.stdout || '').trim();
-      return { ok: r.status === 0, message: version || 'Not installed' };
+      const { ok, out } = syncCheck(python, ['-c', 'import manim; print(manim.__version__)']);
+      return { ok, message: ok ? out : 'Not installed — run: pip install manim' };
     }));
 
     // FFmpeg
     results.push(runCheck('FFmpeg', () => {
-      const r = spawnSync('ffmpeg', ['-version'], { encoding: 'utf8', timeout: 3000 });
-      const firstLine = (r.stdout || '').split('\n')[0] ?? '';
-      return { ok: r.status === 0, message: firstLine || 'Not found' };
+      const { ok, out } = syncCheck('ffmpeg', ['-version']);
+      const firstLine = out.split('\n')[0] ?? '';
+      return { ok, message: firstLine || 'Not found' };
     }));
 
     // LaTeX (for Manim math rendering)
     results.push(runCheck('LaTeX (pdflatex)', () => {
-      const r = spawnSync('pdflatex', ['--version'], { encoding: 'utf8', timeout: 3000 });
-      const firstLine = (r.stdout || '').split('\n')[0] ?? '';
-      return { ok: r.status === 0, message: firstLine.slice(0, 40) || 'Not found' };
+      const { ok, out } = syncCheck('pdflatex', ['--version']);
+      const firstLine = out.split('\n')[0] ?? '';
+      return { ok, message: (firstLine.slice(0, 40) || 'Not found') + (ok ? '' : ' (optional)') };
     }));
 
     // ANTHROPIC_API_KEY
@@ -92,11 +100,8 @@ export function DoctorPanel({ onBack }: DoctorPanelProps) {
       };
     }));
 
-    // ~/.paper2manim settings dir
+    // ~/.paper2manim settings dir — M6: use top-level ESM imports (not require)
     results.push(runCheck('Settings dir (~/.paper2manim)', () => {
-      const { existsSync } = require('node:fs');
-      const { join } = require('node:path');
-      const { homedir } = require('node:os');
       const dir = join(homedir(), '.paper2manim');
       return { ok: existsSync(dir), message: existsSync(dir) ? dir : 'Not created yet' };
     }));

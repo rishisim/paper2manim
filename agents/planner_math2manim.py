@@ -14,6 +14,7 @@ Output conforms to ProSegmentedStoryboard so the downstream pipeline is unchange
 import json
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterator, Literal, List, Dict
@@ -452,7 +453,10 @@ def compose_narrative(
     yield {"status": f"Composing {total} segments in parallel (~{per_segment_seconds}s each, target {target_seconds}s total)..."}
 
     # Launch all segment compositions in parallel
+    # L6: Protect results/segment_errors with a lock — futures complete on pool threads
     results: dict[int, dict | None] = {}
+    segment_errors: dict[int, str] = {}
+    results_lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=min(total, 5)) as pool:
         futures = {
             pool.submit(
@@ -462,17 +466,19 @@ def compose_narrative(
             ): i
             for i, node in enumerate(enriched_tree.nodes)
         }
-        segment_errors: dict[int, str] = {}
         for future in as_completed(futures):
             idx = futures[future]
             node = enriched_tree.nodes[idx]
             try:
-                results[idx] = future.result()
+                seg_result = future.result()
+                with results_lock:
+                    results[idx] = seg_result
             except Exception as e:
                 err_msg = str(e)
                 print(f"Segment {idx + 1} ({node.title}) failed: {err_msg}", file=sys.stderr)
-                results[idx] = None
-                segment_errors[idx] = err_msg
+                with results_lock:
+                    results[idx] = None
+                    segment_errors[idx] = err_msg
             yield {"status": f"  → Segment {idx + 1}/{total} done: {node.title}"}
 
     # Collect in order

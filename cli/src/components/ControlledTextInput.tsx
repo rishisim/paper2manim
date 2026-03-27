@@ -58,19 +58,20 @@ export function ControlledTextInput({
     return str.slice(0, start) + str.slice(end);
   }, []);
 
-  const findWordBoundaryLeft = (str: string, pos: number): number => {
+  // L2: Memoize word-boundary helpers so they have stable identity across renders
+  const findWordBoundaryLeft = useCallback((str: string, pos: number): number => {
     let i = pos - 1;
     while (i > 0 && str[i] === ' ') i--;
     while (i > 0 && str[i - 1] !== ' ') i--;
     return i;
-  };
+  }, []);
 
-  const findWordBoundaryRight = (str: string, pos: number): number => {
+  const findWordBoundaryRight = useCallback((str: string, pos: number): number => {
     let i = pos;
     while (i < str.length && str[i] === ' ') i++;
     while (i < str.length && str[i] !== ' ') i++;
     return i;
-  };
+  }, []);
 
   useInput((input, key) => {
     if (!focus || isDisabled) return;
@@ -156,7 +157,8 @@ export function ControlledTextInput({
       const len = commandHistory.length;
       if (len === 0) return;
       const newIdx = historyIdx === -1 ? len - 1 : Math.max(0, historyIdx - 1);
-      if (historyIdx === -1) setSavedInput(value);
+      // M2: Only save the current input when first entering history navigation
+      if (historyIdx === -1) setSavedInput(value ?? '');
       setHistoryIdx(newIdx);
       const entry = commandHistory[newIdx] ?? '';
       onChange(entry);
@@ -256,7 +258,8 @@ export function ControlledTextInput({
       return;
     }
 
-    // Slash at start — notify slash mode
+    // M3: Slash at start — only activate slash mode when cursor is at 0 AND field is empty
+    // (If cursor is mid-string, '/' should be inserted normally)
     if (input === '/' && cursor === 0 && value === '' && onSlashMode) {
       const next = '/';
       onChange(next);

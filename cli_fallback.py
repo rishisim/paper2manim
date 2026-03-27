@@ -1256,7 +1256,7 @@ def _repl_doctor() -> None:
 
     # Node.js ≥18
     try:
-        out = subprocess.check_output(["node", "--version"], stderr=subprocess.DEVNULL).decode().strip()
+        out = subprocess.check_output(["node", "--version"], stderr=subprocess.DEVNULL, timeout=5).decode().strip()
         major = int(out.lstrip("v").split(".")[0])
         _check("Node.js ≥ 18", major >= 18, out)
     except Exception:
@@ -1276,14 +1276,14 @@ def _repl_doctor() -> None:
 
     # FFmpeg in PATH
     try:
-        subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.DEVNULL)
+        subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.DEVNULL, timeout=5)
         _check("FFmpeg", True, "found in PATH")
     except Exception:
         _check("FFmpeg", False, "not found in PATH")
 
     # LaTeX (pdflatex)
     try:
-        subprocess.check_output(["pdflatex", "--version"], stderr=subprocess.DEVNULL)
+        subprocess.check_output(["pdflatex", "--version"], stderr=subprocess.DEVNULL, timeout=5)
         _check("LaTeX (pdflatex)", True, "found in PATH")
     except Exception:
         _check("LaTeX (pdflatex)", False, "optional — needed for LaTeX-heavy animations")

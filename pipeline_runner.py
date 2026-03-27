@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import sys
 
 # Ensure the project root is importable
@@ -56,8 +57,36 @@ except ImportError:
 
 
 def _emit(msg: dict) -> None:
-    """Print a JSON line to stdout (unbuffered)."""
-    print(json.dumps(msg, default=str), flush=True)
+    """Print a JSON line to stdout (unbuffered).
+    H10: Wrapped in try-except so a non-serializable object in `msg` never crashes stdout.
+    """
+    try:
+        print(json.dumps(msg, default=str), flush=True)
+    except Exception as e:
+        # Fallback: emit a safe error message so the TS side always gets valid NDJSON
+        try:
+            print(json.dumps({"type": "error", "message": f"Emit error: {e}"}), flush=True)
+        except Exception:
+            pass  # stdout itself is broken; nothing we can do
+
+
+def _read_stdin_line(timeout_seconds: float = 30.0) -> str | None:
+    """C8: Read one line from stdin with a timeout.
+
+    Returns the stripped line, or None if the timeout expired or EOF was reached.
+    Uses select() on Unix; falls back to a blocking read on Windows (no select).
+    """
+    try:
+        # select() is not available on Windows pipes; guard accordingly
+        ready, _, _ = select.select([sys.stdin], [], [], timeout_seconds)
+        if not ready:
+            return None
+    except (AttributeError, ValueError):
+        # Windows or non-selectable fd — fall back to blocking read
+        pass
+
+    line = sys.stdin.readline()
+    return line.strip() if line else None
 
 
 def _handle_workspace_command(args: dict) -> None:
@@ -207,16 +236,16 @@ def main() -> None:
 
         _emit({"type": "questions", "questions": questions})
 
-        # Wait for answers on stdin (single round)
+        # C8: Wait for answers on stdin with a 30-second timeout
+        line = _read_stdin_line(timeout_seconds=30.0)
+        if not line:
+            _emit({"type": "error", "message": "Timeout waiting for questionnaire answers (30s). Is the CLI still running?"})
+            sys.exit(1)
         try:
-            line = sys.stdin.readline().strip()
-            if not line:
-                _emit({"type": "error", "message": "No questionnaire answers received."})
-                sys.exit(1)
             msg = json.loads(line)
             questionnaire_answers = msg.get("answers", {})
         except Exception as e:
-            _emit({"type": "error", "message": f"Failed to read answers: {e}"})
+            _emit({"type": "error", "message": f"Failed to parse questionnaire answers: {e}"})
             sys.exit(1)
 
         # Emit preference summary for the UI to display
@@ -266,20 +295,9 @@ def main() -> None:
         ):
             _emit({"type": "pipeline", "update": update})
 
-            # Emit a token_usage message when the final update arrives,
-            # using total_tool_calls as a proxy for model calls (approximate)
-            if update.get("final") and not update.get("error"):
-                total_calls = update.get("total_tool_calls", 0) or 0
-                # Approximate token usage: each tool call ~2k tokens average
-                approx_input = total_calls * 2000
-                approx_output = total_calls * 500
-                if total_calls > 0:
-                    _emit({
-                        "type": "token_usage",
-                        "input": approx_input,
-                        "output": approx_output,
-                        "cache_read": 0,
-                    })
+            # M13: Only emit token_usage when real data is available.
+            # Heuristic approximations removed — they were wildly inaccurate.
+            # Real usage is emitted by agents when they receive API responses.
 
     except Exception as e:
         _emit({"type": "error", "message": str(e)})

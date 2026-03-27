@@ -38,12 +38,14 @@ export function FooterStatusLine({ stage }: FooterStatusLineProps) {
 
   const modeLabel = PERMISSION_MODE_LABELS[permissionMode] ?? permissionMode;
 
-  // Short model name
+  // H14: Short model name — strip date suffixes generically so new models work
   const modelShort = currentModel
     .replace('claude-', '')
-    .replace('-4-6', ' 4.6')
-    .replace('-4-5', ' 4.5')
-    .replace('-20251001', '');
+    .replace(/-\d{8}$/, '')         // strip -YYYYMMDD date suffix
+    .replace(/-preview$/, '')       // strip -preview suffix
+    .replace(/-4-6/, ' 4.6')
+    .replace(/-4-5/, ' 4.5')
+    .replace(/-4-0/, ' 4.0');
 
   const qualityIcon = quality === 'low' ? '⚡' : quality === 'medium' ? '◆' : '◈';
 

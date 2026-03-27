@@ -2,7 +2,7 @@
  * React hook that spawns the Python pipeline runner and streams NDJSON updates.
  */
 
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import type { ChildProcess } from 'node:child_process';
 import { spawnRunner } from '../lib/process.js';
 import type { PipelineUpdate, PipelineArgs, QuestionDef, ToolCallEntry } from '../lib/types.js';
@@ -42,9 +42,21 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
   const procRef = useRef<ChildProcess | null>(null);
   const bufferRef = useRef('');
   const toolCallIdCounter = useRef(0);
+  // H3: use a ref for status so `start` callback doesn't depend on status state
+  const statusRef = useRef<PipelineStatus>('idle');
+  // Track whether a final update was received (C1)
+  const finalUpdateReceivedRef = useRef(false);
 
-  // Context-injected callback for token usage (set by parent via ref)
-  const onTokenUsage = opts?.onTokenUsage;
+  // Keep statusRef in sync
+  const updateStatus = useCallback((s: PipelineStatus) => {
+    statusRef.current = s;
+    setStatus(s);
+  }, []);
+
+  // L1: Stabilize onTokenUsage via a ref so handleLine's dep array doesn't
+  // recreate the callback on every render when the caller passes a new function reference.
+  const onTokenUsageRef = useRef(opts?.onTokenUsage);
+  useEffect(() => { onTokenUsageRef.current = opts?.onTokenUsage; });
 
   const handleLine = useCallback((line: string) => {
     try {
@@ -52,34 +64,30 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
 
       if (msg.type === 'questions') {
         setQuestions(msg.questions);
-        setStatus('questionnaire');
+        updateStatus('questionnaire');
       } else if (msg.type === 'pipeline') {
         const update = msg.update as PipelineUpdate;
         setUpdates(prev => [...prev, update]);
-        setStatus('running');
+        updateStatus('running');
 
         if (update.final) {
+          finalUpdateReceivedRef.current = true;
           if (update.error) {
             setErrorMessage(update.error);
-            setStatus('error');
+            updateStatus('error');
           } else {
-            setStatus('complete');
+            updateStatus('complete');
           }
           setFinalUpdate(update);
         }
       } else if (msg.type === 'error') {
         setErrorMessage(msg.message);
-        setStatus('error');
+        updateStatus('error');
       } else if (msg.type === 'token_usage') {
-        // Phase 5: accumulate token usage
-        if (onTokenUsage) {
-          onTokenUsage({ input: msg.input ?? 0, output: msg.output ?? 0, cacheRead: msg.cache_read ?? 0 });
-        }
+        onTokenUsageRef.current?.({ input: msg.input ?? 0, output: msg.output ?? 0, cacheRead: msg.cache_read ?? 0 });
       } else if (msg.type === 'thinking') {
-        // Phase 5: update thinking text
         setThinkingText(msg.text ?? '');
       } else if (msg.type === 'tool_call') {
-        // Phase 5: add tool call entry
         const entry: ToolCallEntry = {
           id: `tc-${toolCallIdCounter.current++}`,
           name: msg.name ?? 'unknown',
@@ -89,27 +97,34 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
         };
         setToolCalls(prev => [...prev, entry]);
       } else if (msg.type === 'permission_request') {
-        // Phase 6: permission prompt
         setPermissionPending({ operation: msg.operation ?? 'write', path: msg.path });
       }
       // Unknown types are silently ignored (backward compatible)
     } catch {
-      // Non-JSON line — ignore (Python debug output, etc.)
+      // H13: Non-JSON line — log in verbose mode, ignore otherwise
+      if (verbose) {
+        process.stderr.write(`[warn] Non-JSON pipeline line: ${line.slice(0, 120)}\n`);
+      }
     }
-  }, [onTokenUsage]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [updateStatus, verbose]);
 
   const processChunk = useCallback((chunk: Buffer) => {
     bufferRef.current += chunk.toString();
+    // C3: Warn if buffer grows suspiciously large (indicates a very long partial line)
+    if (bufferRef.current.length > 65536 && verbose) {
+      process.stderr.write(`[warn] Pipeline buffer at ${bufferRef.current.length} bytes — possible partial message\n`);
+    }
     const lines = bufferRef.current.split('\n');
     // Keep the last partial line in the buffer
     bufferRef.current = lines.pop() ?? '';
     for (const line of lines) {
       if (line.trim()) handleLine(line);
     }
-  }, [handleLine]);
+  }, [handleLine, verbose]);
 
   const start = useCallback((args: PipelineArgs) => {
-    setStatus('running');
+    // H3: reset without depending on status state in the dep array
+    updateStatus('running');
     setUpdates([]);
     setQuestions([]);
     setErrorMessage('');
@@ -118,6 +133,7 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
     setThinkingText('');
     setPermissionPending(null);
     bufferRef.current = '';
+    finalUpdateReceivedRef.current = false;
 
     const proc = spawnRunner(JSON.stringify(args));
     procRef.current = proc;
@@ -125,7 +141,6 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
     proc.stdout?.on('data', processChunk);
 
     proc.stderr?.on('data', (chunk: Buffer) => {
-      // Only show Python stderr in verbose mode to keep UI clean
       if (verbose) {
         const text = chunk.toString().trim();
         if (text) {
@@ -141,17 +156,21 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
         bufferRef.current = '';
       }
 
-      if (code !== 0 && status !== 'complete' && status !== 'error') {
+      // H12: Clear any dangling permission prompt when process exits
+      setPermissionPending(null);
+
+      // C1: Set error if process exited non-zero AND no proper final update was received
+      if (code !== 0 && !finalUpdateReceivedRef.current) {
         setErrorMessage(`Pipeline process exited with code ${code}`);
-        setStatus('error');
+        updateStatus('error');
       }
     });
 
     proc.on('error', (err) => {
       setErrorMessage(`Failed to start pipeline: ${err.message}`);
-      setStatus('error');
+      updateStatus('error');
     });
-  }, [processChunk, handleLine, status, verbose]);
+  }, [processChunk, handleLine, updateStatus, verbose]); // H3: no `status` in deps
 
   const answerQuestions = useCallback((answers: Record<string, string>) => {
     const proc = procRef.current;
@@ -160,8 +179,8 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
     const msg = JSON.stringify({ type: 'answers', answers });
     proc.stdin.write(msg + '\n');
     setQuestions([]);
-    setStatus('running');
-  }, []);
+    updateStatus('running');
+  }, [updateStatus]);
 
   /** Respond to a permission_request from Python. */
   const answerPermission = useCallback((allow: boolean, always = false) => {
@@ -176,6 +195,10 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
   const kill = useCallback(() => {
     const proc = procRef.current;
     if (proc && !proc.killed) {
+      // H4: Clean up listeners before killing to prevent leaks on multiple kill() calls
+      proc.stdout?.removeAllListeners();
+      proc.stderr?.removeAllListeners();
+      proc.removeAllListeners();
       proc.kill('SIGTERM');
     }
   }, []);

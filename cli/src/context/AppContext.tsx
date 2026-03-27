@@ -96,12 +96,17 @@ export function AppContextProvider({ settings: initialSettings, session: initial
 
   const setPermissionMode = useCallback((mode: PermissionMode) => {
     setPermissionModeState(mode);
+    // H1: Persist permission mode so it survives restarts
+    saveSettings('user', { defaultMode: mode });
   }, []);
 
   const cyclePermissionMode = useCallback(() => {
     setPermissionModeState(current => {
       const idx = PERMISSION_MODES.indexOf(current);
-      return PERMISSION_MODES[(idx + 1) % PERMISSION_MODES.length]!;
+      const next = PERMISSION_MODES[(idx + 1) % PERMISSION_MODES.length] ?? PERMISSION_MODES[0];
+      // H1: Persist cycled mode too
+      saveSettings('user', { defaultMode: next });
+      return next;
     });
   }, []);
 
@@ -116,7 +121,12 @@ export function AppContextProvider({ settings: initialSettings, session: initial
   }, []);
 
   const setVerboseMode = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
-    setVerboseModeState(v);
+    setVerboseModeState(prev => {
+      const next = typeof v === 'function' ? v(prev) : v;
+      // M10: Persist verbose mode as outputStyle
+      saveSettings('user', { outputStyle: next ? 'verbose' : 'default' });
+      return next;
+    });
   }, []);
 
   const setThinkingVisible = useCallback((v: boolean | ((prev: boolean) => boolean)) => {

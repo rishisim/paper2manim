@@ -4,7 +4,7 @@
  * Mirrors Claude Code CLI's permission dialog.
  */
 
-import React from 'react';
+import React, { useRef } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { useAppContext } from '../context/AppContext.js';
 
@@ -19,14 +19,20 @@ interface PermissionPromptProps {
 export function PermissionPrompt({ operation, path, onAllow, onDeny, onAllowAlways }: PermissionPromptProps) {
   const { themeColors, permissionMode } = useAppContext();
 
+  // H11: One-shot ref guard prevents onAllow/onDeny from firing more than once
+  const called = useRef(false);
+
   // In acceptEdits/auto/bypassPermissions mode — auto-allow without showing prompt
   React.useEffect(() => {
+    if (called.current) return;
     if (permissionMode === 'acceptEdits' || permissionMode === 'auto' || permissionMode === 'bypassPermissions') {
+      called.current = true;
       onAllow();
     } else if (permissionMode === 'plan') {
+      called.current = true;
       onDeny();
     }
-  }, [permissionMode]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [permissionMode, onAllow, onDeny]);
 
   useInput((_input, key) => {
     const lower = _input.toLowerCase();

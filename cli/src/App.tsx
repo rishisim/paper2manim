@@ -24,6 +24,7 @@ import { usePipeline } from './hooks/usePipeline.js';
 import { useElapsed } from './hooks/useElapsed.js';
 import { AppContextProvider, useAppContext } from './context/AppContext.js';
 import { exportSessionToText } from './lib/session.js';
+import { loadMemory } from './lib/memory.js';
 import { stageConfig, segmentPhaseLabels, colors, cleanStatus, type StageName } from './lib/theme.js';
 import type { CompletedStage, SegmentState, Settings, Session } from './lib/types.js';
 import { PERMISSION_MODES } from './lib/types.js';
@@ -153,13 +154,19 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
 
   // ── Hooks: fire SessionStart on mount, SessionEnd on unmount ──────
   const { settings } = useAppContext();
+  // H2: Use a ref so the SessionEnd cleanup always reads the latest settings value
+  const settingsRef = useRef(settings);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+
   useEffect(() => {
-    if (!settings.disableAllHooks) {
-      runHooks('SessionStart', { concept: initialConcept ?? '' }, settings.hooks, settings.disableAllHooks);
+    const s = settingsRef.current;
+    if (!s.disableAllHooks) {
+      runHooks('SessionStart', { concept: initialConcept ?? '' }, s.hooks, s.disableAllHooks);
     }
     return () => {
-      if (!settings.disableAllHooks) {
-        runHooks('SessionEnd', {}, settings.hooks, settings.disableAllHooks);
+      const s2 = settingsRef.current;
+      if (!s2.disableAllHooks) {
+        runHooks('SessionEnd', {}, s2.hooks, s2.disableAllHooks);
       }
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -243,7 +250,7 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
     if (key.escape) {
       const now = Date.now();
       if (now - escPressTime.current < 500) {
-        // Double Esc — rewind (just go back to input for now)
+        // C6: Double Esc navigates back to input from ANY non-running screen
         if (screen !== 'input' && screen !== 'running') {
           setScreen('input');
         }
@@ -276,12 +283,19 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
   useEffect(() => {
     if (resumeDir) {
       addConceptHeader('project from: ' + resumeDir, true);
-      pipeline.start({ concept: 'resume', max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: resumeDir, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: systemPrompt, max_turns: maxTurns, model: currentModel });
+      pipeline.start({ concept: 'resume', max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: resumeDir, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: buildSystemPrompt(), max_turns: maxTurns, model: currentModel });
     } else if (initialConcept) {
       addConceptHeader(initialConcept);
-      pipeline.start({ concept: initialConcept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: systemPrompt, max_turns: maxTurns, model: currentModel });
+      pipeline.start({ concept: initialConcept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: buildSystemPrompt(), max_turns: maxTurns, model: currentModel });
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // H9: Build the effective system_prompt_prefix by combining PAPER2MANIM.md memory with the CLI --system-prompt flag
+  const buildSystemPrompt = () => {
+    const memory = loadMemory();
+    const parts = [memory, systemPrompt].filter(Boolean);
+    return parts.join('\n\n---\n\n') || undefined;
+  };
 
   // Handle concept submission
   const handleConceptSubmit = (c: string) => {
@@ -290,7 +304,7 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
     pushHistory(c);
     updateSession({ concept: c });
     process.stdout.write(`\x1b]0;paper2manim: ${c.slice(0, 50)}\x07`);
-    pipeline.start({ concept: c, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: systemPrompt, max_turns: maxTurns, model: currentModel });
+    pipeline.start({ concept: c, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: buildSystemPrompt(), max_turns: maxTurns, model: currentModel });
     setScreen('running');
   };
 
@@ -313,7 +327,8 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
   useEffect(() => {
     if (pipeline.updates.length === 0) return;
 
-    const latest = pipeline.updates[pipeline.updates.length - 1]!;
+    // M1: Safe access — updates.length > 0 is already guarded above
+    const latest = pipeline.updates.at(-1)!;
     const stage = latest.stage as StageName;
 
     // Track total segments
@@ -539,7 +554,8 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
       setInlineMessage({ text: 'Log compacted.', color: themeColors.dim });
     },
     exportSession: (_filename) => {
-      return exportSessionToText(session);
+      // C7: exportSessionToText returns null on write failure
+      return exportSessionToText(session) ?? '';
     },
     killPipeline: () => { pipeline.kill(); },
     exit: () => { pipeline.kill(); exit(); process.exit(0); },

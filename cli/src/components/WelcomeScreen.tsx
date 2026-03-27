@@ -8,8 +8,7 @@ import { useTerminalWidth } from '../hooks/useTerminalWidth.js';
 import { useAppContext } from '../context/AppContext.js';
 import type { Project, AppDispatch } from '../lib/types.js';
 
-// Pick tip once at module load (not on every render)
-const tip = TIPS[Math.floor(Math.random() * TIPS.length)]!;
+// M9: Tip is selected inside the component (per-mount) not at module load
 
 /** Truncate from the right, keeping the beginning. */
 function truncateRight(s: string, maxLen: number): string {
@@ -28,6 +27,8 @@ interface WelcomeScreenProps {
 export function WelcomeScreen({ onSubmit, onResumeProject, dispatch }: WelcomeScreenProps) {
   const { themeColors } = useAppContext();
   const { projects, loading } = useRecentProjects();
+  // M9: Pick a tip per-mount so it varies across sessions
+  const [tip] = useState(() => TIPS[Math.floor(Math.random() * TIPS.length)]!);
   const [focusMode, setFocusMode] = useState<FocusMode>('input');
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [clearKey, setClearKey] = useState(0);

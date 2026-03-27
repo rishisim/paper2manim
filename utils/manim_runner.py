@@ -26,10 +26,27 @@ def _find_manim_binary() -> str:
 
 
 def _make_manim_env() -> dict:
-    """Return os.environ copy with TeX binaries prepended to PATH."""
+    """Return os.environ copy with TeX binaries prepended to PATH.
+
+    Checks a platform-agnostic list of candidate directories for pdflatex
+    and prepends whichever ones are found — works on macOS, Linux, and Windows.
+    """
+    # M14: Cross-platform TeX PATH detection instead of hardcoded macOS path
+    tex_candidates = [
+        "/Library/TeX/texbin",               # macOS MacTeX
+        "/usr/local/texlive/bin/universal-darwin",  # macOS alternate TeX Live
+        "/opt/homebrew/bin",                  # Homebrew (Apple Silicon)
+        "/usr/local/bin",                     # Homebrew (Intel) / Linux
+        "/usr/bin",                           # Linux system TeX
+    ]
     env = os.environ.copy()
-    if "/Library/TeX/texbin" not in env.get("PATH", ""):
-        env["PATH"] = f"/Library/TeX/texbin:{env.get('PATH', '')}"
+    current_path = env.get("PATH", "")
+    to_prepend = [
+        d for d in tex_candidates
+        if d not in current_path and os.path.isfile(os.path.join(d, "pdflatex"))
+    ]
+    if to_prepend:
+        env["PATH"] = ":".join(to_prepend) + ":" + current_path
     return env
 
 

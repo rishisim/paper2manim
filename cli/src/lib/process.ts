@@ -2,7 +2,7 @@
  * Utilities for locating Python and spawning the pipeline runner.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,7 +25,9 @@ export function getProjectRoot(): string {
 }
 
 /** Find the correct Python executable.
- *  Prefers PAPER2MANIM_PYTHON (set by cli_launcher.py to the venv Python). */
+ *  Prefers PAPER2MANIM_PYTHON (set by cli_launcher.py to the venv Python).
+ *  H5: Uses spawnSync (synchronous) so the existence check is actually reliable.
+ *      The old async spawn+kill returned before the process even started. */
 export function findPython(): string {
   const envPython = process.env['PAPER2MANIM_PYTHON'];
   if (envPython) return envPython;
@@ -33,14 +35,13 @@ export function findPython(): string {
   const candidates = ['python3', 'python'];
   for (const cmd of candidates) {
     try {
-      const result = spawn(cmd, ['--version'], { stdio: 'pipe' });
-      result.kill();
-      return cmd;
+      const result = spawnSync(cmd, ['--version'], { stdio: 'ignore', timeout: 3000 });
+      if (result.status === 0 && result.error == null) return cmd;
     } catch {
       // continue
     }
   }
-  return 'python3';
+  return 'python3'; // last-resort fallback
 }
 
 /** Spawn the pipeline runner with the given JSON args. */

@@ -1,5 +1,7 @@
 import json
 import os
+import sys
+import tempfile
 import time
 from typing import Any, Optional
 
@@ -43,11 +45,25 @@ def load_project(output_dir: str) -> dict[str, Any]:
 
 
 def save_project(output_dir: str, state: dict[str, Any]) -> None:
-    """Saves the project state to disk."""
+    """Saves the project state to disk.
+
+    C9: Uses an atomic write (write to .tmp then os.replace) so a crash
+    mid-write never leaves a corrupted project_state.json.
+    """
     state_path = _get_state_path(output_dir)
     state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    with open(state_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+    state_dir = os.path.dirname(state_path)
+    # Write to a temp file in the same directory, then atomically replace
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=state_dir,
+        delete=False,
+        suffix=".tmp",
+    ) as tmp_f:
+        json.dump(state, tmp_f, indent=2)
+        tmp_path = tmp_f.name
+    os.replace(tmp_path, state_path)
 
 
 def mark_stage_done(output_dir: str, stage_name: str, artifacts: list[str] = None) -> dict[str, Any]:
@@ -241,7 +257,9 @@ def _is_placeholder_project(output_dir: str, state: dict[str, Any]) -> bool:
                 continue
             # Any other artifact indicates this is not a placeholder.
             return False
-    except Exception:
+    except Exception as e:
+        # L7: Log unexpected errors instead of silently swallowing them
+        print(f"[warn] _is_placeholder_project: could not list {output_dir}: {e}", file=sys.stderr)
         return False
 
     return True
@@ -274,7 +292,8 @@ def cleanup_placeholder_projects(base_dir: str = "output") -> int:
         try:
             shutil.rmtree(project_dir)
             removed += 1
-        except Exception:
+        except Exception as e:
+            print(f"[warn] cleanup_placeholder_projects: failed to remove {project_dir}: {e}", file=sys.stderr)
             continue
     return removed
 
@@ -306,7 +325,8 @@ def delete_project(output_dir: str) -> bool:
         try:
             shutil.rmtree(output_dir)
             return True
-        except Exception:
+        except Exception as e:
+            print(f"[warn] delete_project: failed to remove {output_dir}: {e}", file=sys.stderr)
             return False
     return False
 

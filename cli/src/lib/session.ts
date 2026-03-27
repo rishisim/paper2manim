@@ -27,7 +27,10 @@ export function saveSession(session: Session): void {
   const path = join(dir, `${session.id}.json`);
   try {
     writeFileSync(path, JSON.stringify(session, null, 2) + '\n', 'utf8');
-  } catch { /* ignore */ }
+  } catch (err) {
+    // H6: Surface save failures to stderr so they're visible in verbose mode
+    process.stderr.write(`[warn] Failed to save session ${session.id}: ${err}\n`);
+  }
 }
 
 export function loadSession(idOrName: string): Session | null {
@@ -68,8 +71,9 @@ export function listSessions(): Session[] {
         sessions.push(session);
       } catch { /* skip */ }
     }
+    // H15: Guard against NaN from malformed startedAt strings
     return sessions.sort((a, b) =>
-      new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
+      (new Date(b.startedAt).getTime() || 0) - (new Date(a.startedAt).getTime() || 0)
     );
   } catch {
     return [];
@@ -92,7 +96,8 @@ export function saveCheckpoint(session: Session, checkpoint: SessionCheckpoint):
   return updated;
 }
 
-export function exportSessionToText(session: Session): string {
+/** C7: Returns the export file path on success, or null if the write failed. */
+export function exportSessionToText(session: Session): string | null {
   const dir = getExportsDir();
   const lines: string[] = [
     `# paper2manim Session Export`,
@@ -114,6 +119,9 @@ export function exportSessionToText(session: Session): string {
   const path = join(dir, filename);
   try {
     writeFileSync(path, content, 'utf8');
-  } catch { /* ignore */ }
-  return path;
+    return path;
+  } catch (err) {
+    process.stderr.write(`[warn] Failed to export session: ${err}\n`);
+    return null;
+  }
 }

@@ -1,12 +1,13 @@
 /**
  * SlashCommandOverlay — Dropdown autocomplete for slash commands.
  * Shown when the user starts typing "/" in the PromptBar.
+ * Supports scrolling through all commands with ↑/↓ arrows.
  */
 
 import React, { useState, useEffect } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { useAppContext } from '../context/AppContext.js';
-import { filterCommands, COMMANDS } from '../lib/commands.js';
+import { filterCommands } from '../lib/commands.js';
 import type { SlashCommand } from '../lib/types.js';
 
 const MAX_VISIBLE = 8;
@@ -21,28 +22,42 @@ interface SlashCommandOverlayProps {
 export function SlashCommandOverlay({ query, onAccept, onDismiss, isActive }: SlashCommandOverlayProps) {
   const { themeColors } = useAppContext();
   const [selectedIdx, setSelectedIdx] = useState(0);
+  const [scrollOffset, setScrollOffset] = useState(0);
 
   const filtered = filterCommands(query);
-  const visible = filtered.slice(0, MAX_VISIBLE);
 
-  // Reset selection when query changes
+  // Reset selection and scroll when query changes
   useEffect(() => {
     setSelectedIdx(0);
+    setScrollOffset(0);
   }, [query]);
 
+  // Keep the selected item within the visible window
+  useEffect(() => {
+    if (selectedIdx < scrollOffset) {
+      setScrollOffset(selectedIdx);
+    } else if (selectedIdx >= scrollOffset + MAX_VISIBLE) {
+      setScrollOffset(selectedIdx - MAX_VISIBLE + 1);
+    }
+  }, [selectedIdx, scrollOffset]);
+
+  const visible = filtered.slice(scrollOffset, scrollOffset + MAX_VISIBLE);
+  const aboveCount = scrollOffset;
+  const belowCount = Math.max(0, filtered.length - scrollOffset - MAX_VISIBLE);
+
   useInput((_input, key) => {
-    if (!isActive || visible.length === 0) return;
+    if (!isActive || filtered.length === 0) return;
 
     if (key.upArrow) {
       setSelectedIdx(i => Math.max(0, i - 1));
       return;
     }
     if (key.downArrow) {
-      setSelectedIdx(i => Math.min(visible.length - 1, i + 1));
+      setSelectedIdx(i => Math.min(filtered.length - 1, i + 1));
       return;
     }
     if (key.return || key.tab) {
-      const cmd = visible[selectedIdx];
+      const cmd = filtered[selectedIdx];
       if (cmd) onAccept(cmd);
       return;
     }
@@ -61,8 +76,14 @@ export function SlashCommandOverlay({ query, onAccept, onDismiss, isActive }: Sl
       borderColor={themeColors.dim}
       marginBottom={0}
     >
+      {aboveCount > 0 && (
+        <Box paddingX={1}>
+          <Text color={themeColors.dim}>  ↑ {aboveCount} more above</Text>
+        </Box>
+      )}
       {visible.map((cmd, idx) => {
-        const isSelected = idx === selectedIdx;
+        const absIdx = scrollOffset + idx;
+        const isSelected = absIdx === selectedIdx;
         return (
           <Box key={cmd.name} paddingX={1}>
             <Text color={isSelected ? themeColors.primary : themeColors.text} bold={isSelected}>
@@ -85,9 +106,9 @@ export function SlashCommandOverlay({ query, onAccept, onDismiss, isActive }: Sl
           </Box>
         );
       })}
-      {filtered.length > MAX_VISIBLE && (
+      {belowCount > 0 && (
         <Box paddingX={1}>
-          <Text color={themeColors.dim}>  … {filtered.length - MAX_VISIBLE} more</Text>
+          <Text color={themeColors.dim}>  ↓ {belowCount} more below</Text>
         </Box>
       )}
     </Box>

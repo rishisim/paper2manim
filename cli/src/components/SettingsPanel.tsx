@@ -30,11 +30,18 @@ export function SettingsPanel({ onBack }: SettingsPanelProps) {
   const [activeTab, setActiveTab] = useState(0);
   const [selectedRow, setSelectedRow] = useState(0);
 
-  const scope = TABS[activeTab]!.scope;
+  const scope = TABS[Math.min(activeTab, TABS.length - 1)]!.scope;
   const scopePath = getSettingsPath(scope);
-  const scopeSettings = existsSync(scopePath)
-    ? JSON.parse(readFileSync(scopePath, 'utf8') || '{}') as Partial<Settings>
-    : {};
+  // C5: Wrap in try-catch — a bad settings file must not crash the component
+  let scopeSettings: Partial<Settings> = {};
+  let settingsLoadError: string | null = null;
+  if (existsSync(scopePath)) {
+    try {
+      scopeSettings = JSON.parse(readFileSync(scopePath, 'utf8') || '{}') as Partial<Settings>;
+    } catch (err) {
+      settingsLoadError = String(err);
+    }
+  }
 
   const rows = EDITABLE_KEYS.map(key => ({
     key,
@@ -87,6 +94,13 @@ export function SettingsPanel({ onBack }: SettingsPanelProps) {
           </Box>
         ))}
       </Box>
+
+      {/* C5: Show load error instead of crashing */}
+      {settingsLoadError && (
+        <Box marginBottom={1}>
+          <Text color={themeColors.warn}>[WARN] Could not read settings file: {settingsLoadError}</Text>
+        </Box>
+      )}
 
       {/* Settings rows */}
       <Box flexDirection="column">

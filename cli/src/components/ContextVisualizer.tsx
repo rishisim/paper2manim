@@ -32,6 +32,8 @@ export function ContextVisualizer({ onBack }: ContextVisualizerProps) {
 
   // Color based on usage
   const getCellColor = (cellIdx: number): string => {
+    // L4: Guard against out-of-range index (defensive)
+    if (cellIdx < 0 || cellIdx >= TOTAL_CELLS) return themeColors.dim;
     const cellPct = cellIdx / TOTAL_CELLS;
     if (cellIdx < filledCells) {
       if (cellPct < 0.5) return themeColors.success;

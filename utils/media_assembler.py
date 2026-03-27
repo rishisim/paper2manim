@@ -5,6 +5,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterator
 
 
+def _size_based_timeout(paths: list[str], base: int = 120) -> int:
+    """Compute a size-proportional subprocess timeout in seconds.
+
+    M15: Replaces hardcoded timeout=120 which is insufficient for large video files.
+    Uses 2 seconds per MB of input, with a minimum of `base` seconds.
+    """
+    total_bytes = sum(os.path.getsize(p) for p in paths if os.path.exists(p))
+    total_mb = total_bytes / (1024 * 1024)
+    return max(base, int(total_mb * 2))
+
+
 def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -> Iterator[dict]:
     """
     Stitches an mp4 video and a wav/mp3 audio file together using ffmpeg.
@@ -44,7 +55,7 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
 
     yield {"status": "Executing ffmpeg command to stitch audio tracks..."}
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_size_based_timeout([video_path, audio_path]))
         if result.returncode == 0:
             yield {
                 "final": True,
@@ -128,7 +139,7 @@ def concatenate_segments(
                     "-movflags", "+faststart",
                     norm_path,
                 ]
-                res = subprocess.run(norm_cmd, capture_output=True, text=True, timeout=180)
+                res = subprocess.run(norm_cmd, capture_output=True, text=True, timeout=_size_based_timeout([vp], base=180))
                 if res.returncode != 0:
                     return (i, norm_path, res.stderr)
                 return (i, norm_path, None)
@@ -171,7 +182,7 @@ def concatenate_segments(
             ]
 
             yield {"status": "Running ffmpeg concat..."}
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=_size_based_timeout(normalized_paths))
 
             if result.returncode == 0:
                 yield {

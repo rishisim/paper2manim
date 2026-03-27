@@ -7,7 +7,7 @@
  *   Local:   .paper2manim/settings.local.json  (cwd, gitignored)
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, statSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
 import type { Settings, ThemeName, PermissionMode } from './types.js';
@@ -97,15 +97,57 @@ export function loadSettings(overrides?: Partial<Settings>): Settings {
   };
 }
 
+/** H7: Acquire a simple file lock (create lock file, retry up to 3 times).
+ *  Stale locks older than 5s are removed automatically. */
+function withFileLock(filePath: string, fn: () => void): void {
+  const lockPath = filePath + '.lock';
+  const maxRetries = 3;
+  const retryDelayMs = 200;
+  const staleAgeMs = 5000;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // Remove stale lock
+    if (existsSync(lockPath)) {
+      try {
+        const age = Date.now() - statSync(lockPath).mtimeMs;
+        if (age > staleAgeMs) unlinkSync(lockPath);
+      } catch { /* lock already gone */ }
+    }
+
+    try {
+      // O_EXCL-style: writeFileSync fails if lock already exists via 'wx' flag
+      writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
+      try {
+        fn();
+      } finally {
+        try { unlinkSync(lockPath); } catch { /* ignore */ }
+      }
+      return;
+    } catch {
+      // Lock contention — wait and retry
+      const start = Date.now();
+      while (Date.now() - start < retryDelayMs) { /* busy wait — short enough */ }
+    }
+  }
+  // Fall back to unlocked write rather than silently dropping the save
+  fn();
+}
+
 /** Save a partial settings update to a specific scope. */
 export function saveSettings(scope: SettingsScope, partial: Partial<Settings>): void {
   const path = getSettingsPath(scope);
   const dir = resolve(path, '..');
   ensureDir(dir);
 
-  const existing = readJsonSafe(path);
-  const merged = { ...existing, ...partial };
-  writeFileSync(path, JSON.stringify(merged, null, 2) + '\n', 'utf8');
+  withFileLock(path, () => {
+    const existing = readJsonSafe(path);
+    const merged = { ...existing, ...partial };
+    try {
+      writeFileSync(path, JSON.stringify(merged, null, 2) + '\n', 'utf8');
+    } catch (err) {
+      process.stderr.write(`[warn] Failed to save settings (${scope}): ${err}\n`);
+    }
+  });
 }
 
 /** Parse CLI flags into settings overrides. */
