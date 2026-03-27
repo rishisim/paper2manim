@@ -12,10 +12,21 @@ import { SummaryTable } from './components/SummaryTable.js';
 import { ErrorPanel } from './components/ErrorPanel.js';
 import { SuccessPanel } from './components/SuccessPanel.js';
 import { WorkspaceDashboard } from './components/WorkspaceDashboard.js';
+import { FooterStatusLine } from './components/FooterStatusLine.js';
+import { PromptBar } from './components/PromptBar.js';
+import { SettingsPanel } from './components/SettingsPanel.js';
+import { DoctorPanel } from './components/DoctorPanel.js';
+import { ContextVisualizer } from './components/ContextVisualizer.js';
+import { KeybindingsHelpOverlay } from './components/KeybindingsHelpOverlay.js';
+import { PermissionPrompt } from './components/PermissionPrompt.js';
+import { runHooks } from './lib/hooks.js';
 import { usePipeline } from './hooks/usePipeline.js';
 import { useElapsed } from './hooks/useElapsed.js';
+import { AppContextProvider, useAppContext } from './context/AppContext.js';
+import { exportSessionToText } from './lib/session.js';
 import { stageConfig, segmentPhaseLabels, colors, cleanStatus, type StageName } from './lib/theme.js';
-import type { CompletedStage, SegmentState } from './lib/types.js';
+import type { CompletedStage, SegmentState, Settings, Session } from './lib/types.js';
+import { PERMISSION_MODES } from './lib/types.js';
 
 interface AppProps {
   initialConcept?: string;
@@ -23,16 +34,23 @@ interface AppProps {
   isLite: boolean;
   quality?: 'low' | 'medium' | 'high';
   model?: string;
-  theme?: 'dark' | 'light' | 'minimal';
+  theme?: string;
   skipAudio?: boolean;
   workspace?: boolean;
   resumeDir?: string;
   verbose: boolean;
   renderTimeout?: number;
   ttsTimeout?: number;
+  // Phase 1 additions
+  settings: Settings;
+  session: Session;
+  gitBranch: string | null;
+  systemPrompt?: string;
+  maxTurns?: number;
+  noSessionPersistence?: boolean;
 }
 
-type Screen = 'input' | 'workspace' | 'questionnaire' | 'running' | 'complete' | 'error';
+type Screen = 'input' | 'workspace' | 'questionnaire' | 'running' | 'complete' | 'error' | 'settings' | 'context' | 'doctor' | 'keybindings';
 
 /** A single log entry rendered in the Static scroll region. */
 interface LogEntry {
@@ -47,9 +65,31 @@ interface LogEntry {
   bold?: boolean;
 }
 
-export function App({ initialConcept, maxRetries, isLite, quality = 'high', model, theme = 'dark', skipAudio = false, workspace = false, resumeDir, verbose, renderTimeout, ttsTimeout }: AppProps) {
+function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAudio = false, workspace = false, resumeDir, verbose, renderTimeout, ttsTimeout, systemPrompt, maxTurns }: Omit<AppProps, 'settings' | 'session' | 'gitBranch' | 'noSessionPersistence' | 'model' | 'theme' | 'quality'> & { quality?: 'low'|'medium'|'high' }) {
   const { exit } = useApp();
-  const pipeline = usePipeline({ verbose });
+  const {
+    themeColors,
+    permissionMode,
+    currentModel,
+    verboseMode: ctxVerboseMode,
+    thinkingVisible,
+    quality: ctxQuality,
+    gitBranch,
+    cyclePermissionMode,
+    setPermissionMode,
+    setVerboseMode,
+    setThinkingVisible,
+    setQuality,
+    setCurrentModel,
+    setPromptColor,
+    updateSetting,
+    addTokenUsage,
+    pushHistory,
+    updateSession,
+    session,
+  } = useAppContext();
+
+  const pipeline = usePipeline({ verbose, onTokenUsage: addTokenUsage });
 
   const initialScreen: Screen = workspace ? 'workspace' : (initialConcept || resumeDir) ? 'running' : 'input';
   const [screen, setScreen] = useState<Screen>(initialScreen);
@@ -100,44 +140,131 @@ export function App({ initialConcept, maxRetries, isLite, quality = 'high', mode
 
   // ── Keyboard shortcut state ─────────────────────────────────
   const [showHelp, setShowHelp] = useState(false);
-  const [verboseLive, setVerboseLive] = useState(verbose);
-  // Keep a ref for use inside useEffect closures to avoid stale state
-  const verboseLiveRef = useRef(verbose);
-  useEffect(() => { verboseLiveRef.current = verboseLive; }, [verboseLive]);
+  // Sync verboseLive with context verboseMode
+  const verboseLive = ctxVerboseMode;
+  const verboseLiveRef = useRef(ctxVerboseMode);
+  useEffect(() => { verboseLiveRef.current = ctxVerboseMode; }, [ctxVerboseMode]);
+
+  // Inline messages (e.g. from slash command confirmations)
+  const [inlineMessage, setInlineMessage] = useState<{text: string; color?: string} | null>(null);
+
+  // Stage tracking for footer
+  const [currentStageForFooter, setCurrentStageForFooter] = useState<string | null>(null);
+
+  // ── Hooks: fire SessionStart on mount, SessionEnd on unmount ──────
+  const { settings } = useAppContext();
+  useEffect(() => {
+    if (!settings.disableAllHooks) {
+      runHooks('SessionStart', { concept: initialConcept ?? '' }, settings.hooks, settings.disableAllHooks);
+    }
+    return () => {
+      if (!settings.disableAllHooks) {
+        runHooks('SessionEnd', {}, settings.hooks, settings.disableAllHooks);
+      }
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const escPressTime = useRef<number>(0);
 
   useInput((_input, key) => {
-    // Ctrl+C is not delivered as '\x03' in ink v5 — use the key object
+    // Ctrl+C — cancel pipeline / exit
     if (key.ctrl && _input === 'c') {
-      if (ctrlCPending) {
-        pipeline.kill();
-        exit();
-        process.exit(0);
+      if (screen === 'running' && currentStage && currentStage !== 'done') {
+        // Single Ctrl+C during run — prompt for confirmation
+        if (ctrlCPending) {
+          pipeline.kill();
+          exit();
+          process.exit(0);
+        } else {
+          setCtrlCPending(true);
+          if (ctrlCTimer.current) clearTimeout(ctrlCTimer.current);
+          ctrlCTimer.current = setTimeout(() => setCtrlCPending(false), 2000);
+        }
       } else {
-        setCtrlCPending(true);
-        if (ctrlCTimer.current) clearTimeout(ctrlCTimer.current);
-        ctrlCTimer.current = setTimeout(() => setCtrlCPending(false), 2000);
+        if (ctrlCPending) {
+          exit();
+          process.exit(0);
+        } else {
+          setCtrlCPending(true);
+          if (ctrlCTimer.current) clearTimeout(ctrlCTimer.current);
+          ctrlCTimer.current = setTimeout(() => setCtrlCPending(false), 2000);
+        }
       }
       return;
     }
 
-    // ? — toggle keyboard help overlay (only during active run)
+    // Ctrl+D — clean exit
+    if (key.ctrl && _input === 'd') {
+      pipeline.kill();
+      exit();
+      process.exit(0);
+      return;
+    }
+
+    // Ctrl+L — clear screen (preserve log history)
+    if (key.ctrl && _input === 'l') {
+      process.stdout.write('\x1b[2J\x1b[H');
+      return;
+    }
+
+    // Ctrl+O — toggle verbose mode
+    if (key.ctrl && _input === 'o') {
+      setVerboseMode(v => !v);
+      return;
+    }
+
+    // Shift+Tab / Alt+M — cycle permission modes
+    if (key.shift && key.tab) {
+      cyclePermissionMode();
+      return;
+    }
+
+    // Alt+T — toggle thinking visible
+    if (key.meta && _input === 't') {
+      setThinkingVisible(v => !v);
+      return;
+    }
+
+    // Alt+O — toggle fast/lite mode (quality low ↔ high)
+    if (key.meta && _input === 'o') {
+      setQuality(ctxQuality === 'low' ? 'high' : 'low');
+      return;
+    }
+
+    // Alt+P — cycle model opus ↔ sonnet
+    if (key.meta && _input === 'p') {
+      const next = currentModel.includes('opus') ? 'claude-sonnet-4-6' : 'claude-opus-4-6';
+      setCurrentModel(next);
+      updateSetting('model', next);
+      return;
+    }
+
+    // Esc+Esc — rewind to last checkpoint (quick double-Esc)
+    if (key.escape) {
+      const now = Date.now();
+      if (now - escPressTime.current < 500) {
+        // Double Esc — rewind (just go back to input for now)
+        if (screen !== 'input' && screen !== 'running') {
+          setScreen('input');
+        }
+      }
+      escPressTime.current = now;
+      return;
+    }
+
+    // ? — toggle keyboard help overlay
     if (_input === '?' && screen === 'running') {
       setShowHelp(h => !h);
       return;
     }
 
-    // Ctrl+O — toggle verbose mode
-    if (key.ctrl && _input === 'o' && screen === 'running') {
-      setVerboseLive(v => !v);
-      return;
-    }
-
+    // Navigate back from secondary screens with Esc (handled per-screen via useInput in child components)
   });
 
   // Add only the concept header to the static log (banner is rendered separately, not in Static)
   const addConceptHeader = (c: string, isResume = false) => {
-    const qualityLabel = quality.charAt(0).toUpperCase() + quality.slice(1);
-    const modelLabel = model ? `  Model: ${model}` : '';
+    const qualityLabel = ctxQuality.charAt(0).toUpperCase() + ctxQuality.slice(1);
+    const modelLabel = currentModel ? `  Model: ${currentModel}` : '';
     const prefix = isResume ? 'Resuming' : 'Concept';
     addLog({
       type: 'header',
@@ -149,10 +276,10 @@ export function App({ initialConcept, maxRetries, isLite, quality = 'high', mode
   useEffect(() => {
     if (resumeDir) {
       addConceptHeader('project from: ' + resumeDir, true);
-      pipeline.start({ concept: 'resume', max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: resumeDir, render_timeout: renderTimeout, tts_timeout: ttsTimeout });
+      pipeline.start({ concept: 'resume', max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: resumeDir, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: systemPrompt, max_turns: maxTurns, model: currentModel });
     } else if (initialConcept) {
       addConceptHeader(initialConcept);
-      pipeline.start({ concept: initialConcept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, render_timeout: renderTimeout, tts_timeout: ttsTimeout });
+      pipeline.start({ concept: initialConcept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: systemPrompt, max_turns: maxTurns, model: currentModel });
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -160,8 +287,10 @@ export function App({ initialConcept, maxRetries, isLite, quality = 'high', mode
   const handleConceptSubmit = (c: string) => {
     setConcept(c);
     addConceptHeader(c);
+    pushHistory(c);
+    updateSession({ concept: c });
     process.stdout.write(`\x1b]0;paper2manim: ${c.slice(0, 50)}\x07`);
-    pipeline.start({ concept: c, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, render_timeout: renderTimeout, tts_timeout: ttsTimeout });
+    pipeline.start({ concept: c, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: systemPrompt, max_turns: maxTurns, model: currentModel });
     setScreen('running');
   };
 
@@ -350,24 +479,101 @@ export function App({ initialConcept, maxRetries, isLite, quality = 'high', mode
     }
   }, [pipeline.updates.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Secondary screens (settings, context, doctor, keybindings) ──
+  if (screen === 'settings') {
+    return (
+      <Box flexDirection="column" paddingX={1}>
+        <SettingsPanel onBack={() => setScreen('input')} />
+        <FooterStatusLine stage={null} />
+      </Box>
+    );
+  }
+
+  if (screen === 'context') {
+    return (
+      <Box flexDirection="column" paddingX={1}>
+        <ContextVisualizer onBack={() => setScreen('input')} />
+        <FooterStatusLine stage={null} />
+      </Box>
+    );
+  }
+
+  if (screen === 'doctor') {
+    return (
+      <Box flexDirection="column" paddingX={1}>
+        <DoctorPanel onBack={() => setScreen('input')} />
+        <FooterStatusLine stage={null} />
+      </Box>
+    );
+  }
+
+  if (screen === 'keybindings') {
+    return (
+      <Box flexDirection="column" paddingX={1}>
+        <KeybindingsHelpOverlay onBack={() => setScreen('input')} />
+        <FooterStatusLine stage={null} />
+      </Box>
+    );
+  }
+
+  // ── Build AppDispatch for command handlers ──────────────────────
+  const appDispatch: import('./lib/types.js').AppDispatch = {
+    setScreen: (s) => setScreen(s as Screen),
+    setPermissionMode: (mode) => setPermissionMode(mode),
+    setVerboseMode: (v: boolean) => setVerboseMode(v),
+    setThinkingVisible: (v: boolean) => setThinkingVisible(v),
+    setPromptColor: (color) => setPromptColor(color),
+    setCurrentModel: (model) => setCurrentModel(model),
+    setTheme: (theme) => updateSetting('theme', theme),
+    setQuality: (q) => setQuality(q),
+    startPipeline: (c) => handleConceptSubmit(c),
+    resumePipeline: (dir) => {
+      setConcept(dir);
+      addConceptHeader(dir, true);
+      pipeline.start({ concept: 'resume', max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: dir, model: currentModel });
+      setScreen('running');
+    },
+    compactLogs: (_instructions) => {
+      // Compact: keep last few entries
+      setLogEntries(prev => prev.slice(-5));
+      setInlineMessage({ text: 'Log compacted.', color: themeColors.dim });
+    },
+    exportSession: (_filename) => {
+      return exportSessionToText(session);
+    },
+    killPipeline: () => { pipeline.kill(); },
+    exit: () => { pipeline.kill(); exit(); process.exit(0); },
+    showMessage: (text, color) => {
+      setInlineMessage({ text, color });
+      setTimeout(() => setInlineMessage(null), 5000);
+    },
+  };
+
   // ── Input screen ──────────────────────────────────────────────
   if (screen === 'input') {
     return (
       <Box flexDirection="column" paddingX={1}>
         <WelcomeScreen
           onSubmit={handleConceptSubmit}
+          dispatch={appDispatch}
           onResumeProject={(project) => {
             setConcept(project.concept);
             addConceptHeader(project.concept, true);
-            pipeline.start({ concept: project.concept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: project.dir });
+            pipeline.start({ concept: project.concept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: project.dir, model: currentModel });
             setScreen('running');
           }}
         />
-        {ctrlCPending && (
-          <Box marginTop={1}>
-            <Text color={colors.dim}>Press <Text bold>Ctrl+C</Text> again to exit</Text>
+        {inlineMessage && (
+          <Box marginTop={1} paddingLeft={1}>
+            <Text color={inlineMessage.color ?? themeColors.dim}>{inlineMessage.text}</Text>
           </Box>
         )}
+        {ctrlCPending && (
+          <Box marginTop={1}>
+            <Text color={themeColors.dim}>Press <Text bold>Ctrl+C</Text> again to exit</Text>
+          </Box>
+        )}
+        <FooterStatusLine stage={null} />
       </Box>
     );
   }
@@ -381,7 +587,7 @@ export function App({ initialConcept, maxRetries, isLite, quality = 'high', mode
           onResume={(resumeConcept, resumeFromDir) => {
             setConcept(resumeConcept);
             addConceptHeader(resumeConcept, true);
-            pipeline.start({ concept: resumeConcept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: resumeFromDir });
+            pipeline.start({ concept: resumeConcept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: resumeFromDir, model: currentModel });
             setScreen('running');
           }}
           onBack={() => {
@@ -390,9 +596,10 @@ export function App({ initialConcept, maxRetries, isLite, quality = 'high', mode
         />
         {ctrlCPending && (
           <Box marginTop={1}>
-            <Text color={colors.dim}>Press <Text bold>Ctrl+C</Text> again to exit</Text>
+            <Text color={themeColors.dim}>Press <Text bold>Ctrl+C</Text> again to exit</Text>
           </Box>
         )}
+        <FooterStatusLine stage={null} />
       </Box>
     );
   }
@@ -408,9 +615,10 @@ export function App({ initialConcept, maxRetries, isLite, quality = 'high', mode
         />
         {ctrlCPending && (
           <Box marginTop={1}>
-            <Text color={colors.dim}>Press <Text bold>Ctrl+C</Text> again to exit</Text>
+            <Text color={themeColors.dim}>Press <Text bold>Ctrl+C</Text> again to exit</Text>
           </Box>
         )}
+        <FooterStatusLine stage={null} />
       </Box>
     );
   }
@@ -460,13 +668,13 @@ export function App({ initialConcept, maxRetries, isLite, quality = 'high', mode
           return (
             <Box key={entry.id} paddingLeft={3}>
               <Text>
-                <Text color={entry.color ?? colors.dim}>
+                <Text color={entry.color ?? themeColors.dim}>
                   {entry.icon ?? '│'}{' '}
                 </Text>
                 {entry.bold ? (
                   <Text bold color={entry.color}>{entry.text}</Text>
                 ) : (
-                  <Text color={colors.dim}>{entry.text}</Text>
+                  <Text color={themeColors.dim}>{entry.text}</Text>
                 )}
               </Text>
             </Box>
@@ -490,26 +698,53 @@ export function App({ initialConcept, maxRetries, isLite, quality = 'high', mode
       {/* Keyboard shortcuts — Claude Code style inline list */}
       {showHelp && screen === 'running' && (
         <Box flexDirection="column" marginTop={1} paddingLeft={2}>
-          <Text bold color={colors.primary}>Keyboard shortcuts</Text>
+          <Text bold color={themeColors.primary}>Keyboard shortcuts</Text>
           <Box marginTop={0}>
-            <Text color={colors.dim}>  {'→'}  </Text>
-            <Text color={colors.primary} bold>{'?'}</Text>
-            <Text color={colors.dim}>{'         '}Toggle this help</Text>
+            <Text color={themeColors.dim}>  {'→'}  </Text>
+            <Text color={themeColors.primary} bold>{'?'}</Text>
+            <Text color={themeColors.dim}>{'         '}Toggle this help</Text>
           </Box>
           <Box>
-            <Text color={colors.dim}>  {'→'}  </Text>
-            <Text color={colors.primary} bold>Ctrl+O</Text>
-            <Text color={colors.dim}>{'    '}Toggle verbose mode{verboseLive ? ' (currently ON)' : ' (currently OFF)'}</Text>
+            <Text color={themeColors.dim}>  {'→'}  </Text>
+            <Text color={themeColors.primary} bold>Ctrl+O</Text>
+            <Text color={themeColors.dim}>{'    '}Toggle verbose mode{verboseLive ? ' (currently ON)' : ' (currently OFF)'}</Text>
           </Box>
           <Box>
-            <Text color={colors.dim}>  {'→'}  </Text>
-            <Text color={colors.primary} bold>Ctrl+C</Text>
-            <Text color={colors.dim}>{'    '}Cancel (press twice to exit)</Text>
+            <Text color={themeColors.dim}>  {'→'}  </Text>
+            <Text color={themeColors.primary} bold>Ctrl+C</Text>
+            <Text color={themeColors.dim}>{'    '}Cancel (press twice)</Text>
+          </Box>
+          <Box>
+            <Text color={themeColors.dim}>  {'→'}  </Text>
+            <Text color={themeColors.primary} bold>Ctrl+D</Text>
+            <Text color={themeColors.dim}>{'    '}Exit immediately</Text>
+          </Box>
+          <Box>
+            <Text color={themeColors.dim}>  {'→'}  </Text>
+            <Text color={themeColors.primary} bold>Shift+Tab</Text>
+            <Text color={themeColors.dim}>{'  '}Cycle permission mode</Text>
+          </Box>
+          <Box>
+            <Text color={themeColors.dim}>  {'→'}  </Text>
+            <Text color={themeColors.primary} bold>Alt+T</Text>
+            <Text color={themeColors.dim}>{'    '}Toggle thinking display</Text>
+          </Box>
+          <Box>
+            <Text color={themeColors.dim}>  {'→'}  </Text>
+            <Text color={themeColors.primary} bold>Alt+O</Text>
+            <Text color={themeColors.dim}>{'    '}Toggle fast/lite mode</Text>
+          </Box>
+          <Box>
+            <Text color={themeColors.dim}>  {'→'}  </Text>
+            <Text color={themeColors.primary} bold>Alt+P</Text>
+            <Text color={themeColors.dim}>{'    '}Cycle model (opus ↔ sonnet)</Text>
           </Box>
           <Box marginTop={0}>
-            <Text color={colors.dim}>  Press </Text>
-            <Text color={colors.primary} bold>?</Text>
-            <Text color={colors.dim}> to close</Text>
+            <Text color={themeColors.dim}>  Press </Text>
+            <Text color={themeColors.primary} bold>?</Text>
+            <Text color={themeColors.dim}> to close  ·  Type </Text>
+            <Text color={themeColors.primary} bold>/</Text>
+            <Text color={themeColors.dim}> for slash commands</Text>
           </Box>
         </Box>
       )}
@@ -538,9 +773,49 @@ export function App({ initialConcept, maxRetries, isLite, quality = 'high', mode
       {/* Ctrl+C warning */}
       {ctrlCPending && (
         <Box paddingLeft={1} marginTop={1}>
-          <Text color={colors.dim}>Press <Text bold>Ctrl+C</Text> again to exit</Text>
+          <Text color={themeColors.dim}>Press <Text bold>Ctrl+C</Text> again to exit</Text>
         </Box>
       )}
+
+      {/* Permission prompt (default mode) */}
+      {pipeline.permissionPending && (
+        <PermissionPrompt
+          operation={pipeline.permissionPending.operation}
+          path={pipeline.permissionPending.path}
+          onAllow={() => pipeline.answerPermission(true)}
+          onDeny={() => pipeline.answerPermission(false)}
+          onAllowAlways={() => pipeline.answerPermission(true, true)}
+        />
+      )}
+
+      {/* Footer status line — always at bottom */}
+      <FooterStatusLine stage={currentStage} />
     </Box>
+  );
+}
+
+/** Public App component — wraps AppInner with AppContextProvider. */
+export function App(props: AppProps) {
+  return (
+    <AppContextProvider
+      settings={props.settings}
+      session={props.session}
+      gitBranch={props.gitBranch}
+    >
+      <AppInner
+        initialConcept={props.initialConcept}
+        maxRetries={props.maxRetries}
+        isLite={props.isLite}
+        quality={props.quality}
+        skipAudio={props.skipAudio}
+        workspace={props.workspace}
+        resumeDir={props.resumeDir}
+        verbose={props.verbose}
+        renderTimeout={props.renderTimeout}
+        ttsTimeout={props.ttsTimeout}
+        systemPrompt={props.systemPrompt}
+        maxTurns={props.maxTurns}
+      />
+    </AppContextProvider>
   );
 }

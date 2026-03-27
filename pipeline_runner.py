@@ -142,6 +142,10 @@ def main() -> None:
     questionnaire_answers: dict | None = args.get("questionnaire_answers")
     render_timeout: int = int(args.get("render_timeout") or 0)
     tts_timeout: int = int(args.get("tts_timeout") or 0)
+    # Phase 5-6 extensions (new optional args — fully backward-compatible)
+    system_prompt_prefix: str = args.get("system_prompt_prefix") or ""
+    max_turns: int = int(args.get("max_turns") or 0)
+    model_override: str = args.get("model") or ""
 
     # ── Resume mode: load concept from existing project ──────────────
     resume_dir: str | None = args.get("resume_dir")
@@ -238,6 +242,17 @@ def main() -> None:
     # ── Pipeline phase ───────────────────────────────────────────────
     from agents.pipeline import run_segmented_pipeline
 
+    # If system_prompt_prefix or model_override provided, inject via env so agents can read it
+    if system_prompt_prefix:
+        os.environ["PAPER2MANIM_SYSTEM_PROMPT_PREFIX"] = system_prompt_prefix
+    if model_override:
+        os.environ["PAPER2MANIM_MODEL_OVERRIDE"] = model_override
+    if max_turns:
+        os.environ["PAPER2MANIM_MAX_TURNS"] = str(max_turns)
+
+    accumulated_input_tokens = 0
+    accumulated_output_tokens = 0
+
     try:
         for update in run_segmented_pipeline(
             concept=concept,
@@ -250,6 +265,22 @@ def main() -> None:
             tts_timeout_seconds=tts_timeout,
         ):
             _emit({"type": "pipeline", "update": update})
+
+            # Emit a token_usage message when the final update arrives,
+            # using total_tool_calls as a proxy for model calls (approximate)
+            if update.get("final") and not update.get("error"):
+                total_calls = update.get("total_tool_calls", 0) or 0
+                # Approximate token usage: each tool call ~2k tokens average
+                approx_input = total_calls * 2000
+                approx_output = total_calls * 500
+                if total_calls > 0:
+                    _emit({
+                        "type": "token_usage",
+                        "input": approx_input,
+                        "output": approx_output,
+                        "cache_read": 0,
+                    })
+
     except Exception as e:
         _emit({"type": "error", "message": str(e)})
         sys.exit(1)

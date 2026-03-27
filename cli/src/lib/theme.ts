@@ -2,7 +2,21 @@
  * Theme constants — Claude Code-inspired color palette and stage configuration.
  */
 
-export const colors = {
+import type { ThemeName } from './types.js';
+
+export interface ThemeColors {
+  primary: string;
+  success: string;
+  error: string;
+  warn: string;
+  muted: string;
+  text: string;
+  dim: string;
+  accent: string;
+  bg: string;
+}
+
+export const colors: ThemeColors = {
   primary: '#64B4FF',
   success: '#00C853',
   error: '#F44336',
@@ -11,7 +25,83 @@ export const colors = {
   text: '#FFFFFF',
   dim: '#888888',
   accent: '#5B9DFF',
+  bg: '#000000',
 } as const;
+
+export const THEMES: Record<ThemeName, ThemeColors> = {
+  dark: {
+    primary: '#64B4FF',
+    success: '#00C853',
+    error: '#F44336',
+    warn: '#FF9800',
+    muted: '#999999',
+    text: '#FFFFFF',
+    dim: '#888888',
+    accent: '#5B9DFF',
+    bg: '#000000',
+  },
+  light: {
+    primary: '#0066CC',
+    success: '#00873C',
+    error: '#CC0000',
+    warn: '#CC6600',
+    muted: '#666666',
+    text: '#000000',
+    dim: '#555555',
+    accent: '#0052A3',
+    bg: '#FFFFFF',
+  },
+  minimal: {
+    primary: '#AAAAAA',
+    success: '#AAAAAA',
+    error: '#AAAAAA',
+    warn: '#AAAAAA',
+    muted: '#888888',
+    text: '#FFFFFF',
+    dim: '#666666',
+    accent: '#AAAAAA',
+    bg: '#000000',
+  },
+  colorblind: {
+    primary: '#0072B2',  // Blue
+    success: '#009E73',  // Teal
+    error: '#D55E00',    // Vermillion
+    warn: '#E69F00',     // Orange
+    muted: '#999999',
+    text: '#FFFFFF',
+    dim: '#888888',
+    accent: '#56B4E9',   // Sky blue
+    bg: '#000000',
+  },
+  ansi: {
+    primary: 'cyan',
+    success: 'green',
+    error: 'red',
+    warn: 'yellow',
+    muted: 'gray',
+    text: 'white',
+    dim: 'gray',
+    accent: 'blue',
+    bg: 'black',
+  },
+};
+
+export const PROMPT_COLORS: Record<string, string> = {
+  red:    '#F44336',
+  blue:   '#64B4FF',
+  green:  '#00C853',
+  yellow: '#FFD600',
+  purple: '#9C78FF',
+  orange: '#FF9800',
+  pink:   '#FF6496',
+  cyan:   '#00B4D8',
+  white:  '#FFFFFF',
+  default: '#64B4FF',
+};
+
+export function getThemeColors(theme: ThemeName): ThemeColors {
+  return THEMES[theme] ?? THEMES.dark;
+}
 
 export const BRAND_ICON = '✻';
 

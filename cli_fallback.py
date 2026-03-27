@@ -1154,24 +1154,75 @@ def run_pipeline_for_concept(
 
 
 REPL_COMMANDS: dict[str, str] = {
-    "/help":      "Show available commands",
-    "/settings":  "Show current settings (quality, model, theme)",
-    "/workspace": "Open the workspace dashboard",
-    "/status":    "Show last pipeline summary",
-    "/clear":     "Clear the screen",
-    "/quit":      "Exit interactive mode",
+    # Generation
+    "/generate":      "Generate a video for a concept  (/generate <concept>)",
+    "/plan":          "Plan mode: generate without running  (/plan <concept>)",
+    "/resume":        "Resume an interrupted project  (/resume [dir])",
+    # Workspace
+    "/list":          "List all projects in the workspace",
+    "/delete":        "Delete a project directory  (/delete <dir>)",
+    "/clean":         "Remove stale placeholder projects",
+    "/workspace":     "Open the workspace dashboard",
+    "/status":        "Show last pipeline summary",
+    "/diff":          "Show git diff of the output directory",
+    # Display / interface
+    "/clear":         "Clear the terminal screen  (alias: /reset, /new)",
+    "/verbose":       "Toggle verbose mode on/off",
+    "/compact":       "Summarise long log output  (/compact [instructions])",
+    "/context":       "Show context window usage visualizer",
+    "/cost":          "Print token usage for this session",
+    "/insights":      "Print timing and tool-call analytics",
+    # Settings
+    "/config":        "Show and edit settings  (alias: /settings)",
+    "/model":         "Switch the Claude model  (/model [name])",
+    "/quality":       "Set quality level  (/quality low|medium|high)",
+    "/theme":         "Set color theme  (/theme dark|light|minimal|colorblind|ansi)",
+    "/color":         "Set prompt bar color  (/color red|blue|green|...)",
+    "/vim":           "Toggle vim / normal editor mode",
+    "/statusline":    "Show or set a custom status-line script path",
+    # Memory / docs
+    "/memory":        "Open PAPER2MANIM.md in $EDITOR",
+    "/init":          "Write a template PAPER2MANIM.md to the current directory",
+    "/release-notes": "Show the CHANGELOG",
+    # Session / export
+    "/export":        "Export session log to ~/.paper2manim/exports/  (/export [filename])",
+    "/btw":           "Ask a side question without adding it to history  (/btw <question>)",
+    # Introspection / help
+    "/doctor":        "Run installation diagnostics",
+    "/hooks":         "List configured lifecycle hooks",
+    "/permissions":   "Show permission rules  (alias: /allowed-tools)",
+    "/keybindings":   "Show keyboard shortcut reference",
+    "/help":          "Show this command list  (alias: /?)",
+    "/feedback":      "Open the GitHub issue tracker in a browser  (alias: /bug)",
+    # Session control
+    "/quit":          "Exit interactive mode  (alias: /exit, /q)",
 }
 
 
+# ── REPL command handlers ─────────────────────────────────────────────
+
 def _repl_help() -> None:
-    table = Table(box=box.MINIMAL, show_header=False, padding=(0, 2))
-    table.add_column(style=ACCENT_B)
-    table.add_column(style=DIM)
-    for cmd, desc in REPL_COMMANDS.items():
-        table.add_row(cmd, desc)
+    groups = [
+        ("Generation",       ["/generate", "/plan", "/resume"]),
+        ("Workspace",        ["/list", "/delete", "/clean", "/workspace", "/status", "/diff"]),
+        ("Display",          ["/clear", "/verbose", "/compact", "/context", "/cost", "/insights"]),
+        ("Settings",         ["/config", "/model", "/quality", "/theme", "/color", "/vim", "/statusline"]),
+        ("Memory / Docs",    ["/memory", "/init", "/release-notes"]),
+        ("Session / Export", ["/export", "/btw"]),
+        ("Help",             ["/doctor", "/hooks", "/permissions", "/keybindings", "/help", "/feedback"]),
+        ("Session Control",  ["/quit"]),
+    ]
     console.print()
-    console.print("  [bold]Commands[/bold]")
-    console.print(table)
+    console.print("  [bold]Commands[/bold]\n")
+    for group_name, cmds in groups:
+        console.print(f"  [{ACCENT}]{group_name}[/{ACCENT}]")
+        table = Table(box=box.MINIMAL, show_header=False, padding=(0, 2))
+        table.add_column(style=ACCENT_B, min_width=18)
+        table.add_column(style=DIM)
+        for c in cmds:
+            if c in REPL_COMMANDS:
+                table.add_row(c, REPL_COMMANDS[c])
+        console.print(table)
     console.print(f"  [{DIM}]Or type any concept to generate a video.[/{DIM}]\n")
 
 
@@ -1195,6 +1246,285 @@ def _repl_settings(args: argparse.Namespace) -> None:
     console.print()
 
 
+def _repl_doctor() -> None:
+    """Run installation diagnostics and report pass/fail for each check."""
+    import subprocess
+    checks: list[tuple[str, bool, str]] = []
+
+    def _check(label: str, ok: bool, detail: str = "") -> None:
+        checks.append((label, ok, detail))
+
+    # Node.js ≥18
+    try:
+        out = subprocess.check_output(["node", "--version"], stderr=subprocess.DEVNULL).decode().strip()
+        major = int(out.lstrip("v").split(".")[0])
+        _check("Node.js ≥ 18", major >= 18, out)
+    except Exception:
+        _check("Node.js ≥ 18", False, "not found")
+
+    # Python ≥3.10
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    _check("Python ≥ 3.10", sys.version_info >= (3, 10), py_ver)
+
+    # Manim importable
+    try:
+        import importlib
+        importlib.import_module("manim")
+        _check("Manim", True, "importable")
+    except ImportError:
+        _check("Manim", False, "not importable — run: pip install manim")
+
+    # FFmpeg in PATH
+    try:
+        subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.DEVNULL)
+        _check("FFmpeg", True, "found in PATH")
+    except Exception:
+        _check("FFmpeg", False, "not found in PATH")
+
+    # LaTeX (pdflatex)
+    try:
+        subprocess.check_output(["pdflatex", "--version"], stderr=subprocess.DEVNULL)
+        _check("LaTeX (pdflatex)", True, "found in PATH")
+    except Exception:
+        _check("LaTeX (pdflatex)", False, "optional — needed for LaTeX-heavy animations")
+
+    # API keys
+    anthropic_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    gemini_key = bool(os.environ.get("GEMINI_API_KEY"))
+    _check("ANTHROPIC_API_KEY", anthropic_key, "set" if anthropic_key else "missing — required")
+    _check("GEMINI_API_KEY", gemini_key, "set" if gemini_key else "missing — required for TTS")
+
+    # ~/.paper2manim directory
+    cfg_dir = os.path.expanduser("~/.paper2manim")
+    _check("~/.paper2manim dir", os.path.isdir(cfg_dir), cfg_dir if os.path.isdir(cfg_dir) else "not created yet")
+
+    console.print()
+    console.print("  [bold]Doctor[/bold] — Installation diagnostics\n")
+    for label, ok, detail in checks:
+        icon = f"[{SUCCESS}][OK][/{SUCCESS}]  " if ok else f"[{FAIL}][FAIL][/{FAIL}]"
+        detail_str = f"  [{DIM}]{detail}[/{DIM}]" if detail else ""
+        console.print(f"  {icon} {label}{detail_str}")
+    console.print()
+
+
+def _repl_context(last_tool_call_counts: dict[str, int]) -> None:
+    """Show a visual context window usage grid."""
+    # Approximate: count characters typed + tool calls as a proxy for token usage
+    total_tool_calls = sum(last_tool_call_counts.values()) if last_tool_call_counts else 0
+    # 200k token window; rough estimate: 1 tool call ≈ 800 tokens on average
+    used_tokens = total_tool_calls * 800
+    max_tokens = 200_000
+    pct = min(used_tokens / max_tokens, 1.0)
+
+    cols, rows = 50, 6
+    filled = int(pct * cols * rows)
+
+    console.print()
+    console.print("  [bold]Context Window[/bold]")
+    console.print(f"  [{DIM}]~{used_tokens:,} / {max_tokens:,} tokens ({pct * 100:.1f}%)[/{DIM}]\n")
+
+    for r in range(rows):
+        line = "  "
+        for c in range(cols):
+            idx = r * cols + c
+            if idx < filled:
+                if pct < 0.5:
+                    line += f"[green]█[/green]"
+                elif pct < 0.8:
+                    line += f"[yellow]█[/yellow]"
+                else:
+                    line += f"[red]█[/red]"
+            else:
+                line += f"[{DIM}]░[/{DIM}]"
+        console.print(line)
+    console.print()
+
+
+def _repl_memory() -> None:
+    """Open PAPER2MANIM.md in $EDITOR."""
+    mem_path = os.path.join(os.getcwd(), "PAPER2MANIM.md")
+    if not os.path.isfile(mem_path):
+        console.print(f"  [{WARN}]PAPER2MANIM.md not found. Run /init to create it.[/{WARN}]")
+        return
+    editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "nano"))
+    os.system(f'{editor} "{mem_path}"')
+
+
+def _repl_init() -> None:
+    """Write a template PAPER2MANIM.md to the current directory."""
+    mem_path = os.path.join(os.getcwd(), "PAPER2MANIM.md")
+    if os.path.isfile(mem_path):
+        if not Confirm.ask(f"  [{WARN}]PAPER2MANIM.md already exists. Overwrite?[/{WARN}]"):
+            return
+    template = (
+        "# PAPER2MANIM.md\n\n"
+        "This file is loaded at session start and injected as a system prompt prefix.\n\n"
+        "## Generation Preferences\n"
+        "- Default quality: high\n"
+        "- Default audience: undergraduate\n\n"
+        "## Style Notes\n"
+        "- Prefer geometric visualizations\n"
+        "- Use 3b1b color palette (#FFFFFF, #1C1C1C, #58C4DD, #83C167, #FC6255)\n\n"
+        "## Model Hints\n"
+        "- Keep animations under 90 seconds per segment\n"
+    )
+    with open(mem_path, "w") as f:
+        f.write(template)
+    console.print(f"  [{SUCCESS}]✓[/{SUCCESS}]  Created PAPER2MANIM.md in {os.getcwd()}")
+
+
+def _repl_insights(last_stages: list[tuple[str, str, float]], last_tool_call_counts: dict[str, int]) -> None:
+    """Print timing and tool-call analytics for the last run."""
+    if not last_stages:
+        console.print(f"  [{WARN}]No pipeline has run yet in this session.[/{WARN}]")
+        return
+    console.print()
+    console.print("  [bold]Pipeline Insights[/bold]\n")
+
+    # Timing
+    console.print(f"  [{ACCENT}]Stage Timings[/{ACCENT}]")
+    total = sum(e for _, _, e in last_stages)
+    for name, status, elapsed in last_stages:
+        bar_len = int((elapsed / total) * 30) if total > 0 else 0
+        bar = "█" * bar_len + "░" * (30 - bar_len)
+        icon = f"[{SUCCESS}]✓[/{SUCCESS}]" if status == "ok" else f"[{FAIL}]✗[/{FAIL}]"
+        console.print(f"  {icon} {_format_stage_name(name):<22} [{ACCENT}]{bar}[/{ACCENT}] {_format_duration(elapsed)}")
+    console.print(f"  [{DIM}]Total: {_format_duration(total)}[/{DIM}]")
+
+    # Tool calls
+    if last_tool_call_counts:
+        console.print()
+        console.print(f"  [{ACCENT}]Tool Call Counts[/{ACCENT}]")
+        for tool, count in sorted(last_tool_call_counts.items(), key=lambda x: -x[1]):
+            console.print(f"  [{DIM}]{tool:<28}[/{DIM}] {count}")
+    console.print()
+
+
+def _repl_export(session_start: float, concept: str, last_stages: list[tuple[str, str, float]]) -> None:
+    """Export session log to ~/.paper2manim/exports/."""
+    import datetime
+    exports_dir = os.path.expanduser("~/.paper2manim/exports")
+    os.makedirs(exports_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_concept = re.sub(r"[^a-zA-Z0-9_-]", "_", concept or "session")[:40]
+    filename = f"{ts}_{safe_concept}.txt"
+    path = os.path.join(exports_dir, filename)
+
+    lines = [
+        f"paper2manim Session Export",
+        f"==========================",
+        f"Date   : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Concept: {concept or '(none)'}",
+        f"",
+    ]
+    if last_stages:
+        lines.append("Pipeline Stages")
+        lines.append("-" * 40)
+        for name, status, elapsed in last_stages:
+            lines.append(f"  {'OK' if status == 'ok' else 'ERR'}  {name:<20}  {_format_duration(elapsed)}")
+        lines.append(f"  Total: {_format_duration(sum(e for _, _, e in last_stages))}")
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    console.print(f"  [{SUCCESS}]✓[/{SUCCESS}]  Exported to {path}")
+
+
+def _repl_hooks() -> None:
+    """Show configured lifecycle hooks from ~/.paper2manim/settings.json."""
+    import json as _json
+    settings_path = os.path.expanduser("~/.paper2manim/settings.json")
+    if not os.path.isfile(settings_path):
+        console.print(f"  [{DIM}]No settings file found at {settings_path}.[/{DIM}]")
+        return
+    try:
+        with open(settings_path) as f:
+            settings = _json.load(f)
+        hooks = settings.get("hooks", {})
+        if not hooks:
+            console.print(f"  [{DIM}]No hooks configured.[/{DIM}]")
+            return
+        console.print()
+        console.print("  [bold]Configured Hooks[/bold]\n")
+        for event, handlers in hooks.items():
+            console.print(f"  [{ACCENT}]{event}[/{ACCENT}]")
+            for h in (handlers if isinstance(handlers, list) else [handlers]):
+                if isinstance(h, dict):
+                    if h.get("type") == "command":
+                        console.print(f"    [{DIM}]command:[/{DIM}] {h.get('command', '')}")
+                    elif h.get("type") == "http":
+                        console.print(f"    [{DIM}]http:[/{DIM}]    {h.get('url', '')}")
+        console.print()
+    except Exception as e:
+        console.print(f"  [{FAIL}]Error reading settings: {e}[/{FAIL}]")
+
+
+def _repl_permissions() -> None:
+    """Show permission rules from ~/.paper2manim/settings.json."""
+    import json as _json
+    settings_path = os.path.expanduser("~/.paper2manim/settings.json")
+    if not os.path.isfile(settings_path):
+        console.print(f"  [{DIM}]No settings file found.[/{DIM}]")
+        return
+    try:
+        with open(settings_path) as f:
+            settings = _json.load(f)
+        perms = settings.get("permissions", {})
+        mode = settings.get("defaultMode", "default")
+        console.print()
+        console.print(f"  [bold]Permission Mode[/bold]: [{ACCENT}]{mode}[/{ACCENT}]")
+        if perms:
+            console.print()
+            console.print("  [bold]Rules[/bold]")
+            for key, val in perms.items():
+                console.print(f"  [{DIM}]{key}:[/{DIM}] {val}")
+        console.print()
+    except Exception as e:
+        console.print(f"  [{FAIL}]Error reading settings: {e}[/{FAIL}]")
+
+
+def _repl_keybindings() -> None:
+    """Print keyboard shortcut reference."""
+    shortcuts = [
+        ("Global",      [
+            ("Ctrl+C",      "Cancel current generation"),
+            ("Ctrl+D",      "Exit"),
+            ("Ctrl+L",      "Clear screen"),
+            ("Ctrl+O",      "Toggle verbose mode"),
+            ("Shift+Tab",   "Cycle permission mode"),
+            ("Alt+T",       "Toggle thinking blocks"),
+            ("Alt+P",       "Cycle model (opus ↔ sonnet)"),
+            ("?",           "Show keybindings overlay"),
+        ]),
+        ("Text Input",  [
+            ("Ctrl+K",      "Delete to end of line"),
+            ("Ctrl+U",      "Clear line"),
+            ("Ctrl+A",      "Move to start of line"),
+            ("Ctrl+E",      "Move to end of line"),
+            ("Ctrl+W",      "Delete previous word"),
+            ("Ctrl+R",      "History search"),
+            ("Up/Down",     "Navigate command history"),
+            ("\\+Enter",    "Multiline input"),
+        ]),
+        ("Commands",    [
+            ("/",           "Open slash command menu"),
+            ("!",           "Run a shell command"),
+            ("@",           "Reference a file"),
+            ("Tab",         "Accept autocomplete"),
+            ("Esc",         "Dismiss overlay / cancel"),
+        ]),
+    ]
+    console.print()
+    console.print("  [bold]Keyboard Shortcuts[/bold]\n")
+    for group, items in shortcuts:
+        console.print(f"  [{ACCENT}]{group}[/{ACCENT}]")
+        table = Table(box=box.MINIMAL, show_header=False, padding=(0, 2))
+        table.add_column(style=ACCENT_B, min_width=16)
+        table.add_column(style=DIM)
+        for key, desc in items:
+            table.add_row(key, desc)
+        console.print(table)
+    console.print()
+
+
 def interactive_repl(args: argparse.Namespace) -> None:
     """Interactive command-line REPL with /command support."""
     console.print()
@@ -1202,6 +1532,9 @@ def interactive_repl(args: argparse.Namespace) -> None:
     console.print(f"  [{DIM}]Type a concept or /help for commands. Ctrl+C to quit.[/{DIM}]\n")
 
     last_stages: list[tuple[str, str, float]] = []
+    last_tool_call_counts: dict[str, int] = {}
+    session_start = time.monotonic()
+    last_concept = ""
 
     while True:
         try:
@@ -1211,35 +1544,271 @@ def interactive_repl(args: argparse.Namespace) -> None:
                 continue
 
             if raw.startswith("/"):
-                cmd = raw.lower().split()[0]
+                parts = raw.split(None, 1)
+                cmd = parts[0].lower()
+                cmd_args = parts[1] if len(parts) > 1 else ""
 
                 if cmd in ("/help", "/?"):
                     _repl_help()
-                elif cmd == "/settings":
+
+                elif cmd in ("/config", "/settings"):
                     _repl_settings(args)
+
+                elif cmd == "/model":
+                    if cmd_args:
+                        args.model = cmd_args.strip()
+                        console.print(f"  [{SUCCESS}]✓[/{SUCCESS}]  Model set to [bold]{args.model}[/bold]")
+                    else:
+                        current = getattr(args, "model", None) or MODEL_TAG
+                        console.print(f"  [{DIM}]Current model: {current}[/{DIM}]")
+                        console.print(f"  [{DIM}]Usage: /model <model-name>  (e.g. claude-sonnet-4-6)[/{DIM}]")
+
+                elif cmd == "/quality":
+                    valid = ("low", "medium", "high")
+                    if cmd_args and cmd_args.strip() in valid:
+                        args.quality = cmd_args.strip()
+                        console.print(f"  [{SUCCESS}]✓[/{SUCCESS}]  Quality set to [bold]{args.quality}[/bold]")
+                    else:
+                        console.print(f"  [{DIM}]Current quality: {getattr(args, 'quality', 'high')}[/{DIM}]")
+                        console.print(f"  [{DIM}]Usage: /quality low|medium|high[/{DIM}]")
+
+                elif cmd == "/theme":
+                    valid_themes = ("dark", "light", "minimal", "colorblind", "ansi")
+                    if cmd_args and cmd_args.strip() in valid_themes:
+                        args.theme = cmd_args.strip()
+                        _apply_theme(args.theme)
+                        console.print(f"  [{SUCCESS}]✓[/{SUCCESS}]  Theme set to [bold]{args.theme}[/bold]")
+                    else:
+                        console.print(f"  [{DIM}]Current theme: {getattr(args, 'theme', 'dark')}[/{DIM}]")
+                        console.print(f"  [{DIM}]Usage: /theme dark|light|minimal|colorblind|ansi[/{DIM}]")
+
+                elif cmd == "/verbose":
+                    args.verbose = not getattr(args, "verbose", False)
+                    state = "on" if args.verbose else "off"
+                    console.print(f"  [{SUCCESS}]✓[/{SUCCESS}]  Verbose mode [bold]{state}[/bold]")
+
+                elif cmd == "/vim":
+                    if not hasattr(args, "_vim_mode"):
+                        args._vim_mode = False
+                    args._vim_mode = not args._vim_mode
+                    state = "vim" if args._vim_mode else "normal"
+                    console.print(f"  [{SUCCESS}]✓[/{SUCCESS}]  Editor mode: [bold]{state}[/bold]")
+
+                elif cmd == "/color":
+                    valid_colors = ("red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan", "white")
+                    if cmd_args and cmd_args.strip() in valid_colors:
+                        args._prompt_color = cmd_args.strip()
+                        console.print(f"  [{SUCCESS}]✓[/{SUCCESS}]  Prompt color set to [bold]{args._prompt_color}[/bold]")
+                    else:
+                        console.print(f"  [{DIM}]Usage: /color red|blue|green|yellow|purple|orange|pink|cyan[/{DIM}]")
+
+                elif cmd == "/statusline":
+                    if cmd_args:
+                        args._statusline = cmd_args.strip()
+                        console.print(f"  [{SUCCESS}]✓[/{SUCCESS}]  Status line script: [bold]{args._statusline}[/bold]")
+                    else:
+                        sl = getattr(args, "_statusline", None)
+                        if sl:
+                            console.print(f"  [{DIM}]Current status line script: {sl}[/{DIM}]")
+                        else:
+                            console.print(f"  [{DIM}]No custom status line script set.[/{DIM}]")
+                            console.print(f"  [{DIM}]Usage: /statusline <path/to/script>[/{DIM}]")
+
+                elif cmd in ("/generate",):
+                    concept = cmd_args.strip() if cmd_args else ""
+                    if not concept:
+                        console.print(f"  [{WARN}]Usage: /generate <concept>[/{WARN}]")
+                    else:
+                        last_concept = concept
+                        last_stages = []
+                        run_pipeline_for_concept(concept, args, _out_stages=last_stages)
+                        console.print()
+
+                elif cmd == "/plan":
+                    concept = cmd_args.strip() if cmd_args else ""
+                    if not concept:
+                        console.print(f"  [{WARN}]Usage: /plan <concept>[/{WARN}]")
+                    else:
+                        console.print(f"  [{DIM}]Plan mode: showing plan only (no generation).[/{DIM}]\n")
+                        # Plan mode: just run the planner, skip execution
+                        from agents.planner import plan_segmented_storyboard as _plan
+                        quality = getattr(args, "quality", "high")
+                        model = getattr(args, "model", None)
+                        try:
+                            plan = _plan(concept, quality=quality, model=model)
+                            console.print(plan)
+                        except Exception as e:
+                            console.print(f"  [{FAIL}]Plan error: {e}[/{FAIL}]")
+
+                elif cmd in ("/resume", "/continue"):
+                    out_dir = cmd_args.strip() if cmd_args else ""
+                    if out_dir:
+                        project_state = load_project(out_dir)
+                        concept = project_state.get("concept", "") if project_state else ""
+                        if concept:
+                            last_concept = concept
+                            console.print(f"\n  [{SUCCESS}]✓[/{SUCCESS}]  Resuming: [bold]{concept}[/bold]")
+                            last_stages = []
+                            run_pipeline_for_concept(concept, args, output_dir=out_dir, _out_stages=last_stages)
+                        else:
+                            console.print(f"  [{WARN}]Could not find concept in {out_dir}[/{WARN}]")
+                    else:
+                        selected = manage_workspace()
+                        if selected:
+                            project_state = load_project(selected)
+                            concept = project_state.get("concept", "") if project_state else ""
+                            if concept:
+                                last_concept = concept
+                                console.print(f"\n  [{SUCCESS}]✓[/{SUCCESS}]  Resuming: [bold]{concept}[/bold]")
+                                last_stages = []
+                                run_pipeline_for_concept(concept, args, output_dir=selected, _out_stages=last_stages)
+
                 elif cmd == "/workspace":
                     selected = manage_workspace()
                     if selected:
                         project_state = load_project(selected)
                         concept = project_state.get("concept", "") if project_state else ""
                         if concept:
+                            last_concept = concept
                             console.print(f"\n  [{SUCCESS}]✓[/{SUCCESS}]  Resuming: [bold]{concept}[/bold]")
                             last_stages = []
                             run_pipeline_for_concept(concept, args, output_dir=selected, _out_stages=last_stages)
+
+                elif cmd == "/list":
+                    projects = list_all_projects()
+                    if not projects:
+                        console.print(f"  [{DIM}]No projects found.[/{DIM}]")
+                    else:
+                        table = Table(box=box.MINIMAL, show_header=True, padding=(0, 2))
+                        table.add_column("Directory", style=ACCENT_B)
+                        table.add_column("Concept", style=DIM)
+                        table.add_column("Progress", style=SUCCESS)
+                        for p in projects:
+                            state = load_project(p) or {}
+                            concept_name = state.get("concept", "—")
+                            progress = f"{calculate_progress(p):.0f}%"
+                            table.add_row(os.path.basename(p), concept_name, progress)
+                        console.print()
+                        console.print(table)
+                        console.print()
+
+                elif cmd == "/delete":
+                    target = cmd_args.strip()
+                    if not target:
+                        console.print(f"  [{WARN}]Usage: /delete <dir>[/{WARN}]")
+                    elif Confirm.ask(f"  [{WARN}]Delete project '{target}'?[/{WARN}]"):
+                        try:
+                            delete_project(target)
+                            console.print(f"  [{SUCCESS}]✓[/{SUCCESS}]  Deleted {target}")
+                        except Exception as e:
+                            console.print(f"  [{FAIL}]Error: {e}[/{FAIL}]")
+
+                elif cmd == "/clean":
+                    placeholders = list_placeholder_projects()
+                    if not placeholders:
+                        console.print(f"  [{SUCCESS}]✓[/{SUCCESS}]  No stale placeholders found.")
+                    else:
+                        console.print(f"  [{WARN}]Found {len(placeholders)} placeholder project(s).[/{WARN}]")
+                        for p in placeholders:
+                            console.print(f"  [{DIM}]  {p}[/{DIM}]")
+                        if Confirm.ask("  Remove them?"):
+                            cleanup_placeholder_projects()
+                            console.print(f"  [{SUCCESS}]✓[/{SUCCESS}]  Cleaned up {len(placeholders)} project(s).")
+
                 elif cmd == "/status":
                     if last_stages:
                         print_pipeline_summary(last_stages)
                     else:
                         console.print(f"  [{WARN}]No pipeline has run yet in this session.[/{WARN}]")
-                elif cmd == "/clear":
+
+                elif cmd == "/diff":
+                    os.system("git diff -- output/")
+
+                elif cmd == "/compact":
+                    # Summarise: just print a compact summary of last stages
+                    if not last_stages:
+                        console.print(f"  [{DIM}]Nothing to compact — no pipeline run yet.[/{DIM}]")
+                    else:
+                        total = sum(e for _, _, e in last_stages)
+                        ok = sum(1 for _, s, _ in last_stages if s == "ok")
+                        fail = len(last_stages) - ok
+                        msg = cmd_args.strip() or "Pipeline complete"
+                        console.print(f"  [{DIM}][Compact] {msg} — {ok} stages OK"
+                                      + (f", {fail} failed" if fail else "")
+                                      + f" — {_format_duration(total)} total[/{DIM}]")
+
+                elif cmd == "/context":
+                    _repl_context(last_tool_call_counts)
+
+                elif cmd == "/cost":
+                    # Show approximate token usage info
+                    total_calls = sum(last_tool_call_counts.values()) if last_tool_call_counts else 0
+                    est_tokens = total_calls * 800
+                    console.print(f"  [{DIM}]~{est_tokens:,} tokens used (~{total_calls} tool calls × 800 avg)[/{DIM}]")
+
+                elif cmd == "/insights":
+                    _repl_insights(last_stages, last_tool_call_counts)
+
+                elif cmd == "/export":
+                    _repl_export(session_start, last_concept, last_stages)
+
+                elif cmd == "/btw":
+                    if not cmd_args.strip():
+                        console.print(f"  [{WARN}]Usage: /btw <question>[/{WARN}]")
+                    else:
+                        console.print(f"  [{DIM}](btw questions use context but aren't saved to history)[/{DIM}]")
+                        console.print(f"  [{ACCENT}]Question:[/{ACCENT}] {cmd_args.strip()}")
+                        console.print(f"  [{DIM}]Side-channel answers require the TypeScript CLI with an active session.[/{DIM}]")
+
+                elif cmd == "/doctor":
+                    _repl_doctor()
+
+                elif cmd == "/hooks":
+                    _repl_hooks()
+
+                elif cmd in ("/permissions", "/allowed-tools"):
+                    _repl_permissions()
+
+                elif cmd == "/keybindings":
+                    _repl_keybindings()
+
+                elif cmd == "/memory":
+                    _repl_memory()
+
+                elif cmd == "/init":
+                    _repl_init()
+
+                elif cmd in ("/release-notes", "/changelog"):
+                    changelog = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CHANGELOG.md")
+                    if os.path.isfile(changelog):
+                        with open(changelog) as f:
+                            console.print(f.read())
+                    else:
+                        console.print(f"  [{DIM}]No CHANGELOG.md found.[/{DIM}]")
+
+                elif cmd in ("/feedback", "/bug"):
+                    url = "https://github.com/anthropics/paper2manim/issues"
+                    console.print(f"  [{ACCENT}]Opening:[/{ACCENT}] {url}")
+                    if sys.platform == "darwin":
+                        os.system(f"open '{url}'")
+                    elif os.name == "nt":
+                        os.system(f'start "" "{url}"')
+                    else:
+                        os.system(f"xdg-open '{url}'")
+
+                elif cmd in ("/clear", "/reset", "/new"):
                     console.clear()
+                    _print_banner(getattr(args, "quality", "high"), getattr(args, "model", None))
+
                 elif cmd in ("/quit", "/exit", "/q"):
                     break
+
                 else:
                     console.print(f"  [{WARN}]Unknown command: {cmd}. Type /help for commands.[/{WARN}]")
                 continue
 
             concept = raw
+            last_concept = concept
             if not os.getenv("GEMINI_API_KEY"):
                 console.print()
                 _print_error(

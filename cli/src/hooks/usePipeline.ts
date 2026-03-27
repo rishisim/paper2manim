@@ -5,12 +5,13 @@
 import { useState, useCallback, useRef } from 'react';
 import type { ChildProcess } from 'node:child_process';
 import { spawnRunner } from '../lib/process.js';
-import type { PipelineUpdate, PipelineArgs, QuestionDef } from '../lib/types.js';
+import type { PipelineUpdate, PipelineArgs, QuestionDef, ToolCallEntry } from '../lib/types.js';
 
 export type PipelineStatus = 'idle' | 'questionnaire' | 'running' | 'complete' | 'error';
 
 interface UsePipelineOptions {
   verbose?: boolean;
+  onTokenUsage?: (delta: { input: number; output: number; cacheRead: number }) => void;
 }
 
 interface UsePipelineReturn {
@@ -19,8 +20,12 @@ interface UsePipelineReturn {
   questions: QuestionDef[];
   errorMessage: string;
   finalUpdate: PipelineUpdate | null;
+  toolCalls: ToolCallEntry[];
+  thinkingText: string;
+  permissionPending: { operation: string; path?: string } | null;
   start: (args: PipelineArgs) => void;
   answerQuestions: (answers: Record<string, string>) => void;
+  answerPermission: (allow: boolean, always?: boolean) => void;
   kill: () => void;
 }
 
@@ -31,8 +36,15 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
   const [questions, setQuestions] = useState<QuestionDef[]>([]);
   const [errorMessage, setErrorMessage] = useState('');
   const [finalUpdate, setFinalUpdate] = useState<PipelineUpdate | null>(null);
+  const [toolCalls, setToolCalls] = useState<ToolCallEntry[]>([]);
+  const [thinkingText, setThinkingText] = useState('');
+  const [permissionPending, setPermissionPending] = useState<{ operation: string; path?: string } | null>(null);
   const procRef = useRef<ChildProcess | null>(null);
   const bufferRef = useRef('');
+  const toolCallIdCounter = useRef(0);
+
+  // Context-injected callback for token usage (set by parent via ref)
+  const onTokenUsage = opts?.onTokenUsage;
 
   const handleLine = useCallback((line: string) => {
     try {
@@ -58,11 +70,33 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
       } else if (msg.type === 'error') {
         setErrorMessage(msg.message);
         setStatus('error');
+      } else if (msg.type === 'token_usage') {
+        // Phase 5: accumulate token usage
+        if (onTokenUsage) {
+          onTokenUsage({ input: msg.input ?? 0, output: msg.output ?? 0, cacheRead: msg.cache_read ?? 0 });
+        }
+      } else if (msg.type === 'thinking') {
+        // Phase 5: update thinking text
+        setThinkingText(msg.text ?? '');
+      } else if (msg.type === 'tool_call') {
+        // Phase 5: add tool call entry
+        const entry: ToolCallEntry = {
+          id: `tc-${toolCallIdCounter.current++}`,
+          name: msg.name ?? 'unknown',
+          params: msg.params ?? {},
+          output: msg.output,
+          collapsed: true,
+        };
+        setToolCalls(prev => [...prev, entry]);
+      } else if (msg.type === 'permission_request') {
+        // Phase 6: permission prompt
+        setPermissionPending({ operation: msg.operation ?? 'write', path: msg.path });
       }
+      // Unknown types are silently ignored (backward compatible)
     } catch {
       // Non-JSON line — ignore (Python debug output, etc.)
     }
-  }, []);
+  }, [onTokenUsage]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const processChunk = useCallback((chunk: Buffer) => {
     bufferRef.current += chunk.toString();
@@ -80,6 +114,9 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
     setQuestions([]);
     setErrorMessage('');
     setFinalUpdate(null);
+    setToolCalls([]);
+    setThinkingText('');
+    setPermissionPending(null);
     bufferRef.current = '';
 
     const proc = spawnRunner(JSON.stringify(args));
@@ -126,6 +163,15 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
     setStatus('running');
   }, []);
 
+  /** Respond to a permission_request from Python. */
+  const answerPermission = useCallback((allow: boolean, always = false) => {
+    const proc = procRef.current;
+    setPermissionPending(null);
+    if (!proc?.stdin?.writable) return;
+    const msg = JSON.stringify({ type: 'permission_response', allow, always });
+    proc.stdin.write(msg + '\n');
+  }, []);
+
   /** Kill the pipeline subprocess if it's still running. */
   const kill = useCallback(() => {
     const proc = procRef.current;
@@ -134,5 +180,5 @@ export function usePipeline(opts?: UsePipelineOptions): UsePipelineReturn {
     }
   }, []);
 
-  return { status, updates, questions, errorMessage, finalUpdate, start, answerQuestions, kill };
+  return { status, updates, questions, errorMessage, finalUpdate, toolCalls, thinkingText, permissionPending, start, answerQuestions, answerPermission, kill };
 }

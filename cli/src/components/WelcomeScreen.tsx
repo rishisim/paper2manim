@@ -2,9 +2,11 @@ import React, { useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { colors, VERSION, MODEL_TAG, BRAND_ICON, TIPS, truncatePath } from '../lib/theme.js';
 import { ConceptInput } from './ConceptInput.js';
+import { PromptBar } from './PromptBar.js';
 import { useRecentProjects } from '../hooks/useRecentProjects.js';
 import { useTerminalWidth } from '../hooks/useTerminalWidth.js';
-import type { Project } from '../lib/types.js';
+import { useAppContext } from '../context/AppContext.js';
+import type { Project, AppDispatch } from '../lib/types.js';
 
 // Pick tip once at module load (not on every render)
 const tip = TIPS[Math.floor(Math.random() * TIPS.length)]!;
@@ -20,9 +22,11 @@ type FocusMode = 'input' | 'projects';
 interface WelcomeScreenProps {
   onSubmit: (concept: string) => void;
   onResumeProject: (project: Project) => void;
+  dispatch?: AppDispatch;
 }
 
-export function WelcomeScreen({ onSubmit, onResumeProject }: WelcomeScreenProps) {
+export function WelcomeScreen({ onSubmit, onResumeProject, dispatch }: WelcomeScreenProps) {
+  const { themeColors } = useAppContext();
   const { projects, loading } = useRecentProjects();
   const [focusMode, setFocusMode] = useState<FocusMode>('input');
   const [selectedIdx, setSelectedIdx] = useState(0);
@@ -155,10 +159,21 @@ export function WelcomeScreen({ onSubmit, onResumeProject }: WelcomeScreenProps)
 
       {/* ── Input below the box ── */}
       <Box flexDirection="column" paddingX={1}>
-        <ConceptInput onSubmit={onSubmit} isDisabled={focusMode === 'projects'} clearKey={clearKey} />
-        <Box marginTop={1}>
-          <Text color={colors.dim}>{hintText}</Text>
-        </Box>
+        {dispatch ? (
+          <PromptBar
+            onSubmit={onSubmit}
+            dispatch={dispatch}
+            isDisabled={focusMode === 'projects'}
+            placeholder="Type a concept, /help for commands…"
+          />
+        ) : (
+          <ConceptInput onSubmit={onSubmit} isDisabled={focusMode === 'projects'} clearKey={clearKey} />
+        )}
+        {focusMode === 'projects' && (
+          <Box marginTop={1}>
+            <Text color={themeColors.dim}>{hintText}</Text>
+          </Box>
+        )}
       </Box>
     </Box>
   );
