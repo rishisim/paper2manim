@@ -1,2 +1,2 @@
 [console_scripts]
-paper2manim = cli:main
+paper2manim = cli_launcher:main

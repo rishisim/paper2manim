@@ -21,9 +21,11 @@ def _parse_sample_rate(mime_type: Optional[str]) -> int:
     match = re.search(r"rate=(\d+)", mime_type)
     return int(match.group(1)) if match else 24000
 
-def _run_ffmpeg(cmd: list[str]) -> Tuple[bool, str]:
+def _run_ffmpeg(cmd: list[str], timeout: int = 60) -> Tuple[bool, str]:
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"ffmpeg timed out after {timeout}s"
     except Exception as exc:
         return False, str(exc)
     if result.returncode == 0:
@@ -39,7 +41,7 @@ def _is_valid_audio_file(path: str) -> bool:
         path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except Exception:
         return False
     return result.returncode == 0 and "codec_type=audio" in result.stdout
@@ -116,7 +118,7 @@ def _get_audio_duration(path: str) -> Optional[float]:
         path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
             return float(result.stdout.strip())
     except Exception:

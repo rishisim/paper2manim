@@ -23,8 +23,8 @@ dependencies = [
 ]
 
 [project.scripts]
-paper2manim = "cli:main"
+paper2manim = "cli_launcher:main"
 
 [tool.setuptools]
 packages = ["agents", "utils"]
-py-modules = ["cli", "workspace"]
+py-modules = ["cli_fallback", "cli_launcher", "pipeline_runner"]

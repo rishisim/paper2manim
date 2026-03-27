@@ -1,4 +1,6 @@
 agents
 cli
+cli_launcher
+pipeline_runner
 utils
 workspace

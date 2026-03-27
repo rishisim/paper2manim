@@ -1,5 +1,7 @@
 README.md
 cli.py
+cli_launcher.py
+pipeline_runner.py
 pyproject.toml
 workspace.py
 agents/coder.py

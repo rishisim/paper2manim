@@ -22,7 +22,7 @@ from utils.manim_docs import (
 )
 from utils.golden_scenes import fetch_golden_scenes
 from utils.web_search import search_web
-from utils.manim_runner import run_manim_code, extract_class_name
+from utils.manim_runner import run_manim_code, dry_run_manim_code, extract_class_name, validate_manim_code
 
 import logging
 _log = logging.getLogger(__name__)
@@ -33,12 +33,12 @@ _log = logging.getLogger(__name__)
 MODEL_PRO = "claude-opus-4-6"              # complex segments
 MODEL_FAST = "claude-sonnet-4-6"           # simple segments (fast)
 
-MAX_TOOL_CALLS_COMPLEX = 1
+MAX_TOOL_CALLS_COMPLEX = 2
 MAX_TOOL_CALLS_SIMPLE = 0
 
 # During self-correction, allow more tool calls so the model can look up docs/examples
 MAX_TOOL_CALLS_FIX_COMPLEX = 3
-MAX_TOOL_CALLS_FIX_SIMPLE = 1
+MAX_TOOL_CALLS_FIX_SIMPLE = 2
 
 # ── helpers ───────────────────────────────────────────────────────────
 
@@ -170,12 +170,41 @@ Here is the Manim documentation topic index:
 - Layout: Use `.to_edge()`, `.to_corner()`, `.next_to()`, `.shift()` for positioning. NEVER hardcode pixel coordinates.
 - Clean up: `FadeOut()` elements that are no longer needed before introducing new ones. Avoid cluttered scenes.
 
+== SCREEN ZONE MAP (MANDATORY — prevents overlapping elements) ==
+Divide every scene into three exclusive vertical zones:
+  HEADER  [top]:    Titles and section headings.  → `.to_edge(UP, buff=0.5)`
+  MAIN  [center]:   Graphs, diagrams, geometry, primary equations. → `.move_to(ORIGIN)` or near it
+  FOOTER  [bottom]: Secondary equations, running formula, key label. → `.to_edge(DOWN, buff=0.5)`
+
+HARD RULES — violating these WILL produce overlapping elements:
+1. NEVER place two independent objects in the same zone simultaneously.
+   If they belong to one conceptual group, wrap them first:
+   `group = VGroup(a, b).arrange(DOWN, buff=0.35).move_to(ORIGIN)`
+2. Before placing ANY new element into a zone that is already occupied,
+   FadeOut everything currently in that zone:
+   `self.play(FadeOut(old_title), run_time=0.4)` — THEN introduce the new element.
+3. At every conceptual transition (new equation set, new diagram, new topic),
+   run a FadeOut pass on the outgoing elements BEFORE animating the incoming ones.
+   Never pile new objects on top of existing ones.
+4. Labels on graphs or arrows: ALWAYS `.next_to(target, direction, buff=0.2)`.
+   NEVER `.move_to(ORIGIN)` for a label — it collides with the main content.
+5. Multiple stacked equations: `VGroup(eq1, eq2, eq3).arrange(DOWN, buff=0.4).move_to(ORIGIN)`.
+   Never manually `.shift(UP * N)` each one — miscalculated shifts cause overlaps.
+
 == LATEX BEST PRACTICES ==
 - Always use raw strings for MathTex: `MathTex(r"\\frac{{a}}{{b}}")`
 - Use double backslashes in ALL LaTeX commands: `\\frac`, `\\int`, `\\sum`, `\\vec`, etc.
 - Split equations into substrings for TransformMatchingTex: `MathTex("a^2", "+", "b^2", "=", "c^2")`
 - If you get `FileNotFoundError` mentioning `tex_to_svg_file`, this means YOUR LaTeX string has a syntax error. Fix the LaTeX, do not search for files.
 - Avoid `\\mathrm` — use `\\text` instead if needed.
+
+== COMMON PITFALLS ==
+- Do NOT import external packages (scipy, PIL, sympy). Only `from manim import *`, `import numpy as np`, and stdlib.
+- For 3D scenes, inherit from `ThreeDScene`, not `Scene`.
+- `axes.get_graph_label(...)` first arg must be a plot object from `axes.plot(...)`.
+- `SurroundingRectangle` takes a Mobject, not coordinates.
+- Use `buff=` not `buffer=` for spacing arguments.
+- Avoid `always_redraw` with expensive computations (>50 points per frame). Use fixed graph + ValueTracker.
 
 == TIMING & PACING ==
 - Match animation timing to audio duration when provided.
@@ -300,7 +329,7 @@ def _send_and_extract(
     while True:
         kwargs: dict = {
             "model": model,
-            "max_tokens": 16384,
+            "max_tokens": 8192,
             "temperature": 0.2,
             "system": system,
             "messages": messages,
@@ -364,6 +393,7 @@ def generate_manim_script(
     tool_call_counts: dict[str, int] | None = None,
     theme_name: str = "",
     color_palette: dict[str, str] | None = None,
+    few_shot_example: str = "",
 ) -> Iterator[str]:
     """Yield the final generated code (single yield after tool calls resolve)."""
     model = _get_model_for_complexity(complexity)
@@ -412,13 +442,16 @@ def generate_manim_script(
             f"### DETAILED VISUAL & ANIMATION FLOW (follow this beat-by-beat)\n"
             f"{seg.get('visual_instructions', '')}\n\n"
             f"### Required Animations:\n{animations_str}\n\n"
-            f"### CRITICAL REQUIREMENTS\n"
+            f"### CRITICAL REQUIREMENTS — FOLLOW THE SPEC EXACTLY\n"
             f"- Set background: self.camera.background_color = \"{(color_palette or {}).get('Background', '#141414')}\"\n"
             f"- Every self.play() MUST have run_time parameter\n"
             f"- Add self.wait() after every animation beat\n"
-            f"- Use the exact hex colors from the palette above\n"
-            f"- Follow the visual flow instructions PRECISELY — they are a beat-by-beat screenplay\n"
-            f"- FadeOut elements that are no longer needed before introducing new ones\n\n"
+            f"- You MUST use the EXACT hex colors listed in Element Color Mapping above — do NOT substitute or improvise colors\n"
+            f"- You MUST use the EXACT LaTeX strings from equations_latex above — copy them verbatim\n"
+            f"- You MUST implement EVERY animation listed in Required Animations — do not skip any\n"
+            f"- Follow the visual flow instructions PRECISELY — they are a beat-by-beat screenplay, not suggestions\n"
+            f"- FadeOut elements that are no longer needed before introducing new ones\n"
+            f"- Do NOT improvise or add elements not in the spec — faithfully implement what was planned\n\n"
         )
 
     if audio_script and audio_duration > 0:
@@ -432,6 +465,12 @@ def generate_manim_script(
             "You MUST time your animations (using `run_time` and `self.wait()`) so that the total scene duration perfectly matches or slightly exceeds the audio duration. "
             "Pace the visuals rhythmically to match the spoken sentences. DO NOT rush through the animations.\n"
             f"{duration_hint}"
+        )
+
+    if few_shot_example:
+        prompt += (
+            "\n\n### REFERENCE — Working Manim script from a sibling segment (use as style/import reference, NOT content):\n"
+            f"```python\n{few_shot_example[:6000]}\n```\n"
         )
 
     yield "looking up docs"  # signal to caller
@@ -449,8 +488,43 @@ def generate_manim_script(
             tool_call_counts=tool_call_counts,
         )
 
+    # Lightweight spec compliance check for Pro segments
+    if code and isinstance(instructions, dict):
+        missing = []
+        element_colors = instructions.get("element_colors", {})
+        for color_hex in element_colors.values():
+            if color_hex and color_hex.upper() not in code.upper():
+                missing.append(f"color {color_hex}")
+        equations = instructions.get("equations_latex", [])
+        for eq in equations[:3]:  # spot-check first 3
+            # Check for key parts of the equation (strip backslashes for fuzzy match)
+            eq_core = eq.replace("\\\\", "\\").replace("\\", "")
+            if len(eq_core) > 3 and eq_core not in code.replace("\\", ""):
+                missing.append(f"equation fragment '{eq[:30]}...'")
+        if missing:
+            _log.warning("Spec compliance gaps: %s", ", ".join(missing[:5]))
+            yield "spec_gaps:" + ", ".join(missing[:5])
+
     if code:
         yield code
+
+
+def _repair_hint(attempt: int) -> str:
+    """Return an escalating repair strategy hint based on how many attempts have failed."""
+    if attempt <= 0:
+        return ""
+    if attempt == 1:
+        return (
+            "\n\nStrategy: A previous fix attempt failed with the same error. "
+            "Try a SIGNIFICANTLY SIMPLER implementation — reduce the number of animations, "
+            "use fewer on-screen objects, and skip complex transforms or updaters."
+        )
+    return (
+        "\n\nStrategy: Multiple fix attempts have failed. "
+        "REWRITE FROM SCRATCH with the absolute minimum code to display the key concept. "
+        "Use only Text, MathTex, and basic Create/Write/FadeIn animations. "
+        "No ValueTrackers, no always_redraw, no 3D, no complex transforms."
+    )
 
 
 def fix_manim_script(
@@ -459,8 +533,14 @@ def fix_manim_script(
     complexity: str = "complex",
     tool_call_counts: dict[str, int] | None = None,
     original_instructions: str = "",
+    repair_attempt: int = 0,
 ) -> Iterator[str]:
-    """Yield the corrected code after consulting docs."""
+    """Yield the corrected code after consulting docs.
+
+    Args:
+        repair_attempt: How many prior fix attempts have already failed (0 = first fix).
+            Controls the escalating repair strategy hint appended to the prompt.
+    """
     model = _get_model_for_complexity(complexity)
     max_tool_calls = MAX_TOOL_CALLS_FIX_SIMPLE if complexity == "simple" else MAX_TOOL_CALLS_FIX_COMPLEX
     client = anthropic.Anthropic()
@@ -489,10 +569,22 @@ def fix_manim_script(
             "Simplify geometry, reduce always_redraw complexity, shorten run_time values, "
             "and eliminate unnecessary updaters."
         )
+    elif "attributeerror" in error_lower or "nameerror" in error_lower:
+        error_hints = (
+            "\n\nERROR TYPE: API misuse — a method or class name does not exist in Manim. "
+            "Use the fetch_manim_docs tool to look up the correct API."
+        )
+    elif "typeerror" in error_lower:
+        error_hints = (
+            "\n\nERROR TYPE: Wrong arguments to a Manim method. "
+            "Check the function signature using the fetch_manim_docs tool."
+        )
 
     context_section = ""
     if original_instructions:
         context_section = f"\n\nOriginal visual instructions (for context):\n{original_instructions}\n"
+
+    strategy_section = _repair_hint(repair_attempt)
 
     prompt = (
         "The following Manim script failed. Fix the code and return the COMPLETE corrected Python file. "
@@ -501,6 +593,7 @@ def fix_manim_script(
         f"Error:\n{compact}{error_hints}\n\n"
         f"Current code:\n{code}"
         f"{context_section}"
+        f"{strategy_section}"
     )
 
     yield "looking up docs"
@@ -527,6 +620,7 @@ def run_coder_agent(
     theme_name: str = "",
     color_palette: dict[str, str] | None = None,
     segment_id: int | None = None,
+    few_shot_example: str = "",
 ):
     """Generate a Manim script, execute it, self-correct up to *max_retries*.
 
@@ -552,15 +646,20 @@ def run_coder_agent(
         "status": f"{_seg}Generating Manim script [{complexity}] via {model_label}...",
         "phase": "generate",
     }
+    spec_gaps = ""
     for chunk in generate_manim_script(
         instructions, audio_script, audio_duration,
         complexity=complexity, scene_class_name=scene_class_name,
         tool_call_counts=tool_call_counts,
         theme_name=theme_name,
         color_palette=color_palette,
+        few_shot_example=few_shot_example,
     ):
         if chunk == "looking up docs":
             yield {"status": f"{_seg}Generating with Claude...", "phase": "docs"}
+            continue
+        if chunk.startswith("spec_gaps:"):
+            spec_gaps = chunk[len("spec_gaps:"):]
             continue
         code = chunk
         yield {"status": f"{_seg}Generating initial Manim script...", "code": code, "phase": "generate"}
@@ -581,20 +680,73 @@ def run_coder_agent(
     elif isinstance(instructions, str):
         original_instructions = instructions
 
+    latex_warnings = ""  # accumulated LaTeX warnings from validation
+
     for attempt in range(max_retries + 1):
         class_name = extract_class_name(code)
+
+        # Pre-execution validation — catch syntax/import/Scene errors instantly
+        validation = validate_manim_code(code)
+        if validation["warnings"]:
+            latex_warnings = "\n".join(validation["warnings"])
+        if validation["errors"]:
+            error_msg = "Pre-execution validation failed:\n" + "\n".join(validation["errors"])
+            _log.debug("%s%s", _seg, error_msg)
+            if attempt < max_retries:
+                yield {
+                    "status": f"{_seg}Validation failed — skipping render, self-correcting (attempt {attempt + 1}/{max_retries})...",
+                    "error": error_msg,
+                    "phase": "self_correct",
+                }
+                updated_code = ""
+                for chunk in fix_manim_script(
+                    code, error_msg,
+                    complexity=complexity,
+                    tool_call_counts=tool_call_counts,
+                    original_instructions=original_instructions,
+                    repair_attempt=attempt,
+                ):
+                    if chunk == "looking up docs":
+                        yield {"status": f"{_seg}Looking up docs for fix (attempt {attempt + 1}/{max_retries})...", "phase": "fix_docs"}
+                        continue
+                    updated_code = chunk
+                    yield {
+                        "status": f"{_seg}Applying fix (attempt {attempt + 1}/{max_retries})...",
+                        "code": updated_code,
+                        "phase": "apply_fix",
+                    }
+                if not updated_code:
+                    yield _attach_tool_usage({
+                        "status": f"{_seg}Failed to receive corrected code from model.",
+                        "error": "Empty model response while self-correcting.",
+                        "phase": "failed",
+                        "final": True,
+                    })
+                    return
+                code = updated_code
+                continue
+            else:
+                yield _attach_tool_usage({
+                    "status": f"{_seg}Failed validation after {max_retries + 1} attempts.",
+                    "error": error_msg,
+                    "phase": "failed",
+                    "final": True,
+                })
+                return
+
         yield {
-            "status": f"{_seg}Attempt {attempt + 1}/{max_retries + 1}: Executing code (Fast render -ql)...",
+            "status": f"{_seg}Attempt {attempt + 1}/{max_retries + 1}: Dry-run validation...",
             "code": code,
             "phase": "execute",
         }
 
-        result = run_manim_code(code, class_name, quality_flag="-ql", timeout_seconds=0, output_dir=output_dir)
+        result = dry_run_manim_code(code, class_name)
 
         if result["success"]:
             yield _attach_tool_usage({
-                "status": f"{_seg}Success! Low-res preview generated (-ql).",
-                "video_path": result["video_path"],
+                "status": f"{_seg}Validation passed. Code ready for HD render.",
+                "video_path": None,
+                "code_validated": True,
                 "code": code,
                 "phase": "done",
                 "final": True,
@@ -605,21 +757,28 @@ def run_coder_agent(
             corrective_hint = ""
             if result.get("error_type") == "timeout":
                 corrective_hint = (
-                    " Render timed out because geometry/updaters were too computationally expensive. "
-                    "Simplify geometry, reduce dynamic redraw complexity, and shorten long run_time blocks."
+                    " Dry-run timed out — scene has extremely expensive object construction. "
+                    "Simplify geometry, reduce always_redraw complexity, and shorten long run_time blocks."
                 )
+            # Append any LaTeX warnings from validation to give more context
+            error_context = f"{result['error']}{corrective_hint}"
+            if latex_warnings:
+                error_context += f"\n\nAdditionally, pre-validation warned: {latex_warnings}"
+            if spec_gaps:
+                error_context += f"\n\nSpec compliance gaps detected: {spec_gaps}"
             yield {
                 "status": f"{_seg}Execution failed. Self-correcting (attempt {attempt + 1}/{max_retries})...{corrective_hint}",
-                "error": f"{result['error']}{corrective_hint}",
+                "error": error_context,
                 "phase": "self_correct",
             }
             updated_code = ""
             for chunk in fix_manim_script(
                 code,
-                f"{result['error']}{corrective_hint}",
+                error_context,
                 complexity=complexity,
                 tool_call_counts=tool_call_counts,
                 original_instructions=original_instructions,
+                repair_attempt=attempt,
             ):
                 if chunk == "looking up docs":
                     yield {"status": f"{_seg}Looking up docs for fix (attempt {attempt + 1}/{max_retries})...", "phase": "fix_docs"}
@@ -665,6 +824,7 @@ async def run_coder_agent_async(
     color_palette: dict[str, str] | None = None,
     segment_id: int | None = None,
     on_update=None,
+    few_shot_example: str = "",
 ) -> dict:
     """Async wrapper around ``run_coder_agent``.
 
@@ -688,6 +848,7 @@ async def run_coder_agent_async(
             theme_name=theme_name,
             color_palette=color_palette,
             segment_id=segment_id,
+            few_shot_example=few_shot_example,
         ):
             if on_update:
                 try:

@@ -44,7 +44,7 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
 
     yield {"status": "Executing ffmpeg command to stitch audio tracks..."}
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode == 0:
             yield {
                 "final": True,
@@ -124,12 +124,11 @@ def concatenate_segments(
                     "-i", vp,
                     "-c:v", "libx264", "-preset", "fast",
                     "-c:a", "aac",
-                    "-r", "30",
                     "-pix_fmt", "yuv420p",
                     "-movflags", "+faststart",
                     norm_path,
                 ]
-                res = subprocess.run(norm_cmd, capture_output=True, text=True)
+                res = subprocess.run(norm_cmd, capture_output=True, text=True, timeout=180)
                 if res.returncode != 0:
                     return (i, norm_path, res.stderr)
                 return (i, norm_path, None)
@@ -152,10 +151,12 @@ def concatenate_segments(
                     yield {"status": f"Normalized segment {i + 1}/{len(segment_video_paths)}"}
 
             # Build the ffmpeg concat list file
+            # Escape single quotes so paths like "O'Reilly" don't break ffmpeg concat.
             list_path = os.path.join(temp_dir, "concat_list.txt")
             with open(list_path, "w") as f:
                 for p in normalized_paths:
-                    f.write(f"file '{p}'\n")
+                    escaped = p.replace("'", "'\\''")
+                    f.write(f"file '{escaped}'\n")
 
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
@@ -170,7 +171,7 @@ def concatenate_segments(
             ]
 
             yield {"status": "Running ffmpeg concat..."}
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
             if result.returncode == 0:
                 yield {
