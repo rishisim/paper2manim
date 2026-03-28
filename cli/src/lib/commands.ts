@@ -7,9 +7,9 @@ import { execSync, execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import type { SlashCommand, AppDispatch, ThemeName } from './types.js';
+import type { SlashCommand, AppDispatch, ThemeName, CommandCategory } from './types.js';
 import { PROMPT_COLORS } from './theme.js';
-import { saveSettings } from './settings.js';
+import { loadSettings, saveSettings } from './settings.js';
 import { listSessions } from './session.js';
 
 const PAPER2MANIM_MD_TEMPLATE = `# PAPER2MANIM.md
@@ -38,6 +38,7 @@ export const COMMANDS: SlashCommand[] = [
     aliases: [],
     description: 'Generate a new educational video',
     args: '<concept>',
+    category: 'generation' as CommandCategory,
     handler: (args, dispatch) => {
       const concept = args.join(' ').trim();
       if (!concept) {
@@ -52,10 +53,12 @@ export const COMMANDS: SlashCommand[] = [
     aliases: ['continue'],
     description: 'Resume an interrupted project',
     args: '[dir]',
+    category: 'generation' as CommandCategory,
     handler: (args, dispatch) => {
       const dir = args[0];
       if (!dir) {
-        dispatch.showMessage('Usage: /resume <output-dir>', undefined);
+        // No dir given — open workspace so user can pick a project
+        dispatch.setScreen('workspace');
         return;
       }
       dispatch.resumePipeline(dir);
@@ -66,6 +69,7 @@ export const COMMANDS: SlashCommand[] = [
     aliases: [],
     description: 'Enter plan-only mode (storyboard without generating)',
     args: '[concept]',
+    category: 'generation' as CommandCategory,
     handler: (args, dispatch) => {
       dispatch.setPermissionMode('plan');
       const concept = args.join(' ').trim();
@@ -76,9 +80,19 @@ export const COMMANDS: SlashCommand[] = [
 
   // ── Workspace ─────────────────────────────────────────────────
   {
+    name: 'workspace',
+    aliases: ['ws'],
+    description: 'Open workspace / project dashboard',
+    category: 'workspace' as CommandCategory,
+    handler: (_args, dispatch) => {
+      dispatch.setScreen('workspace');
+    },
+  },
+  {
     name: 'list',
     aliases: ['ls'],
     description: 'List saved projects',
+    category: 'workspace' as CommandCategory,
     handler: (_args, dispatch) => {
       dispatch.setScreen('workspace');
     },
@@ -88,6 +102,7 @@ export const COMMANDS: SlashCommand[] = [
     aliases: ['rm'],
     description: 'Delete a project directory',
     args: '<dir>',
+    category: 'workspace' as CommandCategory,
     handler: (args, dispatch) => {
       const dir = args[0];
       if (!dir) {
@@ -107,6 +122,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'clean',
     aliases: [],
     description: 'Remove stale/incomplete projects',
+    category: 'workspace' as CommandCategory,
     handler: (_args, dispatch) => {
       dispatch.showMessage('Running cleanup... (use --workspace to manage projects)', undefined);
     },
@@ -117,6 +133,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'clear',
     aliases: ['reset', 'new'],
     description: 'Clear screen and reset to input',
+    category: 'navigation' as CommandCategory,
     handler: (_args, dispatch) => {
       process.stdout.write('\x1b[2J\x1b[H');
       dispatch.setScreen('input');
@@ -126,6 +143,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'help',
     aliases: ['h', '?'],
     description: 'Show all available commands',
+    category: 'navigation' as CommandCategory,
     handler: (_args, dispatch) => {
       dispatch.setScreen('keybindings');
     },
@@ -134,6 +152,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'exit',
     aliases: ['quit', 'q'],
     description: 'Exit paper2manim',
+    category: 'navigation' as CommandCategory,
     handler: (_args, dispatch) => {
       dispatch.exit();
     },
@@ -144,6 +163,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'config',
     aliases: ['settings'],
     description: 'Open settings panel',
+    category: 'settings' as CommandCategory,
     handler: (_args, dispatch) => {
       dispatch.setScreen('settings');
     },
@@ -152,6 +172,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'status',
     aliases: [],
     description: 'Show version, model, and API key status',
+    category: 'settings' as CommandCategory,
     handler: (_args, dispatch) => {
       const hasAnthropicKey = !!process.env['ANTHROPIC_API_KEY'];
       const hasGeminiKey = !!process.env['GEMINI_API_KEY'] || !!process.env['GOOGLE_API_KEY'];
@@ -170,6 +191,7 @@ export const COMMANDS: SlashCommand[] = [
     aliases: [],
     description: 'Change color theme',
     args: '[dark|light|minimal|colorblind|ansi]',
+    category: 'settings' as CommandCategory,
     handler: (args, dispatch) => {
       const themes: ThemeName[] = ['dark', 'light', 'minimal', 'colorblind', 'ansi'];
       const requested = args[0] as ThemeName | undefined;
@@ -186,6 +208,7 @@ export const COMMANDS: SlashCommand[] = [
     aliases: [],
     description: 'Switch Claude model',
     args: '[opus|sonnet|<model-id>]',
+    category: 'settings' as CommandCategory,
     handler: (args, dispatch) => {
       let model = args[0];
       if (!model) {
@@ -203,6 +226,7 @@ export const COMMANDS: SlashCommand[] = [
     aliases: [],
     description: 'Set render quality',
     args: '[low|medium|high]',
+    category: 'settings' as CommandCategory,
     handler: (args, dispatch) => {
       const q = args[0] as 'low' | 'medium' | 'high' | undefined;
       if (!q || !['low', 'medium', 'high'].includes(q)) {
@@ -218,6 +242,7 @@ export const COMMANDS: SlashCommand[] = [
     aliases: [],
     description: 'Set prompt bar color',
     args: '[red|blue|green|yellow|purple|orange|pink|cyan|white|default]',
+    category: 'settings' as CommandCategory,
     handler: (args, dispatch) => {
       const colorName = args[0] ?? 'default';
       const hex = PROMPT_COLORS[colorName];
@@ -233,8 +258,9 @@ export const COMMANDS: SlashCommand[] = [
     name: 'vim',
     aliases: [],
     description: 'Toggle vim editing mode',
+    category: 'settings' as CommandCategory,
     handler: (_args, dispatch) => {
-      dispatch.showMessage('Vim mode toggle saved to settings.', undefined);
+      dispatch.showMessage('Vim mode is configured in /config → Editor Mode.', undefined);
     },
   },
 
@@ -243,10 +269,10 @@ export const COMMANDS: SlashCommand[] = [
     name: 'verbose',
     aliases: [],
     description: 'Toggle verbose output mode (also: Ctrl+O)',
+    category: 'display' as CommandCategory,
     handler: (_args, dispatch) => {
-      // The dispatch receives the current verboseMode via closure — we toggle it
-      // by calling with the negation. The AppDispatch.setVerboseMode receives a boolean.
-      dispatch.showMessage('Verbose mode toggled. (Use Ctrl+O for instant toggle)', undefined);
+      dispatch.toggleVerboseMode();
+      dispatch.showMessage('Verbose mode toggled. (Ctrl+O also works.)', undefined);
     },
   },
   {
@@ -254,6 +280,7 @@ export const COMMANDS: SlashCommand[] = [
     aliases: [],
     description: 'Compact the log with optional focus instructions',
     args: '[instructions]',
+    category: 'display' as CommandCategory,
     handler: (args, dispatch) => {
       const instructions = args.join(' ').trim();
       dispatch.compactLogs(instructions || undefined);
@@ -263,6 +290,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'context',
     aliases: [],
     description: 'Visualize context window usage',
+    category: 'display' as CommandCategory,
     handler: (_args, dispatch) => {
       dispatch.setScreen('context');
     },
@@ -271,6 +299,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'cost',
     aliases: [],
     description: 'Show token usage and estimated cost',
+    category: 'display' as CommandCategory,
     handler: (_args, dispatch) => {
       dispatch.showMessage('Token usage shown in footer. Detailed breakdown coming soon.', undefined);
     },
@@ -280,9 +309,14 @@ export const COMMANDS: SlashCommand[] = [
     aliases: [],
     description: 'Export session log to a text file',
     args: '[filename]',
+    category: 'display' as CommandCategory,
     handler: (args, dispatch) => {
-      dispatch.exportSession(args[0]);
-      dispatch.showMessage('Session exported to ~/.paper2manim/exports/', undefined);
+      const path = dispatch.exportSession(args[0]);
+      if (path) {
+        dispatch.showMessage(`Session exported to: ${path}`, undefined);
+      } else {
+        dispatch.showMessage('Export failed — check permissions on ~/.paper2manim/exports/', 'red');
+      }
     },
   },
 
@@ -291,6 +325,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'doctor',
     aliases: [],
     description: 'Diagnose paper2manim installation',
+    category: 'tools' as CommandCategory,
     handler: (_args, dispatch) => {
       dispatch.setScreen('doctor');
     },
@@ -299,14 +334,32 @@ export const COMMANDS: SlashCommand[] = [
     name: 'hooks',
     aliases: [],
     description: 'View configured lifecycle hooks',
+    category: 'tools' as CommandCategory,
     handler: (_args, dispatch) => {
-      dispatch.showMessage('Hooks configuration:\nEdit ~/.paper2manim/settings.json to add hooks.', undefined);
+      const { hooks } = loadSettings();
+      const events = Object.keys(hooks) as (keyof typeof hooks)[];
+      if (events.length === 0) {
+        dispatch.showMessage(
+          'No hooks configured.\nEdit ~/.paper2manim/settings.json to add hooks.',
+          undefined,
+        );
+        return;
+      }
+      const lines = events.map(evt => {
+        const handlers = hooks[evt] ?? [];
+        const summary = handlers
+          .map(h => ('command' in h ? h.command : h.url))
+          .join(', ');
+        return `${evt}: ${summary}`;
+      });
+      dispatch.showMessage(`Hooks:\n${lines.join('\n')}`, undefined);
     },
   },
   {
     name: 'permissions',
     aliases: ['allowed-tools'],
     description: 'View and update permission rules',
+    category: 'tools' as CommandCategory,
     handler: (_args, dispatch) => {
       dispatch.setScreen('settings');
     },
@@ -315,6 +368,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'tasks',
     aliases: [],
     description: 'List background processes',
+    category: 'tools' as CommandCategory,
     handler: (_args, dispatch) => {
       dispatch.showMessage('No background tasks running.', undefined);
     },
@@ -323,6 +377,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'keybindings',
     aliases: [],
     description: 'Show all keyboard shortcuts',
+    category: 'tools' as CommandCategory,
     handler: (_args, dispatch) => {
       dispatch.setScreen('keybindings');
     },
@@ -333,6 +388,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'memory',
     aliases: [],
     description: 'Edit PAPER2MANIM.md memory file',
+    category: 'memory' as CommandCategory,
     handler: (_args, dispatch) => {
       const memPath = 'PAPER2MANIM.md';
       const editor = process.env['EDITOR'] ?? process.env['VISUAL'] ?? 'nano';
@@ -348,6 +404,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'init',
     aliases: [],
     description: 'Initialize project with PAPER2MANIM.md',
+    category: 'memory' as CommandCategory,
     handler: (_args, dispatch) => {
       const path = 'PAPER2MANIM.md';
       if (existsSync(path)) {
@@ -363,13 +420,20 @@ export const COMMANDS: SlashCommand[] = [
     aliases: [],
     description: 'Show or set custom status line script path',
     args: '[script-path]',
+    category: 'memory' as CommandCategory,
     handler: (args, dispatch) => {
       const scriptPath = args[0];
       if (scriptPath) {
         saveSettings('user', { statusLine: scriptPath });
         dispatch.showMessage(`Status line script set to: ${scriptPath}`, undefined);
       } else {
-        dispatch.showMessage('Set a custom status line script: /statusline <path>', undefined);
+        const { statusLine } = loadSettings();
+        dispatch.showMessage(
+          statusLine
+            ? `Current status line script: ${statusLine}\nUse /statusline <path> to change it.`
+            : 'No status line script set. Use /statusline <path> to set one.',
+          undefined,
+        );
       }
     },
   },
@@ -379,6 +443,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'insights',
     aliases: [],
     description: 'Generate session analysis (timing, tool calls, quality)',
+    category: 'session' as CommandCategory,
     handler: (_args, dispatch) => {
       dispatch.showMessage('Session insights shown in the summary table after generation completes.', undefined);
     },
@@ -387,6 +452,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'release-notes',
     aliases: ['changelog'],
     description: 'View release notes / changelog',
+    category: 'session' as CommandCategory,
     handler: (_args, dispatch) => {
       const changelogPath = join(process.cwd(), 'CHANGELOG.md');
       if (existsSync(changelogPath)) {
@@ -405,6 +471,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'feedback',
     aliases: ['bug'],
     description: 'Submit feedback or report a bug',
+    category: 'session' as CommandCategory,
     handler: (_args, dispatch) => {
       try {
         execSync('open https://github.com/anthropics/claude-code/issues');
@@ -417,6 +484,7 @@ export const COMMANDS: SlashCommand[] = [
     name: 'diff',
     aliases: [],
     description: 'Show git diff of current project output',
+    category: 'session' as CommandCategory,
     handler: (_args, dispatch) => {
       try {
         const diff = execSync('git diff -- output/', { encoding: 'utf8', timeout: 5000 }).slice(0, 1000);
@@ -431,6 +499,7 @@ export const COMMANDS: SlashCommand[] = [
     aliases: [],
     description: 'Ask a side question without affecting generation history',
     args: '<question>',
+    category: 'session' as CommandCategory,
     handler: (args, dispatch) => {
       const question = args.join(' ').trim();
       if (!question) return;
@@ -448,11 +517,23 @@ export function findCommand(name: string): SlashCommand | undefined {
   );
 }
 
-/** Filter commands by prefix for autocomplete. */
+/** Filter commands by substring for autocomplete, with prefix matches ranked first. */
 export function filterCommands(prefix: string): SlashCommand[] {
   const lower = prefix.toLowerCase();
   if (!lower) return COMMANDS;
-  return COMMANDS.filter(cmd =>
-    cmd.name.startsWith(lower) || cmd.aliases.some(a => a.startsWith(lower))
-  );
+
+  const prefixMatches: SlashCommand[] = [];
+  const substringMatches: SlashCommand[] = [];
+
+  for (const cmd of COMMANDS) {
+    const nameMatch = cmd.name.includes(lower);
+    const aliasMatch = cmd.aliases.some(a => a.includes(lower));
+    if (!nameMatch && !aliasMatch) continue;
+
+    const isPrefix = cmd.name.startsWith(lower) || cmd.aliases.some(a => a.startsWith(lower));
+    if (isPrefix) prefixMatches.push(cmd);
+    else substringMatches.push(cmd);
+  }
+
+  return [...prefixMatches, ...substringMatches];
 }

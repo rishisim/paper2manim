@@ -138,6 +138,7 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
   // ── Double Ctrl+C to exit (Claude Code style) ──────────────
   const [ctrlCPending, setCtrlCPending] = useState(false);
   const ctrlCTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inlineMsgTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Keyboard shortcut state ─────────────────────────────────
   const [showHelp, setShowHelp] = useState(false);
@@ -536,6 +537,7 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
     setScreen: (s) => setScreen(s as Screen),
     setPermissionMode: (mode) => setPermissionMode(mode),
     setVerboseMode: (v: boolean) => setVerboseMode(v),
+    toggleVerboseMode: () => setVerboseMode(v => !v),
     setThinkingVisible: (v: boolean) => setThinkingVisible(v),
     setPromptColor: (color) => setPromptColor(color),
     setCurrentModel: (model) => setCurrentModel(model),
@@ -545,23 +547,24 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
     resumePipeline: (dir) => {
       setConcept(dir);
       addConceptHeader(dir, true);
-      pipeline.start({ concept: 'resume', max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: dir, model: currentModel });
+      pipeline.start({ concept: 'resume', max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: dir, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: buildSystemPrompt(), max_turns: maxTurns, model: currentModel });
       setScreen('running');
     },
     compactLogs: (_instructions) => {
-      // Compact: keep last few entries
       setLogEntries(prev => prev.slice(-5));
+      if (inlineMsgTimer.current) clearTimeout(inlineMsgTimer.current);
       setInlineMessage({ text: 'Log compacted.', color: themeColors.dim });
+      inlineMsgTimer.current = setTimeout(() => setInlineMessage(null), 5000);
     },
     exportSession: (_filename) => {
-      // C7: exportSessionToText returns null on write failure
-      return exportSessionToText(session) ?? '';
+      return exportSessionToText(session);
     },
     killPipeline: () => { pipeline.kill(); },
     exit: () => { pipeline.kill(); exit(); process.exit(0); },
     showMessage: (text, color) => {
+      if (inlineMsgTimer.current) clearTimeout(inlineMsgTimer.current);
       setInlineMessage({ text, color });
-      setTimeout(() => setInlineMessage(null), 5000);
+      inlineMsgTimer.current = setTimeout(() => setInlineMessage(null), 5000);
     },
   };
 
@@ -603,7 +606,7 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
           onResume={(resumeConcept, resumeFromDir) => {
             setConcept(resumeConcept);
             addConceptHeader(resumeConcept, true);
-            pipeline.start({ concept: resumeConcept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: resumeFromDir, model: currentModel });
+            pipeline.start({ concept: resumeConcept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: resumeFromDir, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: buildSystemPrompt(), max_turns: maxTurns, model: currentModel });
             setScreen('running');
           }}
           onBack={() => {

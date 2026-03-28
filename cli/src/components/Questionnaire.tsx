@@ -67,7 +67,7 @@ export function Questionnaire({ concept, questions, onComplete }: QuestionnaireP
           {current.question}
         </Text>
         <Box marginTop={0}>
-          <SelectList options={current.options} onSubmit={handleSelect} />
+          <SelectList key={current.id} options={current.options} onSubmit={handleSelect} />
         </Box>
       </Box>
       <Box marginTop={1}>

@@ -113,10 +113,21 @@ export interface Session {
 
 // ── Slash Commands ────────────────────────────────────────────────────────────
 
+export type CommandCategory =
+  | 'generation'
+  | 'workspace'
+  | 'navigation'
+  | 'settings'
+  | 'display'
+  | 'tools'
+  | 'memory'
+  | 'session';
+
 export interface AppDispatch {
   setScreen: (screen: string) => void;
   setPermissionMode: (mode: PermissionMode) => void;
   setVerboseMode: (v: boolean) => void;
+  toggleVerboseMode: () => void;
   setThinkingVisible: (v: boolean) => void;
   setPromptColor: (color: string) => void;
   setCurrentModel: (model: string) => void;
@@ -125,7 +136,7 @@ export interface AppDispatch {
   startPipeline: (concept: string) => void;
   resumePipeline: (dir: string) => void;
   compactLogs: (instructions?: string) => void;
-  exportSession: (filename?: string) => void;
+  exportSession: (filename?: string) => string | null;
   killPipeline: () => void;
   exit: () => void;
   showMessage: (text: string, color?: string) => void;
@@ -136,6 +147,7 @@ export interface SlashCommand {
   aliases: string[];
   description: string;
   args?: string;
+  category: CommandCategory;
   handler: (args: string[], dispatch: AppDispatch) => void;
 }
 

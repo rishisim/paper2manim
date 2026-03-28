@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Box, Text, useInput, useApp } from 'ink';
 import { execSync } from 'node:child_process';
 import { resolve } from 'node:path';
@@ -22,10 +22,18 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
   const [summaryText, setSummaryText] = useState<string | null>(null);
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(true);
+  const procRef = useRef<ReturnType<typeof spawnRunner> | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fetchProjects = useCallback(() => {
+    if (procRef.current && !procRef.current.killed) {
+      procRef.current.stdout?.removeAllListeners();
+      procRef.current.removeAllListeners();
+      procRef.current.kill();
+    }
     setLoading(true);
     const proc = spawnRunner(JSON.stringify({ mode: 'workspace', workspace_action: 'list' }));
+    procRef.current = proc;
     let buffer = '';
 
     proc.stdout?.on('data', (chunk: Buffer) => {
@@ -61,6 +69,14 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
 
   useEffect(() => {
     fetchProjects();
+    return () => {
+      if (procRef.current && !procRef.current.killed) {
+        procRef.current.stdout?.removeAllListeners();
+        procRef.current.removeAllListeners();
+        procRef.current.kill();
+      }
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
   }, [fetchProjects]);
 
   const deleteProject = useCallback((dir: string) => {
@@ -70,7 +86,8 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
       setSubScreen('list');
       setSelectedIdx(0);
       fetchProjects();
-      setTimeout(() => setMessage(''), 2000);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => setMessage(''), 2000);
     });
   }, [fetchProjects]);
 
@@ -80,7 +97,8 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
       setMessage('Stale entries cleaned.');
       setSubScreen('list');
       fetchProjects();
-      setTimeout(() => setMessage(''), 2000);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => setMessage(''), 2000);
     });
   }, [fetchProjects]);
 

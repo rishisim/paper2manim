@@ -21,6 +21,8 @@ interface ControlledTextInputProps {
   placeholder?: string;
   isDisabled?: boolean;
   focus?: boolean;
+  /** When true the slash-command overlay is visible — suppress up/down so only the overlay navigates. */
+  slashModeActive?: boolean;
 }
 
 export function ControlledTextInput({
@@ -32,6 +34,7 @@ export function ControlledTextInput({
   placeholder,
   isDisabled = false,
   focus = true,
+  slashModeActive = false,
 }: ControlledTextInputProps) {
   const { themeColors, commandHistory } = useAppContext();
   const [cursor, setCursor] = useState(value.length);
@@ -151,6 +154,9 @@ export function ControlledTextInput({
       setCursor(cursor + 1);
       return;
     }
+
+    // Up/down arrow — yielded entirely to the slash-command overlay when it is open
+    if (slashModeActive && (key.upArrow || key.downArrow)) return;
 
     // Up arrow — navigate history backwards
     if (key.upArrow) {

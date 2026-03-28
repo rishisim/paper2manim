@@ -10,6 +10,9 @@ import type { Project, AppDispatch } from '../lib/types.js';
 
 // M9: Tip is selected inside the component (per-mount) not at module load
 
+/** Number of project rows always reserved — keeps the welcome box height stable. */
+const PROJECT_ROWS = 5;
+
 /** Truncate from the right, keeping the beginning. */
 function truncateRight(s: string, maxLen: number): string {
   if (s.length <= maxLen) return s;
@@ -32,26 +35,18 @@ export function WelcomeScreen({ onSubmit, onResumeProject, dispatch }: WelcomeSc
   const [focusMode, setFocusMode] = useState<FocusMode>('input');
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [clearKey, setClearKey] = useState(0);
+  // Track slash mode from PromptBar so we can suspend our own key handling
+  const [slashActive, setSlashActive] = useState(false);
 
   // Reactive terminal width — re-renders on resize
   const termWidth = useTerminalWidth();
   const BOX_WIDTH = Math.max(60, termWidth - 2);
-
-  // Box inner area (subtract left+right borders)
-  const BOX_INNER = BOX_WIDTH - 2;
-
-  // Left panel ~42% of inner area
-  const LEFT_WIDTH = Math.floor(BOX_INNER * 0.42);
-  // Content available inside left panel (subtract paddingX=2 on each side)
+  const BOX_INNER   = BOX_WIDTH - 2;
+  const LEFT_WIDTH  = Math.floor(BOX_INNER * 0.42);
   const LEFT_CONTENT = LEFT_WIDTH - 4;
-
-  // Divider column = 1 char; right panel gets the rest
-  const RIGHT_WIDTH = BOX_INNER - LEFT_WIDTH - 1;
-  // Content available inside right panel (subtract paddingX=2 on each side)
+  const RIGHT_WIDTH  = BOX_INNER - LEFT_WIDTH - 1;
   const RIGHT_CONTENT = RIGHT_WIDTH - 4;
-
-  // Max concept length per project row: RIGHT_CONTENT minus pointer (2) + icon (2)
-  const MAX_CONCEPT = Math.max(8, RIGHT_CONTENT - 4);
+  const MAX_CONCEPT  = Math.max(8, RIGHT_CONTENT - 4);
 
   const cwd = process.cwd();
   const home = process.env['HOME'] ?? '';
@@ -63,7 +58,6 @@ export function WelcomeScreen({ onSubmit, onResumeProject, dispatch }: WelcomeSc
         setFocusMode('projects');
         setSelectedIdx(projects.length - 1);
       } else if (key.escape) {
-        // Esc clears the input field (Claude Code style)
         setClearKey(k => k + 1);
       }
     } else if (focusMode === 'projects') {
@@ -82,7 +76,7 @@ export function WelcomeScreen({ onSubmit, onResumeProject, dispatch }: WelcomeSc
         if (project) onResumeProject(project);
       }
     }
-  });
+  }, { isActive: !slashActive });
 
   const hintText = focusMode === 'projects'
     ? '↑↓ select  Enter resume  Esc back to input'
@@ -90,87 +84,103 @@ export function WelcomeScreen({ onSubmit, onResumeProject, dispatch }: WelcomeSc
       ? '↑ navigate recent  Enter submit  Esc clear'
       : 'Enter to submit  Esc clear';
 
+  // Project rows: always render exactly PROJECT_ROWS lines so the welcome box
+  // height never changes between the loading state and the loaded state.
+  const projectRows = Array.from({ length: PROJECT_ROWS }, (_, idx) => {
+    if (loading) {
+      return (
+        <Box key={`load-${idx}`}>
+          <Text color={colors.dim}>{idx === 0 ? '  Loading…' : ' '}</Text>
+        </Box>
+      );
+    }
+    const p = projects[idx];
+    if (!p) {
+      // No project at this slot — show placeholder if list is empty on first slot
+      return (
+        <Box key={`empty-${idx}`}>
+          <Text color={colors.dim}>
+            {idx === 0 && projects.length === 0 ? '  No recent projects yet.' : ' '}
+          </Text>
+        </Box>
+      );
+    }
+    const isSelected = focusMode === 'projects' && idx === selectedIdx;
+    const icon = p.status === 'completed' ? '✓' : '○';
+    const iconColor = p.status === 'completed' ? colors.success : colors.warn;
+    const conceptDisplay = truncateRight(p.concept, MAX_CONCEPT);
+    return (
+      // Single <Text> guarantees exactly one terminal line per project
+      <Text key={p.dir}>
+        <Text color={isSelected ? colors.primary : colors.dim}>{isSelected ? '▸ ' : '  '}</Text>
+        <Text color={iconColor}>{icon} </Text>
+        <Text bold={isSelected} color={isSelected ? colors.primary : colors.text}>{conceptDisplay}</Text>
+      </Text>
+    );
+  });
+
   return (
     <Box flexDirection="column" marginBottom={1}>
-      {/* ── Welcome box ── */}
-      <Box
-        flexDirection="row"
-        borderStyle="round"
-        borderColor={colors.primary}
-        width={BOX_WIDTH}
-      >
-        {/* LEFT PANEL */}
-        <Box flexDirection="column" width={LEFT_WIDTH} paddingX={2} paddingY={1}>
-          <Text>
-            <Text bold color={colors.primary}>{BRAND_ICON}</Text>
-            <Text bold color={colors.text}> paper2manim</Text>
-            <Text color={colors.dim}>  v{VERSION}</Text>
-          </Text>
-          <Box marginTop={1} justifyContent="center">
-            <Text bold color={colors.primary}>{BRAND_ICON}</Text>
+      {/* ── Welcome box — hidden when slash overlay is open to prevent terminal overflow.
+           Hiding (not unmounting) keeps the PromptBar instance alive so its slashMode
+           state survives the transition and the overlay opens on the first /. ── */}
+      {!slashActive && (
+        <Box flexDirection="row" borderStyle="round" borderColor={colors.primary} width={BOX_WIDTH}>
+          {/* LEFT PANEL */}
+          <Box flexDirection="column" width={LEFT_WIDTH} paddingX={2} paddingY={1}>
+            <Text>
+              <Text bold color={colors.primary}>{BRAND_ICON}</Text>
+              <Text bold color={colors.text}> paper2manim</Text>
+              <Text color={colors.dim}>  v{VERSION}</Text>
+            </Text>
+            <Box marginTop={1} justifyContent="center">
+              <Text bold color={colors.primary}>{BRAND_ICON}</Text>
+            </Box>
+            <Box marginTop={1}>
+              <Text color={colors.dim}>{truncateRight(MODEL_TAG, LEFT_CONTENT)}</Text>
+            </Box>
+            <Text color={colors.dim}>{truncatePath(displayCwd, LEFT_CONTENT)}</Text>
           </Box>
-          <Box marginTop={1}>
-            <Text color={colors.dim}>{truncateRight(MODEL_TAG, LEFT_CONTENT)}</Text>
+
+          {/* VERTICAL DIVIDER */}
+          <Box
+            borderStyle="single"
+            borderLeft={true}
+            borderRight={false}
+            borderTop={false}
+            borderBottom={false}
+            borderColor={colors.dim}
+          />
+
+          {/* RIGHT PANEL */}
+          <Box flexDirection="column" width={RIGHT_WIDTH} paddingX={2} paddingY={1}>
+            <Text bold color={colors.dim}>Tips for getting started</Text>
+            <Text color={colors.dim}>{truncateRight(tip, RIGHT_CONTENT)}</Text>
+            <Box marginTop={1}>
+              <Text color={colors.dim}>{'─'.repeat(RIGHT_CONTENT)}</Text>
+            </Box>
+            <Box marginTop={1}>
+              <Text bold color={colors.dim}>Recent projects</Text>
+            </Box>
+            {projectRows}
           </Box>
-          <Text color={colors.dim}>{truncatePath(displayCwd, LEFT_CONTENT)}</Text>
         </Box>
+      )}
 
-        {/* VERTICAL DIVIDER */}
-        <Box
-          borderStyle="single"
-          borderLeft={true}
-          borderRight={false}
-          borderTop={false}
-          borderBottom={false}
-          borderColor={colors.dim}
-        />
-
-        {/* RIGHT PANEL */}
-        <Box flexDirection="column" width={RIGHT_WIDTH} paddingX={2} paddingY={1}>
-          <Text bold color={colors.dim}>Tips for getting started</Text>
-          <Text color={colors.dim}>{truncateRight(tip, RIGHT_CONTENT)}</Text>
-          <Box marginTop={1}>
-            <Text color={colors.dim}>{'─'.repeat(RIGHT_CONTENT)}</Text>
-          </Box>
-          <Box marginTop={1}>
-            <Text bold color={colors.dim}>Recent projects</Text>
-          </Box>
-          {loading && (
-            <Text color={colors.dim}>  Loading…</Text>
-          )}
-          {!loading && projects.length === 0 && (
-            <Text color={colors.dim}>  No recent projects yet.</Text>
-          )}
-          {/* Each project rendered as a single <Text> to guarantee one line */}
-          {!loading && projects.map((p, idx) => {
-            const isSelected = focusMode === 'projects' && idx === selectedIdx;
-            const icon = p.status === 'completed' ? '✓' : '○';
-            const iconColor = p.status === 'completed' ? colors.success : colors.warn;
-            const conceptDisplay = truncateRight(p.concept, MAX_CONCEPT);
-            return (
-              <Text key={p.dir}>
-                <Text color={isSelected ? colors.primary : colors.dim}>{isSelected ? '▸ ' : '  '}</Text>
-                <Text color={iconColor}>{icon} </Text>
-                <Text bold={isSelected} color={isSelected ? colors.primary : colors.text}>{conceptDisplay}</Text>
-              </Text>
-            );
-          })}
-        </Box>
-      </Box>
-
-      {/* ── Input below the box ── */}
+      {/* ── Input — always the same instance regardless of slashActive ── */}
       <Box flexDirection="column" paddingX={1}>
         {dispatch ? (
           <PromptBar
             onSubmit={onSubmit}
             dispatch={dispatch}
-            isDisabled={focusMode === 'projects'}
+            isDisabled={!slashActive && focusMode === 'projects'}
             placeholder="Type a concept, /help for commands…"
+            onSlashModeChange={setSlashActive}
           />
         ) : (
-          <ConceptInput onSubmit={onSubmit} isDisabled={focusMode === 'projects'} clearKey={clearKey} />
+          <ConceptInput onSubmit={onSubmit} isDisabled={!slashActive && focusMode === 'projects'} clearKey={clearKey} />
         )}
-        {focusMode === 'projects' && (
+        {!slashActive && focusMode === 'projects' && (
           <Box marginTop={1}>
             <Text color={themeColors.dim}>{hintText}</Text>
           </Box>
