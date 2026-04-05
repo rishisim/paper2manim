@@ -1,8 +1,11 @@
+import logging
 import os
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterator
+
+logger = logging.getLogger(__name__)
 
 
 def _size_based_timeout(paths: list[str], base: int = 120) -> int:
@@ -72,7 +75,17 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
             "error": result.stderr or result.stdout,
             "command": " ".join(cmd),
         }
-    except Exception as exc:
+    except subprocess.TimeoutExpired as exc:
+        logger.error("ffmpeg stitch timed out: %s", exc)
+        yield {
+            "final": True,
+            "success": False,
+            "output_path": None,
+            "error": str(exc),
+            "command": " ".join(cmd),
+        }
+    except OSError as exc:
+        logger.error("ffmpeg stitch failed: %s", exc)
         yield {
             "final": True,
             "success": False,
@@ -198,7 +211,16 @@ def concatenate_segments(
                     "output_path": None,
                     "error": result.stderr or result.stdout,
                 }
-    except Exception as exc:
+    except subprocess.TimeoutExpired as exc:
+        logger.error("Segment concatenation timed out: %s", exc)
+        yield {
+            "final": True,
+            "success": False,
+            "output_path": None,
+            "error": str(exc),
+        }
+    except OSError as exc:
+        logger.error("Segment concatenation failed: %s", exc)
         yield {
             "final": True,
             "success": False,

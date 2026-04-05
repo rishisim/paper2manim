@@ -1,9 +1,12 @@
 import json
+import logging
 import os
 import sys
 import tempfile
 import time
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _get_state_path(output_dir: str) -> str:
@@ -40,7 +43,8 @@ def load_project(output_dir: str) -> dict[str, Any]:
     try:
         with open(state_path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        logger.warning("Corrupt project state in %s: %s", state_path, e)
         return None
 
 
@@ -257,9 +261,8 @@ def _is_placeholder_project(output_dir: str, state: dict[str, Any]) -> bool:
                 continue
             # Any other artifact indicates this is not a placeholder.
             return False
-    except Exception as e:
-        # L7: Log unexpected errors instead of silently swallowing them
-        print(f"[warn] _is_placeholder_project: could not list {output_dir}: {e}", file=sys.stderr)
+    except OSError as e:
+        logger.warning("Could not list directory %s: %s", output_dir, e)
         return False
 
     return True
@@ -292,8 +295,8 @@ def cleanup_placeholder_projects(base_dir: str = "output") -> int:
         try:
             shutil.rmtree(project_dir)
             removed += 1
-        except Exception as e:
-            print(f"[warn] cleanup_placeholder_projects: failed to remove {project_dir}: {e}", file=sys.stderr)
+        except OSError as e:
+            logger.warning("Failed to remove placeholder project %s: %s", project_dir, e)
             continue
     return removed
 
@@ -325,8 +328,8 @@ def delete_project(output_dir: str) -> bool:
         try:
             shutil.rmtree(output_dir)
             return True
-        except Exception as e:
-            print(f"[warn] delete_project: failed to remove {output_dir}: {e}", file=sys.stderr)
+        except OSError as e:
+            logger.warning("Failed to delete project %s: %s", output_dir, e)
             return False
     return False
 

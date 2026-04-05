@@ -8,11 +8,14 @@ in-memory for the lifetime of the process so repeated look-ups are free.
 
 from __future__ import annotations
 
+import logging
 import re
 from functools import lru_cache
 from typing import Optional
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 REPO_BASE = (
     "https://raw.githubusercontent.com/ManimCommunity/manim/main"
@@ -111,7 +114,17 @@ def _fetch_raw(path: str) -> Optional[str]:
         resp = requests.get(url, timeout=5) # Reduced timeout to 5s
         resp.raise_for_status()
         return resp.text
-    except Exception:
+    except requests.ConnectionError as e:
+        logger.warning("Connection error fetching %s: %s", url, e)
+        return None
+    except requests.Timeout as e:
+        logger.warning("Timeout fetching %s: %s", url, e)
+        return None
+    except requests.HTTPError as e:
+        logger.warning("HTTP error fetching %s: %s", url, e)
+        return None
+    except requests.RequestException as e:
+        logger.warning("Request failed for %s: %s", url, e)
         return None
 
 

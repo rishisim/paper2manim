@@ -8,12 +8,15 @@ Manim scenes simultaneously, taking advantage of multi-core CPUs
 
 from __future__ import annotations
 
+import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from utils.manim_runner import run_manim_code, extract_class_name
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -59,6 +62,7 @@ def _render_single(job: RenderJob) -> RenderResult:
             error=result.get("error"),
         )
     except Exception as exc:
+        logger.error("Render worker crashed for segment %d: %s", job.segment_id, exc)
         return RenderResult(
             segment_id=job.segment_id,
             success=False,
@@ -100,6 +104,7 @@ def render_parallel(
             try:
                 result = future.result()
             except Exception as exc:
+                logger.error("Future result retrieval failed for segment %d: %s", seg_id, exc)
                 result = RenderResult(segment_id=seg_id, success=False, error=str(exc))
 
             results_map[seg_id] = result
