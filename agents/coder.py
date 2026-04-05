@@ -30,6 +30,8 @@ from agents.config import (
     MAX_TOOL_CALLS_SIMPLE,
     MAX_TOOL_CALLS_FIX_COMPLEX,
     MAX_TOOL_CALLS_FIX_SIMPLE,
+    new_token_counter,
+    estimate_cost,
 )
 
 import logging
@@ -312,6 +314,7 @@ def _send_and_extract(
     user_message: str,
     max_tool_calls: int,
     tool_call_counts: dict[str, int] | None = None,
+    token_counter: dict | None = None,
 ) -> str:
     """Send a message via Anthropic Messages API, handle tool calls,
     and return the final text with code fences stripped."""
@@ -333,6 +336,15 @@ def _send_and_extract(
             kwargs["tools"] = tools
 
         response = client.messages.create(**kwargs)
+
+        # Track token usage from this API call
+        if token_counter is not None:
+            try:
+                token_counter["input_tokens"] += getattr(response.usage, "input_tokens", 0)
+                token_counter["output_tokens"] += getattr(response.usage, "output_tokens", 0)
+                token_counter["api_calls"] += 1
+            except Exception:
+                pass  # Don't let tracking failures break the pipeline
 
         # Extract text blocks and tool use blocks
         text_parts: list[str] = []
@@ -389,6 +401,7 @@ def generate_manim_script(
     theme_name: str = "",
     color_palette: dict[str, str] | None = None,
     few_shot_example: str = "",
+    token_counter: dict | None = None,
 ) -> Iterator[str]:
     """Yield the final generated code (single yield after tool calls resolve)."""
     model = _get_model_for_complexity(complexity)
@@ -474,6 +487,7 @@ def generate_manim_script(
         client, model, system, prompt,
         max_tool_calls=max_tool_calls,
         tool_call_counts=tool_call_counts,
+        token_counter=token_counter,
     )
     if not code:
         _log.debug("falling back to tool-less generation (model=%s)", model)
@@ -481,6 +495,7 @@ def generate_manim_script(
             client, model, system, prompt,
             max_tool_calls=0,
             tool_call_counts=tool_call_counts,
+            token_counter=token_counter,
         )
 
     # Lightweight spec compliance check for Pro segments
@@ -529,6 +544,7 @@ def fix_manim_script(
     tool_call_counts: dict[str, int] | None = None,
     original_instructions: str = "",
     repair_attempt: int = 0,
+    token_counter: dict | None = None,
 ) -> Iterator[str]:
     """Yield the corrected code after consulting docs.
 
@@ -597,6 +613,7 @@ def fix_manim_script(
         client, model, system, prompt,
         max_tool_calls=max_tool_calls,
         tool_call_counts=tool_call_counts,
+        token_counter=token_counter,
     )
     if fixed:
         yield fixed
@@ -630,11 +647,13 @@ def run_coder_agent(
     _seg = f"[Seg {segment_id}] " if segment_id is not None else ""
     code = ""
     tool_call_counts: dict[str, int] = {}
+    coder_tokens = new_token_counter()
 
     def _attach_tool_usage(payload: dict) -> dict:
         counts = dict(sorted(tool_call_counts.items()))
         payload["tool_call_counts"] = counts
         payload["total_tool_calls"] = sum(counts.values())
+        payload["token_usage"] = dict(coder_tokens)
         return payload
 
     yield {
@@ -649,6 +668,7 @@ def run_coder_agent(
         theme_name=theme_name,
         color_palette=color_palette,
         few_shot_example=few_shot_example,
+        token_counter=coder_tokens,
     ):
         if chunk == "looking up docs":
             yield {"status": f"{_seg}Generating with Claude...", "phase": "docs"}
@@ -700,6 +720,7 @@ def run_coder_agent(
                     tool_call_counts=tool_call_counts,
                     original_instructions=original_instructions,
                     repair_attempt=attempt,
+                    token_counter=coder_tokens,
                 ):
                     if chunk == "looking up docs":
                         yield {"status": f"{_seg}Looking up docs for fix (attempt {attempt + 1}/{max_retries})...", "phase": "fix_docs"}
@@ -774,6 +795,7 @@ def run_coder_agent(
                 tool_call_counts=tool_call_counts,
                 original_instructions=original_instructions,
                 repair_attempt=attempt,
+                token_counter=coder_tokens,
             ):
                 if chunk == "looking up docs":
                     yield {"status": f"{_seg}Looking up docs for fix (attempt {attempt + 1}/{max_retries})...", "phase": "fix_docs"}

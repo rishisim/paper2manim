@@ -25,6 +25,7 @@ from agents.planner_math2manim import run_math2manim_planner
 from agents.coder import run_coder_agent
 from agents.validation import validate_concept
 from agents.stages import Stage
+from agents.config import new_token_counter, merge_token_usage, estimate_cost, CLAUDE_OPUS, CLAUDE_SONNET
 from utils.tts_engine import generate_voiceover_async
 from utils.media_assembler import stitch_video_and_audio, concatenate_segments
 from utils.parallel_renderer import RenderJob, render_parallel
@@ -79,6 +80,7 @@ def _save_pipeline_summary(
     project_dir: str,
     concept: str = "",
     tool_call_counts: dict[str, int] | None = None,
+    token_summary: dict | None = None,
 ) -> str:
     """Write a plain-text pipeline summary to ``project_dir/pipeline_summary.txt``."""
     import time as _time
@@ -115,11 +117,80 @@ def _save_pipeline_summary(
         lines.append("No tool calls recorded.")
         lines.append("")
 
+    # Token usage & cost section
+    if token_summary:
+        lines.append("Token Usage & Estimated Cost")
+        lines.append("=" * 50)
+        lines.append(f"Total input tokens  : {token_summary.get('total_input_tokens', 0):,}")
+        lines.append(f"Total output tokens : {token_summary.get('total_output_tokens', 0):,}")
+        lines.append(f"Total API calls     : {token_summary.get('total_api_calls', 0)}")
+        cost = token_summary.get("estimated_cost_usd", 0)
+        lines.append(f"Estimated cost      : ${cost:.4f} USD")
+        lines.append("")
+        breakdown = token_summary.get("breakdown", {})
+        if breakdown:
+            lines.append("Per-stage breakdown:")
+            for stage_name, stage_data in breakdown.items():
+                s_in = stage_data.get("input_tokens", 0)
+                s_out = stage_data.get("output_tokens", 0)
+                s_cost = stage_data.get("cost_usd", 0)
+                s_calls = stage_data.get("api_calls", 0)
+                lines.append(f"  {stage_name:<20} {s_in:>8,} in / {s_out:>8,} out  ({s_calls} calls)  ~${s_cost:.4f}")
+            lines.append("")
+
     os.makedirs(project_dir, exist_ok=True)
     summary_path = os.path.join(project_dir, "pipeline_summary.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     return summary_path
+
+
+def _build_token_summary(
+    pipeline_tokens: dict,
+    planning_tokens: dict,
+    coding_tokens: dict,
+    tts_api_calls: int = 0,
+) -> dict:
+    """Assemble a comprehensive token usage summary with per-stage breakdown."""
+    total_in = pipeline_tokens["input_tokens"]
+    total_out = pipeline_tokens["output_tokens"]
+    total_calls = pipeline_tokens["api_calls"]
+
+    # Estimate costs — planner uses Sonnet, coder uses a mix of Opus/Sonnet
+    # We approximate by attributing planner to Sonnet and coder to Opus
+    planning_cost = estimate_cost(
+        planning_tokens["input_tokens"],
+        planning_tokens["output_tokens"],
+        model=CLAUDE_SONNET,
+    )
+    coding_cost = estimate_cost(
+        coding_tokens["input_tokens"],
+        coding_tokens["output_tokens"],
+        model=CLAUDE_OPUS,
+    )
+    total_cost = planning_cost + coding_cost
+
+    return {
+        "total_input_tokens": total_in,
+        "total_output_tokens": total_out,
+        "total_api_calls": total_calls,
+        "tts_api_calls": tts_api_calls,
+        "estimated_cost_usd": round(total_cost, 4),
+        "breakdown": {
+            "planning": {
+                "input_tokens": planning_tokens["input_tokens"],
+                "output_tokens": planning_tokens["output_tokens"],
+                "api_calls": planning_tokens["api_calls"],
+                "cost_usd": round(planning_cost, 4),
+            },
+            "coding": {
+                "input_tokens": coding_tokens["input_tokens"],
+                "output_tokens": coding_tokens["output_tokens"],
+                "api_calls": coding_tokens["api_calls"],
+                "cost_usd": round(coding_cost, 4),
+            },
+        },
+    }
 
 
 # ── Main segmented pipeline (synchronous generator for Streamlit) ────
@@ -146,6 +217,12 @@ def run_segmented_pipeline(
 
     concept = validate_concept(concept)
 
+    # ── Token tracking across the full pipeline ────────────────────────
+    pipeline_tokens = new_token_counter()         # grand total
+    planning_tokens = new_token_counter()          # planning stage
+    coding_tokens = new_token_counter()            # code generation stage
+    tts_api_calls = 0                              # TTS calls (no token count for Gemini TTS)
+
     # ── Step 1: Planning ──────────────────────────────────────────────
 
     yield {"stage": Stage.PLAN, "status": "Starting segmented storyboard planning..."}
@@ -168,6 +245,11 @@ def run_segmented_pipeline(
                 yield {"stage": Stage.PLAN, "status": update["error"], "error": update["error"], "final": True}
                 return
             storyboard = update["storyboard"]
+            # Collect planner token usage if available
+            planner_tu = update.get("token_usage")
+            if planner_tu:
+                merge_token_usage(planning_tokens, planner_tu)
+                merge_token_usage(pipeline_tokens, planner_tu)
 
     if not storyboard:
         yield {"stage": Stage.PLAN, "status": "No storyboard generated.", "error": "Empty planner output.", "final": True}
@@ -234,6 +316,7 @@ def run_segmented_pipeline(
                                        error=result.get("error", ""))
 
         tts_ok = sum(1 for r in tts_results.values() if r.get("success"))
+        tts_api_calls = tts_ok  # Each successful TTS is one Gemini API call
         tts_elapsed = time.perf_counter() - tts_start
         timings.append(("Voiceover", "ok" if tts_ok > 0 else "failed", tts_elapsed))
         yield {"stage": Stage.TTS, "status": f"TTS complete: {tts_ok}/{num_segments} succeeded", "tts_results": tts_results}
@@ -303,6 +386,11 @@ def run_segmented_pipeline(
 
             code_results[seg_id] = result
             _merge_tool_calls(result.get("tool_call_counts"))
+            # Accumulate token usage from this segment's coder
+            coder_tu = result.get("token_usage")
+            if coder_tu:
+                merge_token_usage(coding_tokens, coder_tu)
+                merge_token_usage(pipeline_tokens, coder_tu)
 
             has_code = _has_valid_code(result)
             if has_code:
@@ -379,6 +467,11 @@ def run_segmented_pipeline(
 
                 code_results[sid] = last_update
                 _merge_tool_calls(last_update.get("tool_call_counts"))
+                # Accumulate token usage from retry
+                retry_tu = last_update.get("token_usage")
+                if retry_tu:
+                    merge_token_usage(coding_tokens, retry_tu)
+                    merge_token_usage(pipeline_tokens, retry_tu)
 
                 has_code = _has_valid_code(last_update)
                 if has_code:
@@ -516,6 +609,7 @@ def run_segmented_pipeline(
     # ── Step 5: Concatenate all segments ──────────────────────────────
 
     if not valid_paths:
+        ts = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, tts_api_calls)
         yield {
             "stage": Stage.DONE,
             "status": "No segments produced a video.",
@@ -525,8 +619,9 @@ def run_segmented_pipeline(
             "timings": timings,
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
             "total_tool_calls": sum(tool_call_counts.values()),
+            "token_summary": ts,
         }
-        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts)
+        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=ts)
         return
 
     final_output = os.path.join(project_dir, f"{slug}.mp4")
@@ -542,11 +637,13 @@ def run_segmented_pipeline(
 
     concat_elapsed = time.perf_counter() - concat_start
 
+    ts = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, tts_api_calls)
+
     if concat_result and concat_result.get("success"):
         timings.append(("Concat", "ok", concat_elapsed))
         mark_stage_done(project_dir, "concat", artifacts=[final_output])
         mark_project_complete(project_dir)
-        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts)
+        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=ts)
         yield {
             "stage": Stage.DONE,
             "status": "Pipeline complete!",
@@ -558,11 +655,12 @@ def run_segmented_pipeline(
             "timings": timings,
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
             "total_tool_calls": sum(tool_call_counts.values()),
+            "token_summary": ts,
         }
     else:
         err = concat_result.get("error", "unknown") if concat_result else "unknown"
         timings.append(("Concat", "failed", concat_elapsed))
-        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts)
+        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=ts)
         # If concat fails but we have segments, return the first one
         yield {
             "stage": Stage.DONE,
@@ -575,4 +673,5 @@ def run_segmented_pipeline(
             "timings": timings,
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
             "total_tool_calls": sum(tool_call_counts.values()),
+            "token_summary": ts,
         }

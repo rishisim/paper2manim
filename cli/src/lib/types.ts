@@ -181,6 +181,21 @@ export interface PipelineUpdate {
   total_tool_calls?: number;
   stitch_errors?: string[];
 
+  // Token summary (emitted with the final "done" update)
+  token_summary?: {
+    total_input_tokens: number;
+    total_output_tokens: number;
+    total_api_calls: number;
+    tts_api_calls?: number;
+    estimated_cost_usd: number;
+    breakdown?: Record<string, {
+      input_tokens: number;
+      output_tokens: number;
+      api_calls: number;
+      cost_usd: number;
+    }>;
+  };
+
   // Phase 5 extensions — token usage, thinking, tool calls
   token_usage?: { input: number; output: number; cache_read?: number };
   thinking?: string | boolean;

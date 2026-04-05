@@ -21,7 +21,7 @@ from typing import Iterator, Literal, List, Dict
 from pydantic import BaseModel, Field
 import anthropic
 
-from agents.config import CLAUDE_OPUS, CLAUDE_SONNET
+from agents.config import CLAUDE_OPUS, CLAUDE_SONNET, new_token_counter, merge_token_usage, estimate_cost
 
 # ── Duration presets: map user's video-length choice to hard constraints ──
 
@@ -104,12 +104,14 @@ def _extract_json_text(raw_text: str) -> str:
     return match.group(0) if match else text
 
 
-def _call_llm(client: anthropic.Anthropic, prompt: str, model: str = CLAUDE_OPUS, max_tokens: int = 4096) -> str:
+def _call_llm(client: anthropic.Anthropic, prompt: str, model: str = CLAUDE_OPUS, max_tokens: int = 4096, token_counter: dict | None = None) -> str:
     """Make a single Claude API call and return the raw text.
 
     Args:
         max_tokens: Output token ceiling. Stages 1-4 produce small JSON so 4096
             is more than enough. Stage 5 narrative composition should pass 8192.
+        token_counter: If provided, input/output token counts from the response
+            are accumulated into this dict.
     """
     response = client.messages.create(
         model=model,
@@ -119,6 +121,14 @@ def _call_llm(client: anthropic.Anthropic, prompt: str, model: str = CLAUDE_OPUS
             {"role": "user", "content": prompt + "\n\nRespond with ONLY the JSON object, nothing else."},
         ],
     )
+    # Track token usage if a counter was provided
+    if token_counter is not None:
+        try:
+            token_counter["input_tokens"] += getattr(response.usage, "input_tokens", 0)
+            token_counter["output_tokens"] += getattr(response.usage, "output_tokens", 0)
+            token_counter["api_calls"] += 1
+        except Exception:
+            pass  # Don't let tracking failures break the pipeline
     return response.content[0].text or ""
 
 
@@ -166,7 +176,7 @@ def _default_enriched_tree(tree: PrerequisiteTree) -> EnrichedTree:
 
 # ── Stage 1: Concept Analysis ────────────────────────────────────────
 
-def analyze_concept(concept: str, client: anthropic.Anthropic, duration_preset: dict | None = None) -> ConceptAnalysis | None:
+def analyze_concept(concept: str, client: anthropic.Anthropic, duration_preset: dict | None = None, token_counter: dict | None = None) -> ConceptAnalysis | None:
     preset = duration_preset or DEFAULT_DURATION_PRESET
     min_seg, max_seg = preset["min_segments"], preset["max_segments"]
     target_secs = preset["target_seconds"]
@@ -195,7 +205,7 @@ Think about:
 - How to fit this into {min_seg}-{max_seg} segments of ~{preset['per_segment_seconds']}s each?
 """
     try:
-        text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET))
+        text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET, token_counter=token_counter))
         analysis = ConceptAnalysis.model_validate(json.loads(text))
         # Hard clamp segment count to preset range
         analysis.suggested_segment_count = max(min_seg, min(max_seg, analysis.suggested_segment_count))
@@ -207,7 +217,7 @@ Think about:
 
 # ── Stage 2: Prerequisite Discovery ──────────────────────────────────
 
-def build_prerequisite_tree(concept: str, analysis: ConceptAnalysis | None, client: anthropic.Anthropic) -> PrerequisiteTree | None:
+def build_prerequisite_tree(concept: str, analysis: ConceptAnalysis | None, client: anthropic.Anthropic, token_counter: dict | None = None) -> PrerequisiteTree | None:
     analysis_context = ""
     if analysis:
         analysis_context = f"""
@@ -240,13 +250,13 @@ Output as JSON:
   ]
 }}
 """
-    text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET))
+    text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET, token_counter=token_counter))
     return PrerequisiteTree.model_validate(json.loads(text))
 
 
 # ── Stage 3: Mathematical Enrichment ─────────────────────────────────
 
-def enrich_concept_tree(tree: PrerequisiteTree, analysis: ConceptAnalysis | None, client: anthropic.Anthropic) -> EnrichedTree | None:
+def enrich_concept_tree(tree: PrerequisiteTree, analysis: ConceptAnalysis | None, client: anthropic.Anthropic, token_counter: dict | None = None) -> EnrichedTree | None:
     misconceptions_note = ""
     if analysis and analysis.common_misconceptions:
         misconceptions_note = f"\nCommon misconceptions to address: {json.dumps(analysis.common_misconceptions)}"
@@ -278,13 +288,13 @@ Output as JSON:
   ]
 }}
 """
-    text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET))
+    text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET, token_counter=token_counter))
     return EnrichedTree.model_validate(json.loads(text))
 
 
 # ── Stage 4: Visual Design ───────────────────────────────────────────
 
-def design_visuals(enriched_tree: EnrichedTree, analysis: ConceptAnalysis | None, client: anthropic.Anthropic) -> VisualDesign | None:
+def design_visuals(enriched_tree: EnrichedTree, analysis: ConceptAnalysis | None, client: anthropic.Anthropic, token_counter: dict | None = None) -> VisualDesign | None:
     prompt = f"""You are an expert cinematic visual designer for mathematical animation videos (3Blue1Brown style).
 
 Here is the enriched teaching sequence:
@@ -321,7 +331,7 @@ Design rules:
 - Design layouts that avoid clutter — use screen space intentionally
 - Plan transitions so segments flow naturally into each other
 """
-    text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET))
+    text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET, token_counter=token_counter))
     return VisualDesign.model_validate(json.loads(text))
 
 
@@ -337,6 +347,7 @@ def _compose_single_segment(
     client: anthropic.Anthropic,
     max_retries: int = 2,
     per_segment_seconds: int = 50,
+    token_counter: dict | None = None,
 ) -> dict | None:
     """Compose a single segment's narrative. Returns the segment dict or None."""
 
@@ -424,7 +435,7 @@ Respond with ONLY the JSON object, nothing else."""
     last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
-            text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET, max_tokens=8192))
+            text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET, max_tokens=8192, token_counter=token_counter))
             return json.loads(text)
         except Exception as e:
             last_error = e
@@ -443,6 +454,7 @@ def compose_narrative(
     client: anthropic.Anthropic,
     max_retries: int = 3,
     duration_preset: dict | None = None,
+    token_counter: dict | None = None,
 ) -> Iterator[dict]:
     """Compose all segments in parallel for speed, then assemble the storyboard."""
     from agents.planner import ProSegmentedStoryboard  # lazy import
@@ -464,7 +476,7 @@ def compose_narrative(
             pool.submit(
                 _compose_single_segment,
                 node, i, total, visual_design, analysis, enriched_tree, client,
-                max_retries, per_segment_seconds,
+                max_retries, per_segment_seconds, token_counter,
             ): i
             for i, node in enumerate(enriched_tree.nodes)
         }
@@ -524,7 +536,7 @@ def compose_narrative(
             try:
                 new_seg = _compose_single_segment(
                     node, i, total, visual_design, analysis, enriched_tree,
-                    client, max_retries, per_segment_seconds,
+                    client, max_retries, per_segment_seconds, token_counter,
                 )
                 if new_seg:
                     new_words = len(new_seg.get("audio_script", "").split())
@@ -567,6 +579,7 @@ def run_math2manim_planner(concept: str, max_retries: int = 3, previous_storyboa
     5. Narrative Composition — produce verbose 2000+ token storyboard
     """
     client = anthropic.Anthropic()
+    planner_tokens = new_token_counter()
 
     # Resolve duration preset from questionnaire
     video_length = "Medium (3-5 min)"
@@ -589,7 +602,7 @@ def run_math2manim_planner(concept: str, max_retries: int = 3, previous_storyboa
 
     # ── Stage 1: Concept Analysis ──
     yield {"status": f"Stage 1/5: Analyzing concept (target: {duration_preset['target_seconds']}s, {duration_preset['min_segments']}-{duration_preset['max_segments']} segments)..."}
-    analysis = analyze_concept(enriched_concept, client, duration_preset=duration_preset)
+    analysis = analyze_concept(enriched_concept, client, duration_preset=duration_preset, token_counter=planner_tokens)
     if analysis:
         yield {"status": f"  → Domain: {analysis.domain} | Audience: {analysis.target_audience} | Arc: {analysis.narrative_arc[:60]}..."}
     else:
@@ -598,7 +611,7 @@ def run_math2manim_planner(concept: str, max_retries: int = 3, previous_storyboa
     # ── Stage 2: Prerequisite Discovery ──
     yield {"status": "Stage 2/5: Building reverse knowledge tree (what must be understood first?)..."}
     tree, tree_err = _call_stage_with_retries(
-        build_prerequisite_tree, concept, analysis, client,
+        build_prerequisite_tree, concept, analysis, client, planner_tokens,
         max_retries=max_retries, stage_name="Stage 2 (prerequisite tree)",
     )
     if not tree:
@@ -616,7 +629,7 @@ def run_math2manim_planner(concept: str, max_retries: int = 3, previous_storyboa
     # ── Stage 3: Mathematical Enrichment ──
     yield {"status": f"Stage 3/5: Enriching {len(tree.nodes)} segments with equations, variables, and visual metaphors..."}
     enriched, enrich_err = _call_stage_with_retries(
-        enrich_concept_tree, tree, analysis, client,
+        enrich_concept_tree, tree, analysis, client, planner_tokens,
         max_retries=max_retries, stage_name="Stage 3 (enrichment)",
     )
     if not enriched:
@@ -629,7 +642,7 @@ def run_math2manim_planner(concept: str, max_retries: int = 3, previous_storyboa
     # ── Stage 4: Visual Design ──
     yield {"status": "Stage 4/5: Designing visual identity, color palette, and per-segment layouts..."}
     visual_design, _ = _call_stage_with_retries(
-        design_visuals, enriched, analysis, client,
+        design_visuals, enriched, analysis, client, planner_tokens,
         max_retries=max_retries, stage_name="Stage 4 (visual design)",
     )
     if visual_design:
@@ -639,5 +652,8 @@ def run_math2manim_planner(concept: str, max_retries: int = 3, previous_storyboa
 
     # ── Stage 5: Narrative Composition (parallel) ──
     yield {"status": "Stage 5/5: Composing verbose narrative storyboard (parallel, 2000+ tokens per segment)..."}
-    for update in compose_narrative(enriched, visual_design, analysis, client, max_retries, duration_preset=duration_preset):
+    for update in compose_narrative(enriched, visual_design, analysis, client, max_retries, duration_preset=duration_preset, token_counter=planner_tokens):
+        if update.get("final"):
+            # Attach planner token usage to the final update
+            update["token_usage"] = dict(planner_tokens)
         yield update

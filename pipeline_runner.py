@@ -279,9 +279,6 @@ def main() -> None:
     if max_turns:
         os.environ["PAPER2MANIM_MAX_TURNS"] = str(max_turns)
 
-    accumulated_input_tokens = 0
-    accumulated_output_tokens = 0
-
     try:
         for update in run_segmented_pipeline(
             concept=concept,
@@ -295,9 +292,14 @@ def main() -> None:
         ):
             _emit({"type": "pipeline", "update": update})
 
-            # M13: Only emit token_usage when real data is available.
-            # Heuristic approximations removed — they were wildly inaccurate.
-            # Real usage is emitted by agents when they receive API responses.
+            # Emit real token_usage when the final update includes a token_summary
+            token_summary = update.get("token_summary")
+            if token_summary and update.get("final"):
+                _emit({
+                    "type": "token_usage",
+                    "input": token_summary.get("total_input_tokens", 0),
+                    "output": token_summary.get("total_output_tokens", 0),
+                })
 
     except Exception as e:
         _emit({"type": "error", "message": str(e)})

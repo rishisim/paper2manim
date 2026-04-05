@@ -859,6 +859,7 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
             stages={completedStages}
             toolCallCounts={finalUpdate.tool_call_counts}
             totalToolCalls={finalUpdate.total_tool_calls}
+            tokenSummary={finalUpdate.token_summary}
           />
           {finalUpdate.video_path && (
             <SuccessPanel videoPath={finalUpdate.video_path} />
