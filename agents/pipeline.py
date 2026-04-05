@@ -23,6 +23,7 @@ from typing import Any, Iterator
 from agents.planner import plan_segmented_storyboard, plan_segmented_storyboard_lite
 from agents.planner_math2manim import run_math2manim_planner
 from agents.coder import run_coder_agent
+from agents.stages import Stage
 from utils.tts_engine import generate_voiceover_async
 from utils.media_assembler import stitch_video_and_audio, concatenate_segments
 from utils.parallel_renderer import RenderJob, render_two_pass, render_parallel
@@ -63,7 +64,7 @@ def _drain_status_queue(q: Queue) -> Iterator[dict]:
         seg_status = partial.get("status")
         if seg_id and seg_status:
             yield {
-                "stage": "code",
+                "stage": Stage.CODE,
                 "segment_id": seg_id,
                 "segment_status": seg_status,
                 "status": f"Segment {seg_id}: {seg_status}",
@@ -142,7 +143,7 @@ def run_segmented_pipeline(
 
     # ── Step 1: Planning ──────────────────────────────────────────────
 
-    yield {"stage": "plan", "status": "Starting segmented storyboard planning..."}
+    yield {"stage": Stage.PLAN, "status": "Starting segmented storyboard planning..."}
     plan_start = time.perf_counter()
 
     storyboard = None
@@ -156,15 +157,15 @@ def run_segmented_pipeline(
         planner_kwargs["questionnaire_answers"] = questionnaire_answers
     for update in planner_func(concept, **planner_kwargs):
         if "status" in update:
-            yield {"stage": "plan", "status": update["status"]}
+            yield {"stage": Stage.PLAN, "status": update["status"]}
         if update.get("final"):
             if "error" in update:
-                yield {"stage": "plan", "status": update["error"], "error": update["error"], "final": True}
+                yield {"stage": Stage.PLAN, "status": update["error"], "error": update["error"], "final": True}
                 return
             storyboard = update["storyboard"]
 
     if not storyboard:
-        yield {"stage": "plan", "status": "No storyboard generated.", "error": "Empty planner output.", "final": True}
+        yield {"stage": Stage.PLAN, "status": "No storyboard generated.", "error": "Empty planner output.", "final": True}
         return
 
     segments = storyboard["segments"]
@@ -172,7 +173,7 @@ def run_segmented_pipeline(
     plan_elapsed = time.perf_counter() - plan_start
     timings: list[tuple[str, str, float]] = [("Plan", "ok", plan_elapsed)]
     yield {
-        "stage": "plan",
+        "stage": Stage.PLAN,
         "status": f"Storyboard planned: {num_segments} segments",
         "storyboard": storyboard,
         "num_segments": num_segments,
@@ -189,7 +190,7 @@ def run_segmented_pipeline(
     tts_results: dict[int, dict] = {}
 
     if not skip_audio:
-        yield {"stage": "tts", "status": f"Generating voiceovers for {num_segments} segments in parallel..."}
+        yield {"stage": Stage.TTS, "status": f"Generating voiceovers for {num_segments} segments in parallel..."}
         tts_start = time.perf_counter()
 
         async def _run_all_tts():
@@ -230,11 +231,11 @@ def run_segmented_pipeline(
         tts_ok = sum(1 for r in tts_results.values() if r.get("success"))
         tts_elapsed = time.perf_counter() - tts_start
         timings.append(("Voiceover", "ok" if tts_ok > 0 else "failed", tts_elapsed))
-        yield {"stage": "tts", "status": f"TTS complete: {tts_ok}/{num_segments} succeeded", "tts_results": tts_results}
+        yield {"stage": Stage.TTS, "status": f"TTS complete: {tts_ok}/{num_segments} succeeded", "tts_results": tts_results}
 
     # ── Step 3: Parallel code generation ──────────────────────────────
 
-    yield {"stage": "code", "status": f"Generating Manim code for {num_segments} segments in parallel..."}
+    yield {"stage": Stage.CODE, "status": f"Generating Manim code for {num_segments} segments in parallel..."}
     code_start = time.perf_counter()
 
     code_results: dict[int, dict] = {}
@@ -311,7 +312,7 @@ def run_segmented_pipeline(
 
             segment_done_count += 1
             yield {
-                "stage": "code",
+                "stage": Stage.CODE,
                 "segment_id": seg_id,
                 "segment_phase": "done" if has_code else "failed",
                 "segment_final": True,
@@ -328,7 +329,7 @@ def run_segmented_pipeline(
     code_elapsed = time.perf_counter() - code_start
     timings.append(("Code + Validation", "ok" if code_ok > 0 else "failed", code_elapsed))
     yield {
-        "stage": "code",
+        "stage": Stage.CODE,
         "status": f"Code generation complete: {code_ok}/{num_segments} have videos",
         "code_results": code_results,
     }
@@ -348,7 +349,7 @@ def run_segmented_pipeline(
             few_shot_example = min(successful_codes.values(), key=len)
 
         yield {
-            "stage": "code_retry",
+            "stage": Stage.CODE_RETRY,
             "status": f"Retrying {len(failed_seg_ids)} failed segment(s) in parallel with few-shot reference...",
         }
 
@@ -383,7 +384,7 @@ def run_segmented_pipeline(
                                            artifacts=[last_update.get("video_path", "")])
                     code_ok += 1
                     yield {
-                        "stage": "code_retry",
+                        "stage": Stage.CODE_RETRY,
                         "segment_id": sid,
                         "status": f"Retry Segment {sid}: recovered!",
                         "segment_phase": "done",
@@ -391,7 +392,7 @@ def run_segmented_pipeline(
                     }
                 else:
                     yield {
-                        "stage": "code_retry",
+                        "stage": Stage.CODE_RETRY,
                         "segment_id": sid,
                         "status": f"Retry Segment {sid}: still failed",
                         "segment_phase": "failed",
@@ -400,7 +401,7 @@ def run_segmented_pipeline(
 
     # ── Step 3.5: Parallel HD Rendering ───────────────────────────
     if code_ok > 0:
-        yield {"stage": "render", "status": f"Rendering final HD videos for {code_ok} segments in parallel..."}
+        yield {"stage": Stage.RENDER, "status": f"Rendering final HD videos for {code_ok} segments in parallel..."}
         render_start = time.perf_counter()
         
         hd_jobs = []
@@ -431,7 +432,7 @@ def run_segmented_pipeline(
         render_elapsed = time.perf_counter() - render_start
         timings.append(("HD Render", "ok" if hd_ok == code_ok else "partial", render_elapsed))
         yield {
-            "stage": "render",
+            "stage": Stage.RENDER,
             "status": f"HD Rendering complete: {hd_ok}/{code_ok} succeeded",
             "code_results": code_results,
         }
@@ -441,7 +442,7 @@ def run_segmented_pipeline(
     stitch_errors: list[str] = []
 
     if not skip_audio:
-        yield {"stage": "stitch", "status": "Stitching audio and video per segment..."}
+        yield {"stage": Stage.STITCH, "status": "Stitching audio and video per segment..."}
         stitch_start = time.perf_counter()
 
         stitched_results: dict[int, tuple[str | None, str | None]] = {}  # seg_id -> (path, error)
@@ -481,9 +482,9 @@ def run_segmented_pipeline(
                 seg_id, path, error = fut.result()
                 stitched_results[seg_id] = (path, error)
                 if error:
-                    yield {"stage": "stitch", "status": f"Segment {seg_id}: {error}"}
+                    yield {"stage": Stage.STITCH, "status": f"Segment {seg_id}: {error}"}
                 else:
-                    yield {"stage": "stitch", "status": f"Segment {seg_id} stitched."}
+                    yield {"stage": Stage.STITCH, "status": f"Segment {seg_id} stitched."}
 
         # Reassemble in order
         stitched_paths: list[str] = []
@@ -493,7 +494,7 @@ def run_segmented_pipeline(
             if error:
                 stitch_errors.append(error)
 
-        yield {"stage": "stitch", "status": f"Stitching done. Errors: {len(stitch_errors)}"}
+        yield {"stage": Stage.STITCH, "status": f"Stitching done. Errors: {len(stitch_errors)}"}
 
         stitch_elapsed = time.perf_counter() - stitch_start
         timings.append(("Stitch", "ok" if len(stitch_errors) == 0 else "partial", stitch_elapsed))
@@ -511,7 +512,7 @@ def run_segmented_pipeline(
 
     if not valid_paths:
         yield {
-            "stage": "done",
+            "stage": Stage.DONE,
             "status": "No segments produced a video.",
             "error": "All segments failed.",
             "final": True,
@@ -524,13 +525,13 @@ def run_segmented_pipeline(
         return
 
     final_output = os.path.join(project_dir, f"{slug}.mp4")
-    yield {"stage": "concat", "status": f"Concatenating {len(valid_paths)} segments into final video..."}
+    yield {"stage": Stage.CONCAT, "status": f"Concatenating {len(valid_paths)} segments into final video..."}
     concat_start = time.perf_counter()
 
     concat_result = None
     for update in concatenate_segments(valid_paths, final_output):
         if "status" in update:
-            yield {"stage": "concat", "status": update["status"]}
+            yield {"stage": Stage.CONCAT, "status": update["status"]}
         if update.get("final"):
             concat_result = update
 
@@ -542,7 +543,7 @@ def run_segmented_pipeline(
         mark_project_complete(project_dir)
         _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts)
         yield {
-            "stage": "done",
+            "stage": Stage.DONE,
             "status": "Pipeline complete!",
             "final": True,
             "video_path": final_output,
@@ -559,7 +560,7 @@ def run_segmented_pipeline(
         _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts)
         # If concat fails but we have segments, return the first one
         yield {
-            "stage": "done",
+            "stage": Stage.DONE,
             "status": f"Concatenation failed: {err}",
             "final": True,
             "video_path": valid_paths[0] if valid_paths else None,

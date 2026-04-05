@@ -8,6 +8,8 @@ from typing import Optional, Tuple, Iterator
 from google import genai
 from google.genai import types
 
+from agents.config import GEMINI_TTS
+
 def _looks_like_container_audio(audio_bytes: bytes) -> bool:
     if audio_bytes.startswith((b"RIFF", b"ID3", b"OggS", b"fLaC")):
         return True
@@ -137,7 +139,7 @@ def generate_voiceover(text: str, output_path: str) -> Iterator[dict]:
         yield {"status": "Requesting audio generation from LLM..."}
         # L5: Allow model override via env var so callers aren't broken when the
         # preview model is promoted or renamed (e.g. gemini-2.5-flash-tts).
-        tts_model = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+        tts_model = os.getenv("GEMINI_TTS_MODEL", GEMINI_TTS)
         response = client.models.generate_content(
             model=tts_model,
             contents=f"Speak in a calm, clear, and instructional tone. Maintain a steady, measured pace. Use a thoughtful and inquisitive intonation as if explaining a complex mathematical concept to a curious student. Read the following text: {text}",
