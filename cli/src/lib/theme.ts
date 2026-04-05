@@ -199,6 +199,8 @@ export const segmentPhaseLabels: Record<string, string> = {
   self_correct: 'Self-correcting',
   fix_docs: 'Fix: looking up docs',
   apply_fix: 'Applying fix',
+  verify: 'Verifying code quality',
+  verify_fix: 'Fixing verification issues',
   done: 'Complete',
   failed: 'Failed',
   running: 'Running',
