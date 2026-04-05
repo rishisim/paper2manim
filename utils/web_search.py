@@ -62,6 +62,10 @@ _STRIP_RE = re.compile(r"<[^>]+>")
 _MULTI_SPACE_RE = re.compile(r"\s{2,}")
 
 
+# Cache fetched page text so the same URL is only downloaded once per
+# process.  This avoids redundant HTTP requests when the LLM tool-calls
+# search_web with overlapping result URLs.
+@lru_cache(maxsize=32)
 def _fetch_page_text(url: str, max_chars: int = 8_000) -> str:
     """Fetch a URL and return a rough plain-text version of the page body."""
     try:
@@ -87,6 +91,10 @@ def _fetch_page_text(url: str, max_chars: int = 8_000) -> str:
 
 # ── Public tool callable by the LLM ──────────────────────────────────
 
+# Cache full search results so the same query string is not re-executed
+# within a pipeline run.  maxsize=32 covers typical usage where the LLM
+# issues a handful of distinct queries per code-generation session.
+@lru_cache(maxsize=32)
 def search_web(query: str) -> str:
     """Search the web for Manim code examples, Python libraries, or animation techniques.
 

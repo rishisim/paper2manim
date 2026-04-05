@@ -126,6 +126,36 @@ def _truncate(text: str, max_chars: int = 30_000) -> str:
 # Public API — designed to be registered as a Gemini callable tool
 # ---------------------------------------------------------------------------
 
+# Cache the assembled doc output so repeated look-ups for the same topic
+# skip fuzzy matching and string concatenation.  The underlying _fetch_raw
+# calls are already individually cached, but this avoids redundant work
+# when the same topic is queried multiple times in a single pipeline run.
+@lru_cache(maxsize=64)
+def _fetch_docs_cached(key: str) -> Optional[str]:
+    """Inner cached helper -- returns None when the topic is unknown."""
+    paths = TOPIC_INDEX.get(key)
+
+    # Fuzzy fallback: check if the key is a substring of any topic
+    if paths is None:
+        for registered_key, registered_paths in TOPIC_INDEX.items():
+            if key in registered_key or registered_key in key:
+                paths = registered_paths
+                break
+
+    if paths is None:
+        return None
+
+    parts: list[str] = []
+    for path in paths:
+        content = _fetch_raw(path)
+        if content is not None:
+            parts.append(f"# --- {path} ---\n{content}")
+        else:
+            parts.append(f"# --- {path} --- [fetch failed]")
+
+    return _truncate("\n\n".join(parts))
+
+
 def fetch_manim_docs(topic: str) -> str:
     """Retrieve Manim source documentation for a topic.
 
@@ -141,32 +171,24 @@ def fetch_manim_docs(topic: str) -> str:
         Returns an error message if the topic is unknown or the fetch fails.
     """
     key = topic.strip().lower()
-
-    # Try exact match first
-    paths = TOPIC_INDEX.get(key)
-
-    # Fuzzy fallback: check if the key is a substring of any topic
-    if paths is None:
-        for registered_key, registered_paths in TOPIC_INDEX.items():
-            if key in registered_key or registered_key in key:
-                paths = registered_paths
-                break
-
-    if paths is None:
+    result = _fetch_docs_cached(key)
+    if result is None:
         return (
             f"Unknown topic '{topic}'. "
             f"Available topics: {', '.join(sorted(TOPIC_INDEX.keys()))}"
         )
+    return result
 
-    parts: list[str] = []
-    for path in paths:
-        content = _fetch_raw(path)
-        if content is not None:
-            parts.append(f"# --- {path} ---\n{content}")
-        else:
-            parts.append(f"# --- {path} --- [fetch failed]")
 
-    return _truncate("\n\n".join(parts))
+# Cache normalised file fetches so the same path (after URL cleanup) is
+# fetched and truncated only once per process.
+@lru_cache(maxsize=64)
+def _fetch_file_cached(clean_path: str) -> Optional[str]:
+    """Inner cached helper for fetch_manim_file."""
+    content = _fetch_raw(clean_path)
+    if content is not None:
+        return _truncate(content)
+    return None
 
 
 def fetch_manim_file(file_path: str) -> str:
@@ -184,7 +206,7 @@ def fetch_manim_file(file_path: str) -> str:
     clean = re.sub(r"^(https?://[^/]+/[^/]+/[^/]+/(blob|raw)/[^/]+/)", "", file_path)
     clean = clean.lstrip("/")
 
-    content = _fetch_raw(clean)
-    if content is not None:
-        return _truncate(content)
+    result = _fetch_file_cached(clean)
+    if result is not None:
+        return result
     return f"Could not fetch '{clean}' from the Manim repository."
