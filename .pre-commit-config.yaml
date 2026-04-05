@@ -1,0 +1,15 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.0
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: local
+    hooks:
+      - id: tsc-check
+        name: TypeScript type check
+        entry: bash -c 'cd cli && npx tsc --noEmit'
+        language: system
+        types: [ts, tsx]
+        pass_filenames: false
