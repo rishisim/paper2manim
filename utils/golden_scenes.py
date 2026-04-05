@@ -4,6 +4,8 @@ These are high-quality, 3Blue1Brown-style Manim scenes that demonstrate
 advanced animations, precise timing, and good aesthetic practices.
 """
 
+from functools import lru_cache
+
 GOLDEN_SCENES = {
     "TransformMatchingTex_Example": '''
 class TransformEquation(Scene):
@@ -125,17 +127,20 @@ class MovingProjection(Scene):
 '''
 }
 
+# Cache the full golden-scenes output.  GOLDEN_SCENES is a module-level
+# constant so the formatted string never changes; maxsize=1 is sufficient.
+@lru_cache(maxsize=1)
 def fetch_golden_scenes() -> str:
     """
-    Returns several high-quality 'golden' Manim code examples 
+    Returns several high-quality 'golden' Manim code examples
     to serve as inspiration for animations, timing, and properties.
     """
     out = ["=== GOLDEN REFERENCE SCENES ===\n"]
     out.append("Use these concepts (TransformMatchingTex, LaggedStart, always_redraw, ValueTracker) to make your output fluid and high-quality.\n")
-    
+
     for name, code in GOLDEN_SCENES.items():
         out.append(f"--- Example: {name} ---")
         out.append(code.strip())
         out.append("\n")
-        
+
     return "\n".join(out)
