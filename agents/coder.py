@@ -23,22 +23,17 @@ from utils.manim_docs import (
 from utils.golden_scenes import fetch_golden_scenes
 from utils.web_search import search_web
 from utils.manim_runner import run_manim_code, dry_run_manim_code, extract_class_name, validate_manim_code
+from agents.config import (
+    CLAUDE_OPUS,
+    CLAUDE_SONNET,
+    MAX_TOOL_CALLS_COMPLEX,
+    MAX_TOOL_CALLS_SIMPLE,
+    MAX_TOOL_CALLS_FIX_COMPLEX,
+    MAX_TOOL_CALLS_FIX_SIMPLE,
+)
 
 import logging
 _log = logging.getLogger(__name__)
-
-
-# ── Model configuration ──────────────────────────────────────────────
-
-MODEL_PRO = "claude-opus-4-6"              # complex segments
-MODEL_FAST = "claude-sonnet-4-6"           # simple segments (fast)
-
-MAX_TOOL_CALLS_COMPLEX = 2
-MAX_TOOL_CALLS_SIMPLE = 0
-
-# During self-correction, allow more tool calls so the model can look up docs/examples
-MAX_TOOL_CALLS_FIX_COMPLEX = 3
-MAX_TOOL_CALLS_FIX_SIMPLE = 2
 
 # ── helpers ───────────────────────────────────────────────────────────
 
@@ -224,8 +219,8 @@ Embedded style snippets you can reuse directly:
 def _get_model_for_complexity(complexity: str = "complex") -> str:
     """Return the appropriate model name based on segment complexity."""
     if complexity == "simple":
-        return MODEL_FAST
-    return MODEL_PRO
+        return CLAUDE_SONNET
+    return CLAUDE_OPUS
 
 
 def _build_tools() -> list[dict]:

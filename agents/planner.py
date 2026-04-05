@@ -4,6 +4,8 @@ from typing import Iterator, Literal
 from pydantic import BaseModel, Field, ValidationError
 from google import genai
 
+from agents.config import GEMINI_PLANNER_LITE
+
 
 # ── Legacy single-segment model (still used for backward compat) ──────
 
@@ -121,7 +123,7 @@ Return ONLY the JSON. No markdown formatting.
             yield {"status": f"Drafting storyboard (Attempt {attempt + 1})..."}
 
         response = client.models.generate_content(
-            model="gemini-3.1-pro-preview",
+            model=GEMINI_PLANNER_LITE,
             contents=prompt,
         )
         yield {"status": "Parsing generated content..."}
@@ -212,7 +214,7 @@ Return ONLY the JSON. No markdown formatting.
             yield {"status": f"Drafting segmented storyboard (Attempt {attempt + 1})..."}
 
         response = client.models.generate_content(
-            model="gemini-3.1-pro-preview",
+            model=GEMINI_PLANNER_LITE,
             contents=prompt,
         )
         yield {"status": "Parsing generated content..."}
@@ -303,7 +305,7 @@ Return ONLY the JSON. No markdown formatting.
             yield {"status": f"Drafting PRO structured storyboard (Attempt {attempt + 1})..."}
 
         response = client.models.generate_content(
-            model="gemini-3.1-pro-preview",
+            model=GEMINI_PLANNER_LITE,
             contents=prompt,
         )
         yield {"status": "Parsing generated content..."}

@@ -21,6 +21,8 @@ from typing import Iterator, Literal, List, Dict
 from pydantic import BaseModel, Field
 import anthropic
 
+from agents.config import CLAUDE_OPUS, CLAUDE_SONNET
+
 # ── Duration presets: map user's video-length choice to hard constraints ──
 
 DURATION_PRESETS = {
@@ -102,7 +104,7 @@ def _extract_json_text(raw_text: str) -> str:
     return match.group(0) if match else text
 
 
-def _call_llm(client: anthropic.Anthropic, prompt: str, model: str = "claude-opus-4-6", max_tokens: int = 4096) -> str:
+def _call_llm(client: anthropic.Anthropic, prompt: str, model: str = CLAUDE_OPUS, max_tokens: int = 4096) -> str:
     """Make a single Claude API call and return the raw text.
 
     Args:
@@ -193,7 +195,7 @@ Think about:
 - How to fit this into {min_seg}-{max_seg} segments of ~{preset['per_segment_seconds']}s each?
 """
     try:
-        text = _extract_json_text(_call_llm(client, prompt, model="claude-sonnet-4-6"))
+        text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET))
         analysis = ConceptAnalysis.model_validate(json.loads(text))
         # Hard clamp segment count to preset range
         analysis.suggested_segment_count = max(min_seg, min(max_seg, analysis.suggested_segment_count))
@@ -238,7 +240,7 @@ Output as JSON:
   ]
 }}
 """
-    text = _extract_json_text(_call_llm(client, prompt, model="claude-sonnet-4-6"))
+    text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET))
     return PrerequisiteTree.model_validate(json.loads(text))
 
 
@@ -276,7 +278,7 @@ Output as JSON:
   ]
 }}
 """
-    text = _extract_json_text(_call_llm(client, prompt, model="claude-sonnet-4-6"))
+    text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET))
     return EnrichedTree.model_validate(json.loads(text))
 
 
@@ -319,7 +321,7 @@ Design rules:
 - Design layouts that avoid clutter — use screen space intentionally
 - Plan transitions so segments flow naturally into each other
 """
-    text = _extract_json_text(_call_llm(client, prompt, model="claude-sonnet-4-6"))
+    text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET))
     return VisualDesign.model_validate(json.loads(text))
 
 
@@ -422,7 +424,7 @@ Respond with ONLY the JSON object, nothing else."""
     last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
-            text = _extract_json_text(_call_llm(client, prompt, model="claude-sonnet-4-6", max_tokens=8192))
+            text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET, max_tokens=8192))
             return json.loads(text)
         except Exception as e:
             last_error = e
