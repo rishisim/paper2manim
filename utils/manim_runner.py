@@ -1,11 +1,14 @@
+import ast
+import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import json
-import ast
+
+logger = logging.getLogger(__name__)
 
 
 def _find_manim_binary() -> str:
@@ -122,7 +125,8 @@ def dry_run_manim_code(code: str, class_name: str, timeout_seconds: int = 0) -> 
                 ),
                 "error_type": "timeout",
             }
-        except Exception as e:
+        except OSError as e:
+            logger.error("Dry run failed to execute manim: %s", e)
             return {"success": False, "video_path": None, "error": str(e)}
 
 
@@ -195,7 +199,8 @@ def run_manim_code(code: str, class_name: str, quality_flag: str = "-ql", timeou
                 "timeout_seconds": timeout_seconds,
                 "quality_flag": quality_flag,
             }
-        except Exception as e:
+        except OSError as e:
+            logger.error("Manim render failed to execute: %s", e)
             return {"success": False, "video_path": None, "error": str(e)}
 
 def extract_class_name(code: str) -> str:
@@ -222,8 +227,8 @@ def extract_class_name(code: str) -> str:
             return scene_classes[0]
         if other_classes:
             return other_classes[0]
-    except SyntaxError:
-        pass
+    except SyntaxError as e:
+        logger.warning("Could not parse code to extract class name (line %s): %s", e.lineno, e.msg)
     return "GeneratedScene"
 
 

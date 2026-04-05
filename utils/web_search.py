@@ -12,6 +12,7 @@ library APIs, or animation techniques while generating Manim scripts.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import textwrap
@@ -19,6 +20,8 @@ from functools import lru_cache
 from typing import Optional
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 _TIMEOUT = 10  # seconds per HTTP request
 
@@ -52,7 +55,11 @@ def _google_search(query: str, num_results: int = 5) -> list[dict]:
             }
             for item in items[:num_results]
         ]
-    except Exception:
+    except requests.RequestException as e:
+        logger.warning("Google CSE search failed: %s", e)
+        return []
+    except (KeyError, ValueError) as e:
+        logger.warning("Failed to parse Google CSE response: %s", e)
         return []
 
 
@@ -81,7 +88,8 @@ def _fetch_page_text(url: str, max_chars: int = 8_000) -> str:
         text = _MULTI_SPACE_RE.sub(" ", text).strip()
 
         return text[:max_chars]
-    except Exception as exc:
+    except requests.RequestException as exc:
+        logger.warning("Failed to fetch page %s: %s", url, exc)
         return f"[Failed to fetch {url}: {exc}]"
 
 
@@ -177,8 +185,10 @@ def _fallback_search(query: str) -> list[dict]:
                         "snippet": snippet.strip()[:300] or item.get("path", ""),
                     }
                 )
-    except Exception:
-        pass
+    except requests.RequestException as e:
+        logger.warning("GitHub code search failed: %s", e)
+    except (KeyError, ValueError) as e:
+        logger.warning("Failed to parse GitHub search response: %s", e)
 
     # Try StackOverflow tagged search
     try:
@@ -197,7 +207,9 @@ def _fallback_search(query: str) -> list[dict]:
                         "snippet": _STRIP_RE.sub("", item.get("body", ""))[:300],
                     }
                 )
-    except Exception:
-        pass
+    except requests.RequestException as e:
+        logger.warning("StackOverflow search failed: %s", e)
+    except (KeyError, ValueError) as e:
+        logger.warning("Failed to parse StackOverflow response: %s", e)
 
     return results

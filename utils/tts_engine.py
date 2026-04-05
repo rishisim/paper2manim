@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import logging
 import os
 import re
 import subprocess
@@ -7,6 +8,8 @@ import tempfile
 from typing import Optional, Tuple, Iterator
 from google import genai
 from google.genai import types
+
+logger = logging.getLogger(__name__)
 
 def _looks_like_container_audio(audio_bytes: bytes) -> bool:
     if audio_bytes.startswith((b"RIFF", b"ID3", b"OggS", b"fLaC")):
@@ -26,7 +29,8 @@ def _run_ffmpeg(cmd: list[str], timeout: int = 60) -> Tuple[bool, str]:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return False, f"ffmpeg timed out after {timeout}s"
-    except Exception as exc:
+    except OSError as exc:
+        logger.warning("ffmpeg process error: %s", exc)
         return False, str(exc)
     if result.returncode == 0:
         return True, ""
@@ -42,7 +46,11 @@ def _is_valid_audio_file(path: str) -> bool:
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except Exception:
+    except subprocess.TimeoutExpired:
+        logger.warning("ffprobe timed out validating audio file: %s", path)
+        return False
+    except OSError as e:
+        logger.warning("ffprobe failed for %s: %s", path, e)
         return False
     return result.returncode == 0 and "codec_type=audio" in result.stdout
 
@@ -121,8 +129,12 @@ def _get_audio_duration(path: str) -> Optional[float]:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
             return float(result.stdout.strip())
-    except Exception:
-        pass
+    except subprocess.TimeoutExpired:
+        logger.warning("ffprobe timed out reading duration for: %s", path)
+    except ValueError as e:
+        logger.warning("Could not parse audio duration for %s: %s", path, e)
+    except OSError as e:
+        logger.warning("ffprobe failed for %s: %s", path, e)
     return None
 
 def generate_voiceover(text: str, output_path: str) -> Iterator[dict]:
