@@ -10,31 +10,30 @@ Uses Claude Opus 4.6 (Anthropic) for code generation.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from typing import Iterator
 
 import anthropic
 
+from agents.config import (
+    CLAUDE_OPUS,
+    CLAUDE_SONNET,
+    MAX_TOOL_CALLS_COMPLEX,
+    MAX_TOOL_CALLS_FIX_COMPLEX,
+    MAX_TOOL_CALLS_FIX_SIMPLE,
+    MAX_TOOL_CALLS_SIMPLE,
+    new_token_counter,
+)
+from utils.golden_scenes import fetch_golden_scenes
 from utils.manim_docs import (
     fetch_manim_docs,
     fetch_manim_file,
     get_topic_index_description,
 )
-from utils.golden_scenes import fetch_golden_scenes
+from utils.manim_runner import dry_run_manim_code, extract_class_name, validate_manim_code
 from utils.web_search import search_web
-from utils.manim_runner import run_manim_code, dry_run_manim_code, extract_class_name, validate_manim_code
-from agents.config import (
-    CLAUDE_OPUS,
-    CLAUDE_SONNET,
-    MAX_TOOL_CALLS_COMPLEX,
-    MAX_TOOL_CALLS_SIMPLE,
-    MAX_TOOL_CALLS_FIX_COMPLEX,
-    MAX_TOOL_CALLS_FIX_SIMPLE,
-    new_token_counter,
-    estimate_cost,
-)
 
-import logging
 _log = logging.getLogger(__name__)
 
 # ── helpers ───────────────────────────────────────────────────────────

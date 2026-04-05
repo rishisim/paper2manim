@@ -1,10 +1,9 @@
 import json
 import logging
 import os
-import sys
 import tempfile
 import time
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +15,7 @@ def _get_state_path(output_dir: str) -> str:
 def create_project(output_dir: str, concept: str, concept_slug: str, total_segments: int = 1) -> dict[str, Any]:
     """Creates a new project state file in the output directory."""
     os.makedirs(output_dir, exist_ok=True)
-    
+
     # Initialize default state structure
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     state = {
@@ -29,7 +28,7 @@ def create_project(output_dir: str, concept: str, concept_slug: str, total_segme
         "stages": {},
         "segments": {},  # per-segment tracking
     }
-    
+
     save_project(output_dir, state)
     return state
 
@@ -39,7 +38,7 @@ def load_project(output_dir: str) -> dict[str, Any]:
     state_path = _get_state_path(output_dir)
     if not os.path.exists(state_path):
         return None
-        
+
     try:
         with open(state_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -75,7 +74,7 @@ def mark_stage_done(output_dir: str, stage_name: str, artifacts: list[str] = Non
     state = load_project(output_dir)
     if not state:
         raise ValueError(f"No project state found in {output_dir}")
-        
+
     state["stages"][stage_name] = {
         "done": True,
         "artifacts": artifacts or []
@@ -144,7 +143,7 @@ def mark_project_complete(output_dir: str) -> dict[str, Any]:
     state = load_project(output_dir)
     if not state:
         raise ValueError(f"No project state found in {output_dir}")
-    
+
     state["status"] = "completed"
     save_project(output_dir, state)
     return state
@@ -308,7 +307,7 @@ def list_all_projects(base_dir: str = "output") -> list[tuple[str, dict[str, Any
     """
     if not os.path.exists(base_dir):
         return []
-        
+
     projects = []
     # Only scan immediate subdirectories
     for d in os.listdir(base_dir):
@@ -317,7 +316,7 @@ def list_all_projects(base_dir: str = "output") -> list[tuple[str, dict[str, Any
             state = load_project(full_dir)
             if state and not _is_placeholder_project(full_dir, state):
                 projects.append((full_dir, state))
-                
+
     # Sort by updated_at descending (newest first)
     projects.sort(key=lambda x: x[1].get("updated_at", ""), reverse=True)
     return projects

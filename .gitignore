@@ -9,3 +9,4 @@ dist/
 .DS_Store
 mcp/node_modules/
 .mcp_test_scene.py
+media/

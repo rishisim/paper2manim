@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 
 import anthropic
 
-
 # ── Result types ────────────────────────────────────────────────────
 
 @dataclass
@@ -104,7 +103,7 @@ def _parse_json_response(raw: str) -> dict:
 
 def _get_code_tail(code: str, n_lines: int = 40) -> str:
     """Get the last N non-empty lines of code."""
-    lines = [l for l in code.split("\n") if l.strip()]
+    lines = [line for line in code.split("\n") if line.strip()]
     return "\n".join(lines[-n_lines:])
 
 

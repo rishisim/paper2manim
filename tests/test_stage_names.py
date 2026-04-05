@@ -6,12 +6,10 @@ that is not in the canonical list, this test will flag it.
 
 from __future__ import annotations
 
-import ast
 import os
 import re
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Canonical stage names used in the pipeline

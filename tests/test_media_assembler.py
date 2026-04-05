@@ -8,14 +8,11 @@ from __future__ import annotations
 import os
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from utils.media_assembler import (
+    _size_based_timeout,
     concatenate_segments,
     stitch_video_and_audio,
-    _size_based_timeout,
 )
-
 
 # ---------------------------------------------------------------------------
 # _size_based_timeout

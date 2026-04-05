@@ -7,13 +7,22 @@ themes, session history, etc.) requires the TypeScript Ink CLI.
 """
 from __future__ import annotations
 
-import argparse, os, re, signal, sys, time
+import argparse
+import os
+import re
+import signal
+import sys
+import time
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import (
-    BarColumn, Progress, SpinnerColumn, TaskProgressColumn,
-    TextColumn, TimeElapsedColumn,
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
 )
 
 # -- .env loading (same search order as pipeline_runner.py) -----------------
@@ -144,7 +153,7 @@ def _run_pipeline(concept: str, args: argparse.Namespace) -> None:
 
     console.print(f"\n  [dim]Concept:[/dim]  [bold]{concept}[/bold]")
     console.print(f"  [dim]Quality:[/dim]  {args.quality.title()}")
-    console.print(f"  [dim]Answers:[/dim]  (auto-answered in fallback mode)\n")
+    console.print("  [dim]Answers:[/dim]  (auto-answered in fallback mode)\n")
 
     stages: list[tuple[str, str, float]] = []
     last_stage: str | None = None

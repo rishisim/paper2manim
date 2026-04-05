@@ -1,5 +1,4 @@
 import ast
-import json
 import logging
 import os
 import re
@@ -155,7 +154,7 @@ def run_manim_code(code: str, class_name: str, quality_flag: str = "-ql", timeou
 
         try:
             env = _make_manim_env()
-                
+
             result = subprocess.run(
                 cmd,
                 cwd=temp_dir,
@@ -171,7 +170,7 @@ def run_manim_code(code: str, class_name: str, quality_flag: str = "-ql", timeou
                         if file.endswith(f"{class_name}.mp4"):
                             video_path = os.path.join(root, file)
                             break
-                            
+
                 if video_path:
                     if output_dir:
                         dest_dir = os.path.abspath(output_dir)
@@ -180,14 +179,14 @@ def run_manim_code(code: str, class_name: str, quality_flag: str = "-ql", timeou
                     os.makedirs(dest_dir, exist_ok=True)
                     final_path = os.path.join(dest_dir, f"{class_name}_render.mp4")
                     shutil.copy2(video_path, final_path)
-                    
+
                     return {"success": True, "video_path": final_path, "error": None}
                 else:
                     return {"success": False, "video_path": None, "error": "Video file not found after successful execution.\n" + result.stdout}
             else:
                 return {"success": False, "video_path": None, "error": result.stderr or result.stdout}
-                
-        except subprocess.TimeoutExpired as e:
+
+        except subprocess.TimeoutExpired:
             return {
                 "success": False,
                 "video_path": None,
@@ -314,10 +313,11 @@ def validate_manim_code(code: str) -> dict:
     matches = _SINGLE_BACKSLASH_RE.findall(code)
     if matches:
         unique = sorted(set(matches))[:5]
+        bs = "\\\\"
+        joined = ", ".join(bs + m for m in unique)
         warnings.append(
-            f"Possible single-backslash LaTeX commands detected: "
-            f"{', '.join('\\\\' + m for m in unique)}. "
-            f"Use double backslashes (e.g. \\\\frac, \\\\int) in raw strings."
+            f"Possible single-backslash LaTeX commands detected: {joined}. "
+            "Use double backslashes (e.g. \\\\frac, \\\\int) in raw strings."
         )
 
     return {"errors": errors, "warnings": warnings}

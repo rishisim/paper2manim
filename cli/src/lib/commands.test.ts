@@ -26,6 +26,7 @@ function mockDispatch(): AppDispatch {
     killPipeline: vi.fn(),
     exit: vi.fn(),
     showMessage: vi.fn(),
+    setPromptText: vi.fn(),
   };
 }
 

@@ -21,25 +21,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Empty, Queue
 from typing import Any, Iterator
 
-from agents.planner import plan_segmented_storyboard, plan_segmented_storyboard_lite
+from agents.coder import run_coder_agent
+from agents.config import CLAUDE_OPUS, CLAUDE_SONNET, estimate_cost, merge_token_usage, new_token_counter
+from agents.planner import plan_segmented_storyboard_lite
 from agents.planner_math2manim import run_math2manim_planner
-from agents.coder import run_coder_agent, fix_manim_script
-from agents.validation import validate_concept
-from agents.stages import Stage
-from agents.config import new_token_counter, merge_token_usage, estimate_cost, CLAUDE_OPUS, CLAUDE_SONNET
-from utils.tts_engine import generate_voiceover_async
-from utils.media_assembler import stitch_video_and_audio, concatenate_segments
+from utils.media_assembler import concatenate_segments, stitch_video_and_audio
 from utils.parallel_renderer import RenderJob, render_parallel
 from utils.project_state import (
     create_project,
-    load_project,
-    save_project,
-    mark_stage_done,
-    mark_segment_stage,
-    mark_project_complete,
-    is_stage_done,
     is_segment_stage_done,
+    is_stage_done,
+    load_project,
+    mark_project_complete,
+    mark_segment_stage,
+    mark_stage_done,
 )
+from utils.tts_engine import generate_voiceover_async
 
 
 def _format_duration(seconds: float) -> str:
@@ -941,7 +938,7 @@ def run_segmented_pipeline(
         _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=token_summary)
         yield {
             "stage": "concat",
-            "status": f"Skipping (already completed) — final video exists",
+            "status": "Skipping (already completed) — final video exists",
             "skipped": True,
         }
         yield {

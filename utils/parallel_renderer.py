@@ -11,10 +11,10 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from typing import Callable, Optional
+from dataclasses import dataclass
+from typing import Callable
 
-from utils.manim_runner import run_manim_code, extract_class_name
+from utils.manim_runner import extract_class_name, run_manim_code
 
 logger = logging.getLogger(__name__)
 

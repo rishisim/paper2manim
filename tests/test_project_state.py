@@ -8,19 +8,18 @@ import os
 import pytest
 
 from utils.project_state import (
-    create_project,
-    load_project,
-    save_project,
-    mark_stage_done,
-    mark_segment_stage,
-    mark_project_complete,
-    is_stage_done,
-    is_segment_stage_done,
-    get_segment_progress,
-    calculate_progress,
     _get_state_path,
+    calculate_progress,
+    create_project,
+    get_segment_progress,
+    is_segment_stage_done,
+    is_stage_done,
+    load_project,
+    mark_project_complete,
+    mark_segment_stage,
+    mark_stage_done,
+    save_project,
 )
-
 
 # ---------------------------------------------------------------------------
 # Create / Save / Load round-trip
@@ -68,7 +67,7 @@ def test_load_project_corrupt_json_returns_none(tmp_path):
 
 def test_save_project_updates_timestamp(tmp_path):
     state = create_project(str(tmp_path), "Eigen", "eigen")
-    original_ts = state["updated_at"]
+    state["updated_at"]
 
     # Mutate and save again
     state["status"] = "completed"

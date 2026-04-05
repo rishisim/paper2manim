@@ -92,9 +92,11 @@ def _read_stdin_line(timeout_seconds: float = 30.0) -> str | None:
 def _handle_workspace_command(args: dict) -> None:
     """Handle workspace management commands (list, delete, cleanup)."""
     from utils.project_state import (
-        list_all_projects, delete_project,
-        list_placeholder_projects, cleanup_placeholder_projects,
-        calculate_progress, load_project,
+        calculate_progress,
+        cleanup_placeholder_projects,
+        delete_project,
+        list_all_projects,
+        list_placeholder_projects,
     )
 
     action = args.get("workspace_action", "list")

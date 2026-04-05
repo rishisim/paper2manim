@@ -1,11 +1,11 @@
 import json
 import re
 from typing import Iterator, Literal
-from pydantic import BaseModel, Field, ValidationError
+
 from google import genai
+from pydantic import BaseModel, Field, ValidationError
 
 from agents.config import GEMINI_PLANNER_LITE
-
 
 # ── Legacy single-segment model (still used for backward compat) ──────
 
@@ -45,18 +45,18 @@ class SegmentedStoryboardLite(BaseModel):
 class ProSegment(BaseModel):
     id: int = Field(ge=1)
     title: str = Field(description="e.g. 'Prerequisite: The Dot Product' or 'Core Proof'")
-    
+
     # Mathematical Rigor
     equations_latex: list[str] = Field(description="Raw LaTeX strings (double backslashes)")
     variable_definitions: dict[str, str] = Field(description="Maps LaTeX symbols to physical/math meanings")
-    
+
     # Visual Design
     elements: list[str] = Field(description="Visual objects like 'graph', 'axes', 'triangle'")
     element_colors: dict[str, str] = Field(description="Map elements/variables to specific palette colors")
     animations: list[str] = Field(description="Specific Manim animations (e.g., TransformMatchingTex)")
     layout_instructions: str = Field(description="Spatial arrangement on screen")
     visual_instructions: str = Field(description="Very specific, step-by-step chronological instructions for how the scene should unfold visually. Tie all the elements and animations together.")
-    
+
     # Timing and Audio
     audio_script: str = Field()
     duration_hint_seconds: int = Field(description="Minimum time needed to digest the visuals")

@@ -7,15 +7,13 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-
 # ---------------------------------------------------------------------------
 # Model configuration
 # ---------------------------------------------------------------------------
 
 def test_model_constants_exist():
-    from agents.config import CLAUDE_OPUS as MODEL_PRO, CLAUDE_SONNET as MODEL_FAST
+    from agents.config import CLAUDE_OPUS as MODEL_PRO
+    from agents.config import CLAUDE_SONNET as MODEL_FAST
 
     assert isinstance(MODEL_PRO, str) and len(MODEL_PRO) > 0
     assert isinstance(MODEL_FAST, str) and len(MODEL_FAST) > 0
@@ -174,7 +172,7 @@ def _make_mock_response(text: str = "from manim import *\nclass S(Scene):\n  def
     return resp
 
 
-@patch("agents.coder.run_manim_code")
+@patch("agents.coder.dry_run_manim_code")
 @patch("agents.coder.anthropic")
 def test_run_coder_agent_yields_status_dicts(mock_anthropic_mod, mock_run_manim):
     """run_coder_agent should yield dicts with 'status' and end with 'final'."""
@@ -204,7 +202,7 @@ def test_run_coder_agent_yields_status_dicts(mock_anthropic_mod, mock_run_manim)
     assert final.get("final") is True
 
 
-@patch("agents.coder.run_manim_code")
+@patch("agents.coder.dry_run_manim_code")
 @patch("agents.coder.anthropic")
 def test_run_coder_agent_includes_tool_call_counts(mock_anthropic_mod, mock_run_manim):
     from agents.coder import run_coder_agent

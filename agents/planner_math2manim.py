@@ -17,11 +17,12 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Iterator, Literal, List, Dict
-from pydantic import BaseModel, Field
-import anthropic
+from typing import Dict, Iterator, List, Literal
 
-from agents.config import CLAUDE_OPUS, CLAUDE_SONNET, new_token_counter, merge_token_usage, estimate_cost
+import anthropic
+from pydantic import BaseModel, Field
+
+from agents.config import CLAUDE_OPUS, CLAUDE_SONNET, new_token_counter
 
 # ── Duration presets: map user's video-length choice to hard constraints ──
 

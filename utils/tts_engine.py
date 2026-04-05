@@ -5,7 +5,8 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import Optional, Tuple, Iterator
+from typing import Iterator, Optional, Tuple
+
 from google import genai
 from google.genai import types
 
@@ -218,7 +219,7 @@ def generate_voiceover(text: str, output_path: str) -> Iterator[dict]:
         if not _is_valid_audio_file(output_path):
             yield {"final": True, "success": False, "audio_path": None, "mime_type": mime_type, "error": "Generated audio file is invalid after normalization."}
             return
-            
+
         duration = _get_audio_duration(output_path)
 
         yield {"final": True, "success": True, "audio_path": output_path, "mime_type": mime_type, "duration": duration, "error": None}
