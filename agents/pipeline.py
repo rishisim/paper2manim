@@ -1,13 +1,12 @@
 """
 Segmented video pipeline orchestrator.
 
-Coordinates the full parallel pipeline:
+Coordinates the full pipelined-parallel pipeline:
   1. Planner  → segmented storyboard
-  2. TTS      → per-segment voiceover   (async, parallel)
-  3. Coder    → per-segment Manim code  (async, parallel)
-  4. Renderer → per-segment Manim video (multiprocessing, parallel)
-  5. Stitcher → per-segment audio+video (sequential, fast)
-  6. Concat   → final output video      (ffmpeg concat)
+  2. Per-segment pipeline (all segments concurrent):
+       TTS → Code → HD Render → Stitch
+  3. Retry    → failed segments with few-shot + escalation
+  4. Concat   → final output video      (ffmpeg concat)
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Empty, Queue
@@ -106,22 +106,18 @@ def _load_storyboard(project_dir: str) -> dict | None:
 
 
 def _drain_status_queue(q: Queue) -> Iterator[dict]:
+    """Drain all pending messages from the shared status queue.
+
+    Workers put pre-formatted dicts with ``stage``, ``segment_id``,
+    ``status``, etc.  We yield them as-is for the caller to forward.
+    """
     while True:
         try:
-            partial = q.get_nowait()
+            msg = q.get_nowait()
         except Empty:
             break
-        seg_id = partial.get("segment_id")
-        seg_status = partial.get("status")
-        if seg_id and seg_status:
-            yield {
-                "stage": "code",
-                "segment_id": seg_id,
-                "segment_status": seg_status,
-                "status": f"Segment {seg_id}: {seg_status}",
-                "segment_phase": partial.get("phase", "running"),
-                "segment_final": bool(partial.get("final")),
-            }
+        if msg.get("segment_id") is not None and msg.get("status"):
+            yield msg
 
 
 def _save_pipeline_summary(
@@ -369,120 +365,8 @@ def run_segmented_pipeline(
         # Reload state after marking stage done
         state = load_project(project_dir)
 
-    # ── Step 2: Parallel TTS ──────────────────────────────────────────
-
-    tts_results: dict[int, dict] = {}
-    tts_all_cached = False
-
-    if not skip_audio:
-        # Check if TTS is fully cached from a previous run
-        if resumed and state and is_stage_done(state, "tts"):
-            # Verify that all audio files actually exist on disk
-            all_audio_present = True
-            for seg in segments:
-                seg_id = seg["id"]
-                audio_path = os.path.join(project_dir, f"segment_{seg_id}_audio.wav")
-                if os.path.isfile(audio_path):
-                    tts_results[seg_id] = {"success": True, "audio_path": audio_path, "duration": 0.0}
-                elif is_segment_stage_done(state, seg_id, "tts"):
-                    # Marked done but file missing — check artifacts in state
-                    seg_info = state.get("segments", {}).get(str(seg_id), {}).get("tts", {})
-                    artifacts = seg_info.get("artifacts", [])
-                    found = any(os.path.isfile(a) for a in artifacts if a)
-                    if found:
-                        actual_path = next(a for a in artifacts if a and os.path.isfile(a))
-                        tts_results[seg_id] = {"success": True, "audio_path": actual_path, "duration": 0.0}
-                    else:
-                        all_audio_present = False
-                        break
-                else:
-                    all_audio_present = False
-                    break
-
-            if all_audio_present:
-                tts_all_cached = True
-                tts_ok = len(tts_results)
-                timings.append(("Voiceover", "skipped", 0.0))
-                yield {
-                    "stage": "tts",
-                    "status": f"Skipping (already completed) — {tts_ok}/{num_segments} audio files cached",
-                    "skipped": True,
-                    "tts_results": tts_results,
-                }
-
-        if not tts_all_cached:
-            # Determine which segments need TTS (skip individually completed ones)
-            segments_needing_tts = []
-            for seg in segments:
-                seg_id = seg["id"]
-                audio_path = os.path.join(project_dir, f"segment_{seg_id}_audio.wav")
-                if resumed and state and is_segment_stage_done(state, seg_id, "tts") and os.path.isfile(audio_path):
-                    tts_results[seg_id] = {"success": True, "audio_path": audio_path, "duration": 0.0}
-                else:
-                    segments_needing_tts.append(seg)
-
-            cached_count = len(tts_results)
-            remaining = len(segments_needing_tts)
-            if cached_count > 0:
-                yield {"stage": "tts", "status": f"Generating voiceovers: {cached_count} cached, {remaining} remaining..."}
-            else:
-                yield {"stage": "tts", "status": f"Generating voiceovers for {num_segments} segments in parallel..."}
-            tts_start = time.perf_counter()
-
-            if segments_needing_tts:
-                async def _run_all_tts():
-                    tasks = []
-                    for seg in segments_needing_tts:
-                        seg_id = seg["id"]
-                        audio_path = os.path.join(project_dir, f"segment_{seg_id}_audio.wav")
-                        coro = generate_voiceover_async(seg["audio_script"], audio_path)
-                        if tts_timeout_seconds > 0:
-                            coro = asyncio.wait_for(coro, timeout=tts_timeout_seconds)
-                        tasks.append(coro)
-                    return await asyncio.gather(*tasks, return_exceptions=True)
-
-                # C10: asyncio.run() crashes if an event loop is already running (e.g. in
-                # Jupyter / Streamlit). Use get_event_loop().run_until_complete() which
-                # works in both contexts.
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                raw_tts = loop.run_until_complete(_run_all_tts())
-
-                for seg, result in zip(segments_needing_tts, raw_tts):
-                    seg_id = seg["id"]
-                    if isinstance(result, Exception):
-                        tts_results[seg_id] = {"success": False, "error": str(result), "audio_path": None, "duration": 0}
-                        mark_segment_stage(project_dir, seg_id, "tts", done=False, error=str(result))
-                    else:
-                        tts_results[seg_id] = result
-                        if result.get("success"):
-                            tts_api_calls += 1
-                            mark_segment_stage(project_dir, seg_id, "tts", done=True,
-                                               artifacts=[result.get("audio_path", "")])
-                        else:
-                            mark_segment_stage(project_dir, seg_id, "tts", done=False,
-                                               error=result.get("error", ""))
-
-            tts_ok = sum(1 for r in tts_results.values() if r.get("success"))
-            tts_elapsed = time.perf_counter() - tts_start
-            timings.append(("Voiceover", "ok" if tts_ok > 0 else "failed", tts_elapsed))
-
-            # Mark the whole TTS stage done if all segments succeeded
-            if tts_ok == num_segments:
-                mark_stage_done(project_dir, "tts", artifacts=[
-                    tts_results[seg["id"]].get("audio_path", "") for seg in segments
-                    if tts_results.get(seg["id"], {}).get("success")
-                ])
-                state = load_project(project_dir)
-
-            yield {"stage": "tts", "status": f"TTS complete: {tts_ok}/{num_segments} succeeded", "tts_results": tts_results}
-
-    # ── Step 2.5: Complexity downgrade heuristic ────────────────────
-    # Downgrade "complex" → "medium" for segments that look straightforward,
-    # allowing them to use Sonnet instead of Opus (cheaper).
+    # ── Step 2: Complexity downgrade heuristic ────────────────────────
+    # Moved before the parallel block — only reads segment data.
 
     _3D_KEYWORDS = {"threedscene", "3d", "surface", "camera_rotation", "set_camera_orientation"}
     _UPDATER_KEYWORDS = {"always_redraw", "valuetracker", "updater", "add_updater"}
@@ -498,10 +382,22 @@ def run_segmented_pipeline(
         if not has_3d and not has_updaters and len(eqs) <= 2 and len(anims) <= 5:
             seg["complexity"] = "medium"
 
-    # ── Step 3: Parallel code generation ──────────────────────────────
+    # ── Step 3: Pipelined-parallel per-segment processing ─────────────
+    #
+    # Each segment runs through TTS → Code → HD Render → Stitch inside
+    # its own thread.  All segments execute concurrently.  This replaces
+    # the old sequential-stage approach where ALL TTS had to finish
+    # before ANY code generation could start, etc.
 
+    tts_results: dict[int, dict] = {}
     code_results: dict[int, dict] = {}
     tool_call_counts: dict[str, int] = {}
+    stitch_errors: list[str] = []
+
+    theme_name = storyboard.get("theme_name", "")
+    color_palette = storyboard.get("color_palette", {})
+    status_queue: Queue[dict] = Queue()
+    _state_lock = threading.Lock()
 
     def _merge_tool_calls(counts: dict[str, int] | None) -> None:
         if not counts:
@@ -511,171 +407,381 @@ def run_segmented_pipeline(
                 continue
             tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + count
 
-    theme_name = storyboard.get("theme_name", "")
-    color_palette = storyboard.get("color_palette", {})
-    status_queue: Queue[dict] = Queue()
+    # ── Per-segment pipeline worker ──────────────────────────────────
 
-    # Identify segments that already have code+video from a previous run
-    segments_needing_code: list[dict] = []
-    for seg in segments:
+    def _run_segment_pipeline(seg: dict, few_shot_example: str = "") -> dict:
+        """Run the full pipeline for one segment: TTS → Code → HD Render → Stitch.
+
+        Returns a result dict with tts_result, code_result, stitch_path, etc.
+        Communicates progress via the shared *status_queue*.
+        """
         seg_id = seg["id"]
+        seg_output_dir = os.path.join(project_dir, f"segment_{seg_id}")
+        os.makedirs(seg_output_dir, exist_ok=True)
+
+        result: dict[str, Any] = {
+            "segment_id": seg_id,
+            "tts_result": {"success": False, "audio_path": None, "duration": 0.0},
+            "code_result": {"success": False},
+            "stitch_path": None,
+            "stitch_error": None,
+            "token_usage": None,
+            "tool_call_counts": None,
+            "tts_api_call": False,
+        }
+
+        # ── Phase 1: TTS ──────────────────────────────────────────
+        if not skip_audio:
+            audio_path = os.path.join(project_dir, f"segment_{seg_id}_audio.wav")
+
+            # Check per-segment TTS cache
+            cached_tts = False
+            if resumed and state and is_segment_stage_done(state, seg_id, "tts"):
+                if os.path.isfile(audio_path):
+                    result["tts_result"] = {"success": True, "audio_path": audio_path, "duration": 0.0}
+                    cached_tts = True
+                else:
+                    seg_info = state.get("segments", {}).get(str(seg_id), {}).get("tts", {})
+                    found = next((a for a in seg_info.get("artifacts", []) if a and os.path.isfile(a)), None)
+                    if found:
+                        result["tts_result"] = {"success": True, "audio_path": found, "duration": 0.0}
+                        cached_tts = True
+
+            if cached_tts:
+                status_queue.put({
+                    "stage": "tts", "segment_id": seg_id,
+                    "status": f"Segment {seg_id}: TTS cached",
+                    "segment_phase": "done", "segment_final": True,
+                    "skipped": True,
+                })
+            else:
+                status_queue.put({
+                    "stage": "tts", "segment_id": seg_id,
+                    "status": f"Segment {seg_id}: generating voiceover...",
+                    "segment_phase": "running", "segment_final": False,
+                })
+                loop = asyncio.new_event_loop()
+                try:
+                    coro = generate_voiceover_async(seg["audio_script"], audio_path)
+                    if tts_timeout_seconds > 0:
+                        coro = asyncio.wait_for(coro, timeout=tts_timeout_seconds)
+                    tts_r = loop.run_until_complete(coro)
+                    result["tts_result"] = tts_r
+                    if tts_r.get("success"):
+                        result["tts_api_call"] = True
+                        with _state_lock:
+                            mark_segment_stage(project_dir, seg_id, "tts", done=True,
+                                               artifacts=[tts_r.get("audio_path", "")])
+                        status_queue.put({
+                            "stage": "tts", "segment_id": seg_id,
+                            "status": f"Segment {seg_id}: TTS done",
+                            "segment_phase": "done", "segment_final": True,
+                        })
+                    else:
+                        with _state_lock:
+                            mark_segment_stage(project_dir, seg_id, "tts", done=False,
+                                               error=tts_r.get("error", ""))
+                        status_queue.put({
+                            "stage": "tts", "segment_id": seg_id,
+                            "status": f"Segment {seg_id}: TTS failed",
+                            "segment_phase": "failed", "segment_final": True,
+                        })
+                except Exception as e:
+                    result["tts_result"] = {"success": False, "error": str(e), "audio_path": None, "duration": 0}
+                    with _state_lock:
+                        mark_segment_stage(project_dir, seg_id, "tts", done=False, error=str(e))
+                    status_queue.put({
+                        "stage": "tts", "segment_id": seg_id,
+                        "status": f"Segment {seg_id}: TTS error",
+                        "segment_phase": "failed", "segment_final": True,
+                    })
+                finally:
+                    loop.close()
+
+        # ── Phase 2: Code generation ──────────────────────────────
+        code_cached = False
         if resumed and state and is_segment_stage_done(state, seg_id, "code"):
-            # Check if a video file actually exists on disk
-            seg_output_dir = os.path.join(project_dir, f"segment_{seg_id}")
             seg_artifacts = state.get("segments", {}).get(str(seg_id), {}).get("code", {}).get("artifacts", [])
             video_found = None
             for art in seg_artifacts:
                 if art and os.path.isfile(art):
                     video_found = art
                     break
-            if not video_found:
-                # Also check for common video filename patterns in the segment dir
-                if os.path.isdir(seg_output_dir):
-                    for f in os.listdir(seg_output_dir):
-                        if f.endswith(".mp4"):
-                            video_found = os.path.join(seg_output_dir, f)
-                            break
+            if not video_found and os.path.isdir(seg_output_dir):
+                for f_name in os.listdir(seg_output_dir):
+                    if f_name.endswith(".mp4"):
+                        video_found = os.path.join(seg_output_dir, f_name)
+                        break
             if video_found:
-                code_results[seg_id] = {
-                    "success": True,
-                    "video_path": video_found,
-                    "code_validated": True,
-                    "code": "",  # Code text not needed for skipped segments
+                result["code_result"] = {
+                    "success": True, "video_path": video_found,
+                    "code_validated": True, "code": "",
                 }
-                continue
-        segments_needing_code.append(seg)
-
-    cached_code_count = len(code_results)
-
-    def _run_coder_for_segment(seg: dict, few_shot_example: str = "", emit_to_queue: bool = True) -> dict:
-        seg_id = seg["id"]
-        seg_output_dir = os.path.join(project_dir, f"segment_{seg_id}")
-        os.makedirs(seg_output_dir, exist_ok=True)
-        tts_r = tts_results.get(seg_id, {})
-        coder_instructions = seg["visual_instructions"] if is_lite else seg
-        last_update: dict = {}
-        for update in run_coder_agent(
-            instructions=coder_instructions,
-            max_retries=max_retries,
-            audio_script=seg.get("audio_script", ""),
-            audio_duration=tts_r.get("duration", 0.0) or 0.0,
-            complexity=seg.get("complexity", "complex"),
-            scene_class_name=f"Segment{seg_id}Scene",
-            output_dir=seg_output_dir,
-            theme_name=theme_name,
-            color_palette=color_palette,
-            segment_id=seg_id,
-            few_shot_example=few_shot_example,
-        ):
-            last_update = update
-            if emit_to_queue:
-                status_queue.put({"segment_id": seg_id, **update})
-        return last_update
-
-    code_all_cached = cached_code_count == num_segments
-
-    if code_all_cached:
-        # All segments already have code — skip entirely
-        code_ok = num_segments
-        timings.append(("Code + Validation", "skipped", 0.0))
-        yield {
-            "stage": "code",
-            "status": f"Skipping (already completed) — {code_ok}/{num_segments} segments cached",
-            "skipped": True,
-            "code_results": code_results,
-        }
-    else:
-        if cached_code_count > 0:
-            yield {
-                "stage": "code",
-                "status": f"Generating Manim code: {cached_code_count} cached, {len(segments_needing_code)} remaining...",
-            }
-            for seg_id_cached in list(code_results.keys()):
-                yield {
-                    "stage": "code",
-                    "segment_id": seg_id_cached,
-                    "segment_phase": "done",
-                    "segment_final": True,
-                    "status": f"Segment {seg_id_cached}: cached (skipped)",
+                code_cached = True
+                status_queue.put({
+                    "stage": "code", "segment_id": seg_id,
+                    "status": f"Segment {seg_id}: code cached",
+                    "segment_phase": "done", "segment_final": True,
                     "skipped": True,
-                }
-        else:
-            yield {"stage": "code", "status": f"Generating Manim code for {num_segments} segments in parallel..."}
+                })
 
-        code_start = time.perf_counter()
+        if not code_cached:
+            tts_r = result["tts_result"]
+            coder_instructions = seg["visual_instructions"] if is_lite else seg
+            last_update: dict = {}
+            for update in run_coder_agent(
+                instructions=coder_instructions,
+                max_retries=max_retries,
+                audio_script=seg.get("audio_script", ""),
+                audio_duration=tts_r.get("duration", 0.0) or 0.0,
+                complexity=seg.get("complexity", "complex"),
+                scene_class_name=f"Segment{seg_id}Scene",
+                output_dir=seg_output_dir,
+                theme_name=theme_name,
+                color_palette=color_palette,
+                segment_id=seg_id,
+                few_shot_example=few_shot_example,
+            ):
+                last_update = update
+                status_queue.put({
+                    "stage": "code", "segment_id": seg_id,
+                    "status": update.get("status", ""),
+                    "segment_phase": update.get("phase", "running"),
+                    "segment_final": bool(update.get("final")),
+                })
 
-        max_workers = max(1, min(5, len(segments_needing_code)))
-        futures_map: dict[Any, dict] = {}
-        segment_done_count = cached_code_count
+            result["code_result"] = last_update
+            result["token_usage"] = last_update.get("token_usage")
+            result["tool_call_counts"] = last_update.get("tool_call_counts")
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for seg in segments_needing_code:
-                futures_map[executor.submit(_run_coder_for_segment, seg)] = seg
-
-            for fut in as_completed(futures_map):
-                yield from _drain_status_queue(status_queue)
-                seg = futures_map[fut]
-                seg_id = seg["id"]
-
-                try:
-                    result = fut.result()
-                except Exception as exc:
-                    result = {"success": False, "error": str(exc), "final": True}
-
-                code_results[seg_id] = result
-                _merge_tool_calls(result.get("tool_call_counts"))
-
-                # Extract coder token usage
-                try:
-                    coder_tu = result.get("token_usage")
-                    if coder_tu:
-                        merge_token_usage(coding_tokens, coder_tu)
-                        merge_token_usage(pipeline_tokens, coder_tu)
-                except Exception:
-                    pass  # Never let token tracking crash the pipeline
-
-                has_code = _has_valid_code(result)
+            has_code = _has_valid_code(last_update)
+            with _state_lock:
                 if has_code:
                     mark_segment_stage(project_dir, seg_id, "code", done=True,
-                                       artifacts=[result.get("video_path", "")])
-                    if result.get("video_path"):
+                                       artifacts=[last_update.get("video_path", "")])
+                    if last_update.get("video_path"):
                         mark_segment_stage(project_dir, seg_id, "render", done=True,
-                                           artifacts=[result.get("video_path", "")])
+                                           artifacts=[last_update.get("video_path", "")])
                 else:
                     mark_segment_stage(project_dir, seg_id, "code", done=False,
-                                       error=result.get("error", "Code generation failed"))
+                                       error=last_update.get("error", "Code generation failed"))
 
-                segment_done_count += 1
-                yield {
-                    "stage": "code",
-                    "segment_id": seg_id,
-                    "segment_phase": "done" if has_code else "failed",
-                    "segment_final": True,
-                    "status": (
-                        f"Segment {seg_id}: done ({segment_done_count}/{num_segments})"
-                        if has_code
-                        else f"Segment {seg_id}: failed ({segment_done_count}/{num_segments})"
-                    ),
-                }
+        # ── Phase 3: HD Render ────────────────────────────────────
+        code_r = result["code_result"]
+        if _has_valid_code(code_r) and code_r.get("code"):
+            hd_cached = False
+            if resumed and state and is_segment_stage_done(state, seg_id, "hd_render"):
+                hd_info = state.get("segments", {}).get(str(seg_id), {}).get("hd_render", {})
+                hd_found = next((a for a in hd_info.get("artifacts", []) if a and os.path.isfile(a)), None)
+                if hd_found:
+                    code_r["video_path"] = hd_found
+                    hd_cached = True
+                    status_queue.put({
+                        "stage": "render", "segment_id": seg_id,
+                        "status": f"Segment {seg_id}: HD render cached",
+                        "segment_phase": "done", "segment_final": True,
+                        "skipped": True,
+                    })
 
+            if not hd_cached:
+                status_queue.put({
+                    "stage": "render", "segment_id": seg_id,
+                    "status": f"Segment {seg_id}: HD rendering...",
+                    "segment_phase": "running", "segment_final": False,
+                })
+                hd_job = RenderJob(
+                    segment_id=seg_id,
+                    code=code_r["code"],
+                    quality_flag="-qh",
+                    timeout_seconds=render_timeout_seconds or 300,
+                    output_dir=seg_output_dir,
+                )
+                hd_results = render_parallel([hd_job])
+                hd_result = hd_results[0] if hd_results else None
+                if hd_result and hd_result.success and hd_result.video_path:
+                    code_r["video_path"] = hd_result.video_path
+                    with _state_lock:
+                        mark_segment_stage(project_dir, seg_id, "hd_render", done=True,
+                                           artifacts=[hd_result.video_path])
+                    status_queue.put({
+                        "stage": "render", "segment_id": seg_id,
+                        "status": f"Segment {seg_id}: HD render done",
+                        "segment_phase": "done", "segment_final": True,
+                    })
+                else:
+                    err = hd_result.error if hd_result else "Unknown"
+                    with _state_lock:
+                        mark_segment_stage(project_dir, seg_id, "hd_render", done=False,
+                                           error=err or "Unknown")
+                    status_queue.put({
+                        "stage": "render", "segment_id": seg_id,
+                        "status": f"Segment {seg_id}: HD render failed, using preview",
+                        "segment_phase": "failed", "segment_final": True,
+                    })
+
+        # ── Phase 4: Stitch ───────────────────────────────────────
+        if not skip_audio:
+            stitch_cached = False
+            if resumed and state and is_segment_stage_done(state, seg_id, "stitch"):
+                stitched_path = os.path.join(project_dir, f"segment_{seg_id}_stitched.mp4")
+                if os.path.isfile(stitched_path):
+                    result["stitch_path"] = stitched_path
+                    stitch_cached = True
+                else:
+                    seg_stitch_info = state.get("segments", {}).get(str(seg_id), {}).get("stitch", {})
+                    found_art = next((a for a in seg_stitch_info.get("artifacts", [])
+                                      if a and os.path.isfile(a)), None)
+                    if found_art:
+                        result["stitch_path"] = found_art
+                        stitch_cached = True
+
+            if stitch_cached:
+                status_queue.put({
+                    "stage": "stitch", "segment_id": seg_id,
+                    "status": f"Segment {seg_id}: stitch cached",
+                    "playable_segment": result["stitch_path"],
+                    "segment_phase": "done", "segment_final": True,
+                    "skipped": True,
+                })
+            else:
+                video_path = code_r.get("video_path")
+                audio_path = result["tts_result"].get("audio_path")
+                tts_success = result["tts_result"].get("success", False)
+
+                if not video_path:
+                    result["stitch_error"] = f"Segment {seg_id}: no video to stitch"
+                elif not audio_path or not tts_success:
+                    # No audio — use raw video
+                    result["stitch_path"] = video_path
+                    with _state_lock:
+                        mark_segment_stage(project_dir, seg_id, "stitch", done=True,
+                                           artifacts=[video_path])
+                else:
+                    stitched_output = os.path.join(project_dir, f"segment_{seg_id}_stitched.mp4")
+                    stitch_r = None
+                    for update in stitch_video_and_audio(video_path, audio_path, stitched_output):
+                        if update.get("final"):
+                            stitch_r = update
+
+                    if stitch_r and stitch_r.get("success"):
+                        result["stitch_path"] = stitch_r["output_path"]
+                        with _state_lock:
+                            mark_segment_stage(project_dir, seg_id, "stitch", done=True,
+                                               artifacts=[stitch_r["output_path"]])
+                        status_queue.put({
+                            "stage": "stitch", "segment_id": seg_id,
+                            "status": f"Segment {seg_id}: stitched",
+                            "playable_segment": stitch_r["output_path"],
+                            "segment_phase": "done", "segment_final": True,
+                        })
+                    else:
+                        err = stitch_r.get("error", "unknown") if stitch_r else "unknown"
+                        result["stitch_error"] = f"Segment {seg_id}: stitch failed ({err}), using raw video"
+                        result["stitch_path"] = video_path
+                        with _state_lock:
+                            mark_segment_stage(project_dir, seg_id, "stitch", done=False, error=err)
+        else:
+            # skip_audio: use video directly
+            result["stitch_path"] = code_r.get("video_path")
+
+        return result
+
+    # ── Launch all segments concurrently ──────────────────────────────
+
+    yield {
+        "stage": "pipeline",
+        "status": f"Processing {num_segments} segments in parallel (TTS \u2192 Code \u2192 Render \u2192 Stitch)...",
+    }
+
+    pipeline_start = time.perf_counter()
+    segment_results: dict[int, dict] = {}
+    max_workers = max(1, min(5, num_segments))
+    segments_done = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures_map: dict[Any, dict] = {}
+        for seg in segments:
+            futures_map[executor.submit(_run_segment_pipeline, seg)] = seg
+
+        for fut in as_completed(futures_map):
             yield from _drain_status_queue(status_queue)
 
-        code_ok = sum(1 for r in code_results.values() if _has_valid_code(r))
-        code_elapsed = time.perf_counter() - code_start
-        timings.append(("Code + Validation", "ok" if code_ok > 0 else "failed", code_elapsed))
+            seg = futures_map[fut]
+            seg_id = seg["id"]
+            try:
+                seg_result = fut.result()
+            except Exception as exc:
+                seg_result = {
+                    "segment_id": seg_id,
+                    "tts_result": {"success": False},
+                    "code_result": {"success": False, "error": str(exc)},
+                    "stitch_path": None,
+                    "stitch_error": str(exc),
+                    "token_usage": None,
+                    "tool_call_counts": None,
+                    "tts_api_call": False,
+                }
 
-        # Mark code stage done if all segments succeeded
-        if code_ok == num_segments:
-            mark_stage_done(project_dir, "code", artifacts=[])
-            state = load_project(project_dir)
+            segment_results[seg_id] = seg_result
+            segments_done += 1
 
-        yield {
-            "stage": "code",
-            "status": f"Code generation complete: {code_ok}/{num_segments} have videos",
-            "code_results": code_results,
-        }
+            has_code = _has_valid_code(seg_result["code_result"])
+            yield {
+                "stage": "code",
+                "segment_id": seg_id,
+                "status": (
+                    f"Segment {seg_id}: complete ({segments_done}/{num_segments})"
+                    if has_code
+                    else f"Segment {seg_id}: failed ({segments_done}/{num_segments})"
+                ),
+                "segment_phase": "done" if has_code else "failed",
+                "segment_final": True,
+            }
 
-    # ── Step 3.1: Pipeline-level retry for failed segments ────────
+        yield from _drain_status_queue(status_queue)
+
+    pipeline_elapsed = time.perf_counter() - pipeline_start
+
+    # ── Aggregate results from all workers ────────────────────────────
+
+    for seg_id, seg_r in segment_results.items():
+        tts_results[seg_id] = seg_r.get("tts_result", {})
+        code_results[seg_id] = seg_r.get("code_result", {})
+
+        seg_tu = seg_r.get("token_usage")
+        if seg_tu:
+            merge_token_usage(coding_tokens, seg_tu)
+            merge_token_usage(pipeline_tokens, seg_tu)
+        _merge_tool_calls(seg_r.get("tool_call_counts"))
+        if seg_r.get("tts_api_call"):
+            tts_api_calls += 1
+
+    code_ok = sum(1 for r in code_results.values() if _has_valid_code(r))
+    tts_ok = sum(1 for r in tts_results.values() if r.get("success"))
+
+    # Mark completed stages
+    if tts_ok == num_segments:
+        mark_stage_done(project_dir, "tts", artifacts=[
+            tts_results[seg["id"]].get("audio_path", "") for seg in segments
+            if tts_results.get(seg["id"], {}).get("success")
+        ])
+    if code_ok == num_segments:
+        mark_stage_done(project_dir, "code", artifacts=[])
+    if code_ok > 0 and not stitch_errors:
+        mark_stage_done(project_dir, "stitch", artifacts=[])
+    state = load_project(project_dir)
+
+    timings.append(("Parallel Pipeline", "ok" if code_ok > 0 else "failed", pipeline_elapsed))
+
+    yield {
+        "stage": "code",
+        "status": f"Pipeline complete: {code_ok}/{num_segments} rendered, {tts_ok}/{num_segments} voiced",
+        "code_results": code_results,
+        "tts_results": tts_results,
+    }
+
+    # ── Step 3.1: Retry failed segments with few-shot ─────────────────
+
     failed_seg_ids = [sid for sid, r in code_results.items() if not _has_valid_code(r)]
     if failed_seg_ids and code_ok > 0:
         # Pick the shortest successful segment's code as a few-shot example
@@ -685,275 +791,96 @@ def run_segmented_pipeline(
             r = code_results.get(sid, {})
             if _has_valid_code(r) and r.get("code"):
                 successful_codes[sid] = r["code"]
-        few_shot_example = ""
-        if successful_codes:
-            few_shot_example = min(successful_codes.values(), key=len)
+        few_shot = min(successful_codes.values(), key=len) if successful_codes else ""
 
         yield {
             "stage": "code_retry",
-            "status": f"Retrying {len(failed_seg_ids)} failed segment(s) in parallel with few-shot reference...",
+            "status": f"Retrying {len(failed_seg_ids)} failed segment(s) with few-shot + escalation...",
         }
 
         failed_segs = [seg for seg in segments if seg["id"] in failed_seg_ids]
-
         # Escalate "medium" → "complex" (Sonnet → Opus) for failed segments
         for seg in failed_segs:
             if seg.get("complexity") == "medium":
                 seg["complexity"] = "complex"
 
+        retry_results: dict[int, dict] = {}
         retry_max_workers = max(1, min(5, len(failed_segs)))
-        retry_futures_map: dict[Any, dict] = {}
 
         with ThreadPoolExecutor(max_workers=retry_max_workers) as retry_executor:
+            retry_futures: dict[Any, dict] = {}
             for seg in failed_segs:
-                retry_futures_map[retry_executor.submit(
-                    _run_coder_for_segment, seg, few_shot_example, False
+                retry_futures[retry_executor.submit(
+                    _run_segment_pipeline, seg, few_shot
                 )] = seg
 
-            for fut in as_completed(retry_futures_map):
-                seg = retry_futures_map[fut]
+            for fut in as_completed(retry_futures):
+                yield from _drain_status_queue(status_queue)
+                seg = retry_futures[fut]
                 sid = seg["id"]
                 try:
-                    last_update = fut.result()
+                    retry_r = fut.result()
                 except Exception as exc:
-                    last_update = {"success": False, "error": str(exc), "final": True}
+                    retry_r = {
+                        "segment_id": sid,
+                        "tts_result": tts_results.get(sid, {}),
+                        "code_result": {"success": False, "error": str(exc)},
+                        "stitch_path": None,
+                        "stitch_error": str(exc),
+                        "token_usage": None,
+                        "tool_call_counts": None,
+                        "tts_api_call": False,
+                    }
 
-                code_results[sid] = last_update
-                _merge_tool_calls(last_update.get("tool_call_counts"))
+                retry_results[sid] = retry_r
+                # Update aggregated results
+                code_results[sid] = retry_r.get("code_result", {})
+                segment_results[sid] = retry_r
 
-                # Extract retry coder token usage
-                try:
-                    retry_tu = last_update.get("token_usage")
-                    if retry_tu:
-                        merge_token_usage(coding_tokens, retry_tu)
-                        merge_token_usage(pipeline_tokens, retry_tu)
-                except Exception:
-                    pass  # Never let token tracking crash the pipeline
+                retry_tu = retry_r.get("token_usage")
+                if retry_tu:
+                    merge_token_usage(coding_tokens, retry_tu)
+                    merge_token_usage(pipeline_tokens, retry_tu)
+                _merge_tool_calls(retry_r.get("tool_call_counts"))
 
-                has_code = _has_valid_code(last_update)
+                has_code = _has_valid_code(retry_r["code_result"])
                 if has_code:
-                    mark_segment_stage(project_dir, sid, "code", done=True,
-                                       artifacts=[last_update.get("video_path", "")])
-                    if last_update.get("video_path"):
-                        mark_segment_stage(project_dir, sid, "render", done=True,
-                                           artifacts=[last_update.get("video_path", "")])
                     code_ok += 1
                     yield {
-                        "stage": "code_retry",
-                        "segment_id": sid,
+                        "stage": "code_retry", "segment_id": sid,
                         "status": f"Retry Segment {sid}: recovered!",
-                        "segment_phase": "done",
-                        "segment_final": True,
+                        "segment_phase": "done", "segment_final": True,
                     }
                 else:
                     yield {
-                        "stage": "code_retry",
-                        "segment_id": sid,
+                        "stage": "code_retry", "segment_id": sid,
                         "status": f"Retry Segment {sid}: still failed",
-                        "segment_phase": "failed",
-                        "segment_final": True,
+                        "segment_phase": "failed", "segment_final": True,
                     }
 
-    # ── Step 3.5: Parallel HD Rendering ───────────────────────────
-    if code_ok > 0:
-        # Check which segments already have HD renders from a previous run
-        hd_jobs = []
-        hd_cached = 0
-        for seg in segments:
-            seg_id = seg["id"]
-            code_r = code_results.get(seg_id, {})
-            if not _has_valid_code(code_r):
-                continue
-            # Check if this segment's HD render is already done
-            if resumed and state and is_segment_stage_done(state, seg_id, "hd_render"):
-                seg_hd_info = state.get("segments", {}).get(str(seg_id), {}).get("hd_render", {})
-                hd_artifacts = seg_hd_info.get("artifacts", [])
-                hd_found = any(os.path.isfile(a) for a in hd_artifacts if a)
-                if hd_found:
-                    hd_cached += 1
-                    continue
-            # Need code text to re-render; skip segments that were cached without code
-            if not code_r.get("code"):
-                continue
-            seg_output_dir = os.path.join(project_dir, f"segment_{seg_id}")
-            hd_jobs.append(RenderJob(
-                segment_id=seg_id,
-                code=code_r["code"],
-                quality_flag="-qh",
-                timeout_seconds=render_timeout_seconds or 300,
-                output_dir=seg_output_dir,
-            ))
+            yield from _drain_status_queue(status_queue)
 
-        if not hd_jobs and hd_cached > 0:
-            # All HD renders already done
-            timings.append(("HD Render", "skipped", 0.0))
-            yield {
-                "stage": "render",
-                "status": f"Skipping (already completed) — {hd_cached} HD renders cached",
-                "skipped": True,
-                "code_results": code_results,
-            }
-        elif hd_jobs:
-            if hd_cached > 0:
-                yield {"stage": "render", "status": f"Rendering HD videos: {hd_cached} cached, {len(hd_jobs)} remaining..."}
-            else:
-                yield {"stage": "render", "status": f"Rendering final HD videos for {code_ok} segments in parallel..."}
-            render_start = time.perf_counter()
+    # ── Build ordered valid_paths for concat ──────────────────────────
 
-            hd_results = render_parallel(hd_jobs)
-            hd_ok = hd_cached
-            for res in hd_results:
-                seg_id = res.segment_id
-                if res.success and res.video_path:
-                    code_results[seg_id]["video_path"] = res.video_path
-                    hd_ok += 1
-                    mark_segment_stage(project_dir, seg_id, "hd_render", done=True, artifacts=[res.video_path])
-                else:
-                    mark_segment_stage(project_dir, seg_id, "hd_render", done=False, error=res.error or "Unknown error")
-
-            render_elapsed = time.perf_counter() - render_start
-            timings.append(("HD Render", "ok" if hd_ok == code_ok else "partial", render_elapsed))
-
-            # Mark render stage done if all succeeded
-            if hd_ok == code_ok:
-                mark_stage_done(project_dir, "render", artifacts=[])
-                state = load_project(project_dir)
-
-            yield {
-                "stage": "render",
-                "status": f"HD Rendering complete: {hd_ok}/{code_ok} succeeded",
-                "code_results": code_results,
-            }
-
-    # ── Step 4: Stitch audio+video per segment (parallel) ──────────────
-
-    stitch_errors: list[str] = []
-
-    if not skip_audio:
-        # Check if stitch stage is fully cached
-        stitch_all_cached = False
-        if resumed and state and is_stage_done(state, "stitch"):
-            # Verify stitched files exist
-            all_stitched_present = True
-            cached_stitched: dict[int, str] = {}
-            for seg in segments:
-                seg_id = seg["id"]
-                stitched_path = os.path.join(project_dir, f"segment_{seg_id}_stitched.mp4")
-                if os.path.isfile(stitched_path):
-                    cached_stitched[seg_id] = stitched_path
-                elif is_segment_stage_done(state, seg_id, "stitch"):
-                    seg_stitch_info = state.get("segments", {}).get(str(seg_id), {}).get("stitch", {})
-                    artifacts = seg_stitch_info.get("artifacts", [])
-                    found_art = next((a for a in artifacts if a and os.path.isfile(a)), None)
-                    if found_art:
-                        cached_stitched[seg_id] = found_art
-                    else:
-                        all_stitched_present = False
-                        break
-                else:
-                    all_stitched_present = False
-                    break
-
-            if all_stitched_present and cached_stitched:
-                stitch_all_cached = True
-                timings.append(("Stitch", "skipped", 0.0))
-                yield {
-                    "stage": "stitch",
-                    "status": f"Skipping (already completed) — {len(cached_stitched)} stitched files cached",
-                    "skipped": True,
-                }
-                valid_paths = [cached_stitched.get(seg["id"]) for seg in segments
-                               if cached_stitched.get(seg["id"])]
-
-        if not stitch_all_cached:
-            yield {"stage": "stitch", "status": "Stitching audio and video per segment..."}
-            stitch_start = time.perf_counter()
-
-            stitched_results: dict[int, tuple[str | None, str | None]] = {}  # seg_id -> (path, error)
-
-            def _stitch_one(seg: dict) -> tuple[int, str | None, str | None]:
-                seg_id = seg["id"]
-                # Check if this individual segment's stitch is already cached
-                if resumed and state and is_segment_stage_done(state, seg_id, "stitch"):
-                    stitched_path = os.path.join(project_dir, f"segment_{seg_id}_stitched.mp4")
-                    if os.path.isfile(stitched_path):
-                        return (seg_id, stitched_path, None)
-                    seg_stitch_info = state.get("segments", {}).get(str(seg_id), {}).get("stitch", {})
-                    artifacts = seg_stitch_info.get("artifacts", [])
-                    found_art = next((a for a in artifacts if a and os.path.isfile(a)), None)
-                    if found_art:
-                        return (seg_id, found_art, None)
-
-                code_r = code_results.get(seg_id, {})
-                tts_r = tts_results.get(seg_id, {})
-                video_path = code_r.get("video_path")
-                audio_path = tts_r.get("audio_path")
-
-                if not video_path:
-                    return (seg_id, None, f"Segment {seg_id}: no video to stitch")
-
-                if not audio_path or not tts_r.get("success"):
-                    mark_segment_stage(project_dir, seg_id, "stitch", done=True, artifacts=[video_path])
-                    return (seg_id, video_path, None)
-
-                stitched_output = os.path.join(project_dir, f"segment_{seg_id}_stitched.mp4")
-                stitch_result = None
-                for update in stitch_video_and_audio(video_path, audio_path, stitched_output):
-                    if update.get("final"):
-                        stitch_result = update
-
-                if stitch_result and stitch_result.get("success"):
-                    mark_segment_stage(project_dir, seg_id, "stitch", done=True,
-                                       artifacts=[stitch_result["output_path"]])
-                    return (seg_id, stitch_result["output_path"], None)
-                else:
-                    err = stitch_result.get("error", "unknown") if stitch_result else "unknown"
-                    mark_segment_stage(project_dir, seg_id, "stitch", done=False, error=err)
-                    return (seg_id, video_path, f"Segment {seg_id}: stitch failed ({err}), using raw video")
-
-            with ThreadPoolExecutor(max_workers=max(1, len(segments))) as stitch_pool:
-                futures = {stitch_pool.submit(_stitch_one, seg): seg["id"] for seg in segments}
-                for fut in as_completed(futures):
-                    seg_id, path, error = fut.result()
-                    stitched_results[seg_id] = (path, error)
-                    if error:
-                        yield {"stage": "stitch", "status": f"Segment {seg_id}: {error}"}
-                    else:
-                        yield {
-                            "stage": "stitch",
-                            "status": f"Segment {seg_id} stitched.",
-                            "playable_segment": path,
-                            "segment_id": seg_id,
-                        }
-
-            # Reassemble in order
-            stitched_paths: list[str] = []
-            for seg in segments:
-                path, error = stitched_results.get(seg["id"], (None, None))
-                stitched_paths.append(path)
-                if error:
-                    stitch_errors.append(error)
-
-            if stitch_errors:
-                yield {"stage": "stitch", "status": f"Stitching done ({len(stitch_errors)} fell back to raw video)"}
-            else:
-                yield {"stage": "stitch", "status": "Stitching done"}
-
-            stitch_elapsed = time.perf_counter() - stitch_start
-            timings.append(("Stitch", "ok" if len(stitch_errors) == 0 else "partial", stitch_elapsed))
-
-            # Mark stitch stage done if no errors
-            if len(stitch_errors) == 0:
-                mark_stage_done(project_dir, "stitch", artifacts=[])
-                state = load_project(project_dir)
-
-            valid_paths = [p for p in stitched_paths if p is not None]
-    else:
-        # skip_audio: collect HD video paths directly, no stitching
+    if skip_audio:
         valid_paths = [
-            code_results[seg["id"]]["video_path"]
+            code_results[seg["id"]].get("video_path")
             for seg in segments
             if code_results.get(seg["id"], {}).get("video_path")
+        ]
+    else:
+        # Reconstruct ordered stitch paths (retry results may have updated them)
+        for seg in segments:
+            seg_id = seg["id"]
+            seg_r = segment_results.get(seg_id, {})
+            stitch_path = seg_r.get("stitch_path")
+            stitch_error = seg_r.get("stitch_error")
+            if stitch_error:
+                stitch_errors.append(stitch_error)
+        valid_paths = [
+            segment_results.get(seg["id"], {}).get("stitch_path")
+            for seg in segments
+            if segment_results.get(seg["id"], {}).get("stitch_path")
         ]
 
     # ── Step 5: Concatenate all segments ──────────────────────────────

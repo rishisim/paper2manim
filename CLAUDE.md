@@ -9,7 +9,7 @@ cli_launcher.py
   └─ spawns Node.js → cli/dist/cli.js
        └─ Ink v5 React app (cli/src/)
             └─ spawns Python subprocess (pipeline_runner.py) via NDJSON
-                 └─ agents/pipeline.py (6-stage generator)
+                 └─ agents/pipeline.py (pipelined-parallel generator)
 ```
 
 **Communication:** The TypeScript CLI talks to the Python pipeline via NDJSON (newline-delimited JSON) on the child process's stdin/stdout. The pipeline emits `{"type": "pipeline", "update": {...}}` lines; the CLI sends questionnaire answers back on stdin.
@@ -45,7 +45,7 @@ After any TypeScript change, run `cd cli && npm run build` to update `cli/dist/`
 | `cli/src/components/SlashCommandOverlay.tsx` | Fixed-height command palette dropdown |
 | `cli/src/components/FooterStatusLine.tsx` | Bottom status bar (model · mode · tokens · branch) |
 | `cli/src/components/WelcomeScreen.tsx` | Split-panel home screen |
-| `agents/pipeline.py` | 6-stage orchestrator (plan→tts→code→render→stitch→concat) |
+| `agents/pipeline.py` | Pipelined-parallel orchestrator (plan→[TTS→Code→Render→Stitch per-segment]→concat) |
 | `agents/planner_math2manim.py` | Pro planner: Claude-based 5-sub-stage enrichment |
 | `agents/coder.py` | Self-correcting Manim code generator (Claude) |
 | `utils/tts_engine.py` | TTS via Gemini 2.5 Flash |

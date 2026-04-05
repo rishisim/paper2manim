@@ -168,7 +168,7 @@ export const TIPS = [
   'Use --model to override the Claude model',
 ];
 
-export type StageName = 'plan' | 'tts' | 'code' | 'code_retry' | 'verify' | 'render' | 'timing' | 'concat' | 'overlay' | 'done';
+export type StageName = 'plan' | 'pipeline' | 'tts' | 'code' | 'code_retry' | 'verify' | 'render' | 'stitch' | 'timing' | 'concat' | 'overlay' | 'done';
 
 export interface StageConfig {
   icon: string;
@@ -180,11 +180,13 @@ export interface StageConfig {
 export function getStageConfig(theme: ThemeColors): Record<StageName, StageConfig> {
   return {
     plan:       { icon: '⏺', color: theme.primary,  label: 'Plan storyboard' },
+    pipeline:   { icon: '⏺', color: theme.primary,  label: 'Processing segments' },
     tts:        { icon: '⏺', color: theme.accent,   label: 'Generate voiceover' },
     code:       { icon: '⏺', color: theme.primary,  label: 'Generate Manim code' },
     code_retry: { icon: '⏺', color: theme.warn,     label: 'Retrying failed segments' },
     verify:      { icon: '⏺', color: theme.warn,     label: 'Verify code quality' },
     render:      { icon: '⏺', color: theme.accent,   label: 'Render HD segments' },
+    stitch:      { icon: '⏺', color: theme.accent,   label: 'Stitch audio + video' },
     timing:      { icon: '⏺', color: theme.accent,   label: 'Check audio/video timing' },
     concat:      { icon: '⏺', color: theme.success,  label: 'Assemble final video' },
     overlay:     { icon: '⏺', color: theme.success,  label: 'Overlay audio track' },

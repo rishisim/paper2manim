@@ -369,7 +369,14 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
     }
 
     // ── Stage transitions ───────────────────────────────────────
-    if (stage !== currentStage && stage !== 'done') {
+    // Pipeline sub-stages (tts, code, render, stitch) run interleaved
+    // during the parallel pipeline. Don't treat them as full stage
+    // transitions — that would clear segment state and spam headers.
+    const PIPELINE_SUBSTAGES = new Set(['tts', 'code', 'render', 'stitch']);
+    const isPipelineSubstage = PIPELINE_SUBSTAGES.has(stage) &&
+      (currentStage === 'pipeline' || (currentStage != null && PIPELINE_SUBSTAGES.has(currentStage)));
+
+    if (stage !== currentStage && stage !== 'done' && !isPipelineSubstage) {
       // Complete the previous stage → add panel to log
       if (currentStage && currentStage !== 'done') {
         const stageElapsed = (Date.now() - stageStartTime) / 1000;
@@ -391,7 +398,7 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
       setActivityLines([]);  // Clear activity stream on stage transition
       addLog({ type: 'stage-header', text: stage });
 
-      if (stage === 'code') {
+      if (stage === 'pipeline') {
         setSegments(new Map());
         prevSegPhases.current = new Map();
       }
@@ -399,7 +406,10 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
     }
 
     // ── Intermediate status updates ─────────────────────────────
-    if (latest.status && stage !== 'code' && stage !== 'code_retry') {
+    // Show as regular status unless it's a segment-specific update
+    const hasSegmentId = latest.segment_id !== undefined;
+    const isSegmentStage = PIPELINE_SUBSTAGES.has(stage) || stage === 'code_retry';
+    if (latest.status && !(isSegmentStage && hasSegmentId)) {
       const cleaned = cleanStatus(latest.status);
       setStatusDetail(cleaned);
       if (cleaned) {
@@ -433,11 +443,17 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
       }
     }
 
-    // ── Segment-level updates during code / code_retry stage ────
-    if ((stage === 'code' || stage === 'code_retry') && latest.segment_id !== undefined) {
+    // ── Segment-level updates during parallel pipeline ──────────
+    if ((isSegmentStage) && latest.segment_id !== undefined) {
       const segId = latest.segment_id;
       const phase = latest.segment_phase ?? 'running';
-      const prettyPhase = segmentPhaseLabels[phase] ?? phase;
+
+      // Include sub-stage label for non-code stages
+      const subLabel: Record<string, string> = {
+        tts: 'TTS', render: 'Render', stitch: 'Stitch',
+      };
+      const prefix = subLabel[stage] ? `${subLabel[stage]} ` : '';
+      const prettyPhase = `${prefix}${segmentPhaseLabels[phase] ?? phase}`;
 
       // Track attempt number
       const attemptMatch = latest.status?.match(/Attempt (\d+)\//);

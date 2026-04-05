@@ -19,6 +19,7 @@ import pytest
 # "done" is the terminal pseudo-stage.
 VALID_STAGES = {
     "plan",
+    "pipeline",
     "tts",
     "code",
     "code_retry",
