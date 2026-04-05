@@ -1,35 +1,33 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import { colors, VERSION, MODEL_TAG, BRAND_ICON, TIPS, truncatePath } from '../lib/theme.js';
+import { VERSION, BRAND_ICON, RESULT_MARKER, truncatePath } from '../lib/theme.js';
+import { useAppContext } from '../context/AppContext.js';
 
-const tip = TIPS[Math.floor(Math.random() * TIPS.length)]!;
+interface BannerProps {
+  concept?: string;
+}
 
-export function Banner() {
+/** Minimal header for the running screen — Claude Code style. */
+export function Banner({ concept }: BannerProps) {
+  const { themeColors, quality } = useAppContext();
   const cwd = process.cwd();
-  // Inner width = box width - 2 (border) - 4 (paddingX=2 each side)
-  const innerWidth = 56;
-  const boxWidth = innerWidth + 6;
+  const home = process.env['HOME'] ?? '';
+  const displayCwd = home ? cwd.replace(home, '~') : cwd;
 
   return (
-    <Box
-      flexDirection="column"
-      borderStyle="round"
-      borderColor={colors.primary}
-      paddingX={2}
-      paddingY={0}
-      marginBottom={1}
-      width={boxWidth}
-    >
-      <Text>
-        <Text bold color={colors.primary}>{BRAND_ICON}</Text>
-        <Text bold color={colors.text}> paper2manim</Text>
-        <Text color={colors.dim}>  v{VERSION}</Text>
-      </Text>
-      <Text> </Text>
-      <Text color={colors.dim}>  Model: {MODEL_TAG}</Text>
-      <Text color={colors.dim}>  cwd: {truncatePath(cwd, innerWidth - 7)}</Text>
-      <Text> </Text>
-      <Text color={colors.dim}>  Tip: {tip}</Text>
+    <Box flexDirection="column" paddingX={1} marginBottom={1}>
+      <Box>
+        <Text bold color={themeColors.primary}>{BRAND_ICON}</Text>
+        <Text bold color={themeColors.text}> paper2manim</Text>
+        <Text color={themeColors.dim}> v{VERSION}</Text>
+        {concept && (
+          <Text color={themeColors.muted}> — {concept}</Text>
+        )}
+      </Box>
+      <Box>
+        <Text color={themeColors.dim}>{RESULT_MARKER} {truncatePath(displayCwd, 40)}</Text>
+        <Text color={themeColors.dim}>  quality: {quality}</Text>
+      </Box>
     </Box>
   );
 }

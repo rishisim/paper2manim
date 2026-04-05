@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "paper2manim": {
+      "command": "node",
+      "args": ["mcp/server.js"],
+      "cwd": "/Users/rishisim/Documents/projects/paper2manim",
+      "env": {
+        "PAPER2MANIM_ROOT": "/Users/rishisim/Documents/projects/paper2manim",
+        "PAPER2MANIM_PYTHON": "/Users/rishisim/Documents/projects/paper2manim/.venv/bin/python"
+      }
+    }
+  }
+}

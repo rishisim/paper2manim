@@ -1,6 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import { colors } from '../lib/theme.js';
+import { RESULT_MARKER } from '../lib/theme.js';
+import { useAppContext } from '../context/AppContext.js';
 
 interface ErrorPanelProps {
   message: string;
@@ -23,25 +24,46 @@ function extractHint(msg: string): string | null {
   return null;
 }
 
+/** Truncate long error detail to max lines, keeping the most useful parts. */
+function truncateDetail(detail: string, maxLines: number = 20): { text: string; truncated: boolean } {
+  const lines = detail.split('\n');
+  if (lines.length <= maxLines) return { text: detail, truncated: false };
+
+  // Keep first 5 lines (context) and last (maxLines - 6) lines (root cause is usually at the bottom)
+  const head = lines.slice(0, 5);
+  const tail = lines.slice(-(maxLines - 6));
+  const omitted = lines.length - head.length - tail.length;
+  return {
+    text: [...head, `  ... (${omitted} lines omitted)`, ...tail].join('\n'),
+    truncated: true,
+  };
+}
+
 export function ErrorPanel({ message, detail }: ErrorPanelProps) {
+  const { themeColors } = useAppContext();
   const hint = extractHint(detail ?? message);
+  const trimmed = detail ? truncateDetail(detail) : null;
 
   return (
-    <Box
-      flexDirection="column"
-      borderStyle="round"
-      borderColor={colors.error}
-      paddingX={2}
-      paddingY={0}
-      marginTop={1}
-    >
-      <Text bold color={colors.error}>✗ Error</Text>
-      <Text color={colors.error}>{message}</Text>
-      {detail && (
-        <Text color={colors.dim}>  {detail}</Text>
+    <Box flexDirection="column" paddingLeft={1} marginTop={1}>
+      <Text bold color={themeColors.error}>✘ Error</Text>
+      <Box paddingLeft={2}>
+        <Text color={themeColors.error}>{RESULT_MARKER} {message}</Text>
+      </Box>
+      {trimmed && (
+        <Box paddingLeft={4} flexDirection="column">
+          <Text color={themeColors.dim}>{trimmed.text}</Text>
+        </Box>
+      )}
+      {trimmed?.truncated && (
+        <Box paddingLeft={4}>
+          <Text color={themeColors.dim}>(full traceback in pipeline_summary.txt)</Text>
+        </Box>
       )}
       {hint && (
-        <Text color={colors.dim}>  {hint}</Text>
+        <Box paddingLeft={2}>
+          <Text color={themeColors.dim}>{RESULT_MARKER} {hint}</Text>
+        </Box>
       )}
     </Box>
   );

@@ -30,7 +30,7 @@ def test_pro_pipeline_streams_code_progress(monkeypatch, tmp_path):
         }
 
     async def fake_tts_async(script, audio_path):
-        return {"success": True, "audio_path": audio_path, "duration": 1.0}
+        return {"success": True, "audio_path": audio_path, "duration": 9.0}
 
     def fake_coder(*args, **kwargs):
         scene = kwargs.get("scene_class_name", "SegmentX")
@@ -46,18 +46,27 @@ def test_pro_pipeline_streams_code_progress(monkeypatch, tmp_path):
             "tool_call_counts": {},
         }
 
-    def fake_stitch(video_path, audio_path, stitched_output):
-        yield {"final": True, "success": True, "output_path": stitched_output}
-
     def fake_concat(paths, final_output):
+        import os
+        os.makedirs(os.path.dirname(final_output) or ".", exist_ok=True)
+        with open(final_output, "w") as f:
+            f.write("fake")
         yield {"status": "concatenating"}
         yield {"final": True, "success": True, "output_path": final_output}
+
+    def fake_overlay(video_path, audio_path, output_path):
+        import os
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(output_path, "w") as f:
+            f.write("fake")
+        yield {"status": "overlaying"}
+        yield {"final": True, "success": True, "output_path": output_path}
 
     monkeypatch.setattr(pipeline, "run_math2manim_planner", fake_planner)
     monkeypatch.setattr(pipeline, "generate_voiceover_async", fake_tts_async)
     monkeypatch.setattr(pipeline, "run_coder_agent", fake_coder)
-    monkeypatch.setattr(pipeline, "stitch_video_and_audio", fake_stitch)
     monkeypatch.setattr(pipeline, "concatenate_segments", fake_concat)
+
 
     updates = list(
         pipeline.run_segmented_pipeline(

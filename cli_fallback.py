@@ -40,7 +40,7 @@ from utils.project_state import (
 _env_candidates = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
     os.path.join(os.getcwd(), ".env"),
-    os.path.expanduser("~/Documents/projects/paper2manim/.env"),
+    os.path.join(os.path.expanduser("~"), ".paper2manim", ".env"),
 ]
 for _env_path in _env_candidates:
     if os.path.isfile(_env_path):

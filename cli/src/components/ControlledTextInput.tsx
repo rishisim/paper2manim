@@ -48,6 +48,22 @@ export function ControlledTextInput({
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResult, setSearchResult] = useState('');
 
+  // Double-Esc to clear prompt
+  const lastEscTime = useRef(0);
+
+  // Live refs — updated synchronously inside useInput so that rapid input
+  // (e.g. paste or pty sends all chars in a single event-loop task, before
+  // React can flush batched state updates) is tracked correctly.
+  const liveValueRef = useRef(value);
+  const liveCursorRef = useRef(value.length);
+  const liveSlashModeRef = useRef(slashModeActive);
+
+  // Sync value ref when the parent re-renders with updated props (e.g. history navigation)
+  useEffect(() => { liveValueRef.current = value; liveCursorRef.current = value.length; }, [value]);
+  // Sync slash mode ref SYNCHRONOUSLY during render so useInput handlers always see the
+  // current value (useEffect is deferred and the ref can be stale by the time Enter fires).
+  liveSlashModeRef.current = slashModeActive;
+
   // Keep cursor at end when value changes externally
   useEffect(() => {
     setCursor(value.length);
@@ -127,18 +143,38 @@ export function ControlledTextInput({
     // Ctrl+D — handled by parent
     if (key.ctrl && input === 'd') return;
 
-    // Enter — submit (unless it's a modifier+enter for newline)
-    if (key.return && !key.meta && !key.shift) {
-      const trimmed = value.trim();
+    // Esc+Esc — clear prompt text
+    if (key.escape) {
+      const now = Date.now();
+      if (now - lastEscTime.current < 500 && liveValueRef.current.length > 0) {
+        liveValueRef.current = '';
+        liveCursorRef.current = 0;
+        onChange('');
+        setCursor(0);
+        setHistoryIdx(-1);
+      }
+      lastEscTime.current = now;
+      return;
+    }
+
+    // Enter — submit (unless it's a modifier+enter for newline, or slash overlay is active)
+    // Also handle input==='\n': pty ICRNL converts \r→\n, which Ink parses as name='enter'
+    // (key.return=false), so we need to catch both.
+    if ((key.return || input === '\n') && !key.meta && !key.shift && !liveSlashModeRef.current) {
+      const trimmed = liveValueRef.current.trim();
       if (trimmed) {
         // Handle ! prefix — bash mode
         if (trimmed.startsWith('!') && onBashMode) {
           onBashMode(trimmed.slice(1).trim());
+          liveValueRef.current = '';
+          liveCursorRef.current = 0;
           onChange('');
           setCursor(0);
           setHistoryIdx(-1);
           return;
         }
+        liveValueRef.current = '';
+        liveCursorRef.current = 0;
         onSubmit(trimmed);
         onChange('');
         setCursor(0);
@@ -156,7 +192,7 @@ export function ControlledTextInput({
     }
 
     // Up/down arrow — yielded entirely to the slash-command overlay when it is open
-    if (slashModeActive && (key.upArrow || key.downArrow)) return;
+    if (liveSlashModeRef.current && (key.upArrow || key.downArrow)) return;
 
     // Up arrow — navigate history backwards
     if (key.upArrow) {
@@ -191,67 +227,97 @@ export function ControlledTextInput({
 
     // Left arrow
     if (key.leftArrow) {
-      setCursor(c => Math.max(0, c - 1));
+      const newC = Math.max(0, liveCursorRef.current - 1);
+      liveCursorRef.current = newC;
+      setCursor(newC);
       return;
     }
 
     // Right arrow
     if (key.rightArrow) {
-      setCursor(c => Math.min(value.length, c + 1));
+      const newC = Math.min(liveValueRef.current.length, liveCursorRef.current + 1);
+      liveCursorRef.current = newC;
+      setCursor(newC);
       return;
     }
 
     // Ctrl+A — move to start
     if (key.ctrl && input === 'a') {
+      liveCursorRef.current = 0;
       setCursor(0);
       return;
     }
 
     // Ctrl+E — move to end
     if (key.ctrl && input === 'e') {
-      setCursor(value.length);
+      const endPos = liveValueRef.current.length;
+      liveCursorRef.current = endPos;
+      setCursor(endPos);
       return;
     }
 
     // Ctrl+K — delete from cursor to end
     if (key.ctrl && input === 'k') {
-      onChange(value.slice(0, cursor));
+      const lv = liveValueRef.current;
+      const lc = liveCursorRef.current;
+      const next = lv.slice(0, lc);
+      liveValueRef.current = next;
+      onChange(next);
       return;
     }
 
     // Ctrl+U — delete from start to cursor
     if (key.ctrl && input === 'u') {
-      onChange(value.slice(cursor));
+      const lv = liveValueRef.current;
+      const lc = liveCursorRef.current;
+      const next = lv.slice(lc);
+      liveValueRef.current = next;
+      liveCursorRef.current = 0;
+      onChange(next);
       setCursor(0);
       return;
     }
 
     // Ctrl+W — delete word before cursor
     if (key.ctrl && input === 'w') {
-      const start = findWordBoundaryLeft(value, cursor);
-      onChange(deleteRange(value, start, cursor));
+      const lv = liveValueRef.current;
+      const lc = liveCursorRef.current;
+      const start = findWordBoundaryLeft(lv, lc);
+      const next = deleteRange(lv, start, lc);
+      liveValueRef.current = next;
+      liveCursorRef.current = start;
+      onChange(next);
       setCursor(start);
       return;
     }
 
     // Alt+B — move back one word
     if (key.meta && input === 'b') {
-      setCursor(findWordBoundaryLeft(value, cursor));
+      const newC = findWordBoundaryLeft(liveValueRef.current, liveCursorRef.current);
+      liveCursorRef.current = newC;
+      setCursor(newC);
       return;
     }
 
     // Alt+F — move forward one word
     if (key.meta && input === 'f') {
-      setCursor(findWordBoundaryRight(value, cursor));
+      const newC = findWordBoundaryRight(liveValueRef.current, liveCursorRef.current);
+      liveCursorRef.current = newC;
+      setCursor(newC);
       return;
     }
 
     // Backspace
     if (key.backspace || key.delete) {
-      if (cursor > 0) {
-        const next = deleteRange(value, cursor - 1, cursor);
+      const lv = liveValueRef.current;
+      const lc = liveCursorRef.current;
+      if (lc > 0) {
+        const next = deleteRange(lv, lc - 1, lc);
+        const newC = lc - 1;
+        liveValueRef.current = next;
+        liveCursorRef.current = newC;
         onChange(next);
-        setCursor(c => c - 1);
+        setCursor(newC);
       }
       return;
     }
@@ -266,24 +332,34 @@ export function ControlledTextInput({
 
     // M3: Slash at start — only activate slash mode when cursor is at 0 AND field is empty
     // (If cursor is mid-string, '/' should be inserted normally)
-    if (input === '/' && cursor === 0 && value === '' && onSlashMode) {
+    if (input === '/' && liveCursorRef.current === 0 && liveValueRef.current === '' && onSlashMode) {
       const next = '/';
+      liveValueRef.current = next;
+      liveCursorRef.current = 1;
       onChange(next);
       setCursor(1);
       onSlashMode('');
       return;
     }
 
-    // Regular character input
-    if (input && !key.ctrl && !key.meta && input.length > 0) {
-      const next = insertAt(value, cursor, input);
+    // Regular character input — explicitly exclude special keys that have their
+    // own handlers above (return is handled above; '\n' from pty ICRNL must also
+    // be excluded here, or it would be inserted as a literal newline character
+    // when slash mode is active and intercepts the Enter).
+    if (input && !key.ctrl && !key.meta && !key.return && input !== '\n' && input.length > 0) {
+      const lv = liveValueRef.current;
+      const lc = liveCursorRef.current;
+      const next = insertAt(lv, lc, input);
+      const newCursor = lc + input.length;
+      liveValueRef.current = next;
+      liveCursorRef.current = newCursor;
       onChange(next);
-      const newCursor = cursor + input.length;
       setCursor(newCursor);
 
-      // Notify slash mode if input starts with /
+      // Notify slash mode only while the query has no space yet (mirrors PromptBar.handleChange logic)
       if (next.startsWith('/') && onSlashMode) {
-        onSlashMode(next.slice(1));
+        const q = next.slice(1);
+        if (!q.includes(' ')) onSlashMode(q);
       }
 
       return;

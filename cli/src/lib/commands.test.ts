@@ -214,8 +214,8 @@ describe('command handlers', () => {
   it('/model with a custom model id passes it through', () => {
     const dispatch = mockDispatch();
     const cmd = findCommand('model')!;
-    cmd.handler(['my-custom-model'], dispatch);
-    expect(dispatch.setCurrentModel).toHaveBeenCalledWith('my-custom-model');
+    cmd.handler(['claude-custom-model'], dispatch);
+    expect(dispatch.setCurrentModel).toHaveBeenCalledWith('claude-custom-model');
   });
 
   it('/model with no args shows usage', () => {
@@ -297,7 +297,7 @@ describe('command handlers', () => {
     const dispatch = mockDispatch();
     const cmd = findCommand('color')!;
     cmd.handler(['red'], dispatch);
-    expect(dispatch.setPromptColor).toHaveBeenCalledWith('#F44336');
+    expect(dispatch.setPromptColor).toHaveBeenCalledWith('#FF6B80');
   });
 
   it('/color with an invalid name shows available colors', () => {

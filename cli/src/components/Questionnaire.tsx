@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Box, Text, useInput } from 'ink';
-import { colors } from '../lib/theme.js';
+import { useAppContext } from '../context/AppContext.js';
 import type { QuestionDef } from '../lib/types.js';
 
 interface QuestionnaireProps {
@@ -11,6 +11,7 @@ interface QuestionnaireProps {
 
 /** Minimal arrow-key select list — no external dependency. */
 function SelectList({ options, onSubmit }: { options: string[]; onSubmit: (value: string) => void }) {
+  const { themeColors } = useAppContext();
   const [cursor, setCursor] = useState(0);
 
   useInput((input, key) => {
@@ -28,9 +29,9 @@ function SelectList({ options, onSubmit }: { options: string[]; onSubmit: (value
       {options.map((opt, i) => (
         <Text key={opt}>
           {i === cursor ? (
-            <Text color={colors.primary} bold>{'❯ '}{opt}</Text>
+            <Text color={themeColors.primary} bold>{'❯ '}{opt}</Text>
           ) : (
-            <Text color={colors.dim}>{'  '}{opt}</Text>
+            <Text color={themeColors.dim}>{'  '}{opt}</Text>
           )}
         </Text>
       ))}
@@ -39,6 +40,7 @@ function SelectList({ options, onSubmit }: { options: string[]; onSubmit: (value
 }
 
 export function Questionnaire({ concept, questions, onComplete }: QuestionnaireProps) {
+  const { themeColors } = useAppContext();
   const [currentIdx, setCurrentIdx] = useState(0);
   const [answers, setAnswers] = useState<Record<string, string>>({});
 
@@ -59,11 +61,11 @@ export function Questionnaire({ concept, questions, onComplete }: QuestionnaireP
 
   return (
     <Box flexDirection="column">
-      <Text color={colors.primary}>
+      <Text color={themeColors.primary}>
         ? <Text bold>Customizing video for:</Text> {concept}
       </Text>
       <Box marginTop={1} flexDirection="column">
-        <Text bold color={colors.text}>
+        <Text bold color={themeColors.text}>
           {current.question}
         </Text>
         <Box marginTop={0}>
@@ -71,8 +73,8 @@ export function Questionnaire({ concept, questions, onComplete }: QuestionnaireP
         </Box>
       </Box>
       <Box marginTop={1}>
-        <Text color={colors.dim}>
-          Question {currentIdx + 1} of {questions.length}  <Text color={colors.muted}>↑↓ navigate  ↵ select</Text>
+        <Text color={themeColors.dim}>
+          Question {currentIdx + 1} of {questions.length}  <Text color={themeColors.muted}>↑↓ navigate  ↵ select</Text>
         </Text>
       </Box>
     </Box>

@@ -3,4 +3,9 @@ venv/
 .venv/
 __pycache__/
 output/
+build/
+dist/
+*.egg-info/
 .DS_Store
+mcp/node_modules/
+.mcp_test_scene.py

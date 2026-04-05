@@ -1,15 +1,8 @@
 /**
- * SlashCommandOverlay — Claude Code-style command palette.
+ * SlashCommandOverlay — command palette dropdown.
  *
- * Design decisions for rendering stability:
- * - Fixed height: always emits exactly MAX_VISIBLE command rows (padded with
- *   blank rows when fewer commands are shown). This prevents Ink's live-render
- *   region from changing height as the user scrolls, which was causing stale
- *   content from the welcome box above to bleed through.
- * - Above/below scroll indicators are always rendered (blank when not needed)
- *   for the same reason.
- * - Category info is shown in the header (for the selected command) rather than
- *   as interleaved section headers that would add/remove rows mid-list.
+ * Dynamic height: renders only the actual number of matching commands
+ * (up to MAX_VISIBLE). No blank padding rows.
  */
 
 import React, { useState, useEffect } from 'react';
@@ -104,8 +97,13 @@ export function SlashCommandOverlay({
     }
   }, [selectedIdx, scrollOffset]);
 
-  useInput((_input, key) => {
-    if (!isActive || filtered.length === 0) return;
+  useInput((input, key) => {
+    if (!isActive) return;
+
+    if (filtered.length === 0) {
+      if (key.escape) { onDismiss(); return; }
+      return;
+    }
 
     if (key.upArrow) {
       setSelectedIdx(i => Math.max(0, i - 1));
@@ -115,7 +113,7 @@ export function SlashCommandOverlay({
       setSelectedIdx(i => Math.min(filtered.length - 1, i + 1));
       return;
     }
-    if (key.return || key.tab) {
+    if (key.return || key.tab || input === '\n') {
       const cmd = filtered[selectedIdx];
       if (cmd) onAccept(cmd);
       return;
@@ -126,56 +124,56 @@ export function SlashCommandOverlay({
     }
   }, { isActive });
 
-  if (!isActive || filtered.length === 0) return null;
+  if (!isActive) return null;
 
-  // Slice the visible window — may be shorter than MAX_VISIBLE near the end
-  const visible = filtered.slice(scrollOffset, scrollOffset + MAX_VISIBLE);
+  // No matches — show feedback
+  if (filtered.length === 0) {
+    return (
+      <Box flexDirection="column" borderStyle="round" borderColor={themeColors.separator} paddingX={1}>
+        <Text color={themeColors.muted}>No matching commands</Text>
+        <Text color={themeColors.dim} dimColor>esc dismiss</Text>
+      </Box>
+    );
+  }
+
+  // Dynamic visible window
+  const visibleCount = Math.min(filtered.length, MAX_VISIBLE);
+  const visible = filtered.slice(scrollOffset, scrollOffset + visibleCount);
   const aboveCount = scrollOffset;
-  const belowCount = Math.max(0, filtered.length - scrollOffset - MAX_VISIBLE);
+  const belowCount = Math.max(0, filtered.length - scrollOffset - visibleCount);
 
-  // Selected command for the header category label
   const selectedCmd = filtered[selectedIdx];
   const categoryLabel = selectedCmd ? (CATEGORY_LABELS[selectedCmd.category] ?? selectedCmd.category) : '';
 
-  // Pad the visible slice to MAX_VISIBLE so the overlay height never changes
-  const rows: (SlashCommand | null)[] = [...visible];
-  while (rows.length < MAX_VISIBLE) rows.push(null);
-
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={themeColors.dim}>
+    <Box flexDirection="column" borderStyle="round" borderColor={themeColors.separator} paddingX={1}>
 
-      {/* ── Header: match count + selected category ── */}
-      <Box paddingX={1}>
+      {/* Header: match count + selected category */}
+      <Box>
         <Text color={themeColors.muted}>
           {query
             ? `${filtered.length} command${filtered.length !== 1 ? 's' : ''}`
             : `${COMMANDS.length} commands`}
         </Text>
         {categoryLabel ? (
-          <Text color={themeColors.dim} dimColor>{'  '}{categoryLabel}</Text>
+          <Text color={themeColors.dim} dimColor>  {categoryLabel}</Text>
         ) : null}
       </Box>
 
-      {/* ── Scroll indicator: above — always one line ── */}
-      <Box paddingX={2}>
-        {aboveCount > 0
-          ? <Text color={themeColors.dim}>↑ {aboveCount} more</Text>
-          : <Text> </Text>
-        }
-      </Box>
+      {/* Scroll indicator: above (only when scrollable) */}
+      {aboveCount > 0 && (
+        <Box paddingLeft={1}>
+          <Text color={themeColors.dim}>{aboveCount} more</Text>
+        </Box>
+      )}
 
-      {/* ── Fixed-height command rows ── */}
-      {rows.map((cmd, idx) => {
-        if (!cmd) {
-          // Blank padding row — keeps the overlay height constant
-          return <Box key={`pad-${idx}`} paddingX={1}><Text> </Text></Box>;
-        }
-
+      {/* Command rows */}
+      {visible.map((cmd, idx) => {
         const absIdx = scrollOffset + idx;
         const isSelected = absIdx === selectedIdx;
 
         return (
-          <Box key={cmd.name} paddingX={1}>
+          <Box key={cmd.name}>
             <Text color={isSelected ? themeColors.primary : themeColors.dim}>
               {isSelected ? '❯ ' : '  '}
             </Text>
@@ -190,23 +188,22 @@ export function SlashCommandOverlay({
             {cmd.args && (
               <Text color={themeColors.muted}> {cmd.args}</Text>
             )}
-            <Text color={themeColors.dim}>{'  '}{cmd.description}</Text>
+            <Text color={themeColors.dim}>  {cmd.description}</Text>
           </Box>
         );
       })}
 
-      {/* ── Scroll indicator: below — always one line ── */}
-      <Box paddingX={2}>
-        {belowCount > 0
-          ? <Text color={themeColors.dim}>↓ {belowCount} more</Text>
-          : <Text> </Text>
-        }
-      </Box>
+      {/* Scroll indicator: below (only when scrollable) */}
+      {belowCount > 0 && (
+        <Box paddingLeft={1}>
+          <Text color={themeColors.dim}>{belowCount} more</Text>
+        </Box>
+      )}
 
-      {/* ── Footer key hints ── */}
-      <Box paddingX={1}>
+      {/* Footer key hints */}
+      <Box>
         <Text color={themeColors.dim} dimColor>
-          {'↑↓ navigate  tab/↵ accept  esc dismiss'}
+          ↑↓ navigate  tab/↵ accept  esc dismiss
         </Text>
       </Box>
 

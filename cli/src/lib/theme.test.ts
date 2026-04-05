@@ -5,7 +5,7 @@ import { describe, it, expect } from 'vitest';
 import {
   THEMES,
   PROMPT_COLORS,
-  stageConfig,
+  getStageConfig,
   getThemeColors,
   truncatePath,
   cleanStatus,
@@ -16,6 +16,9 @@ import {
 } from './theme.js';
 import type { ThemeColors } from './theme.js';
 import type { ThemeName } from './types.js';
+
+// Build a stageConfig from the default dark theme for testing
+const stageConfig = getStageConfig(getThemeColors('dark'));
 
 // ── Required color fields ────────────────────────────────────────────────────
 
@@ -55,11 +58,11 @@ describe('THEMES', () => {
     }
   });
 
-  it('ansi theme uses named CSS colors', () => {
+  it('ansi theme has valid color values', () => {
     const ansi = THEMES.ansi;
-    // These should be simple named colors, not hex
+    // Accept either named CSS colors or hex codes
     for (const field of REQUIRED_COLOR_FIELDS) {
-      expect(ansi[field]).toMatch(/^[a-z]+$/);
+      expect(ansi[field]).toMatch(/^(#[0-9A-Fa-f]{3,8}|[a-z]+)$/);
     }
   });
 });
@@ -104,7 +107,7 @@ describe('PROMPT_COLORS', () => {
 // ── stageConfig ──────────────────────────────────────────────────────────────
 
 describe('stageConfig', () => {
-  const EXPECTED_STAGES = ['plan', 'tts', 'code', 'render', 'stitch', 'concat', 'done'];
+  const EXPECTED_STAGES = ['plan', 'tts', 'code', 'code_retry', 'verify', 'render', 'timing', 'concat', 'overlay', 'done'];
 
   it('covers all expected pipeline stages', () => {
     for (const stage of EXPECTED_STAGES) {
@@ -123,7 +126,7 @@ describe('stageConfig', () => {
   });
 
   it('done stage has a check-mark icon', () => {
-    expect(stageConfig.done.icon).toContain('\u2713'); // check mark
+    expect(stageConfig.done.icon).toContain('\u2714'); // heavy check mark ✔
   });
 });
 

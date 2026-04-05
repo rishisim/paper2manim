@@ -2,22 +2,20 @@
  * PromptBar — The main input component, styled like Claude Code CLI.
  *
  * Features:
- * - Colored left border (promptColor from settings)
- * - "/ for commands" hint when empty
+ * - Round-bordered input box with gray border (Claude Code style)
+ * - ">" prompt character in success (green) color
  * - Slash command autocomplete via SlashCommandOverlay
  * - "!" prefix routes to bash mode
  * - ControlledTextInput with full cursor control
- * - Model + permission mode shown below input
  */
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { Box, Text } from 'ink';
 import { useAppContext } from '../context/AppContext.js';
 import { ControlledTextInput } from './ControlledTextInput.js';
 import { SlashCommandOverlay } from './SlashCommandOverlay.js';
 import { findCommand } from '../lib/commands.js';
 import type { SlashCommand, AppDispatch } from '../lib/types.js';
-import { PERMISSION_MODE_LABELS } from '../lib/types.js';
 
 interface PromptBarProps {
   onSubmit: (value: string) => void;
@@ -27,19 +25,29 @@ interface PromptBarProps {
   /** Called synchronously when slash mode opens or closes, so the parent can
    *  immediately suspend any competing key handlers. */
   onSlashModeChange?: (active: boolean) => void;
+  /** External text to inject into the input (e.g. from /surprise). */
+  prefill?: string;
+  /** Called after prefill has been consumed, so the parent can clear it. */
+  onPrefillConsumed?: () => void;
 }
 
-export function PromptBar({ onSubmit, dispatch, isDisabled = false, placeholder, onSlashModeChange }: PromptBarProps) {
+export function PromptBar({ onSubmit, dispatch, isDisabled = false, placeholder, onSlashModeChange, prefill, onPrefillConsumed }: PromptBarProps) {
   const {
     themeColors,
     promptColor,
-    permissionMode,
-    currentModel,
   } = useAppContext();
 
   const [value, setValue] = useState('');
   const [slashMode, setSlashMode] = useState(false);
   const [slashQuery, setSlashQuery] = useState('');
+
+  // Apply external prefill when it changes
+  useEffect(() => {
+    if (prefill !== undefined && prefill !== '') {
+      setValue(prefill);
+      onPrefillConsumed?.();
+    }
+  }, [prefill]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /** Open or close slash mode, notifying the parent synchronously. */
   const setSlash = useCallback((active: boolean, query = '') => {
@@ -51,7 +59,11 @@ export function PromptBar({ onSubmit, dispatch, isDisabled = false, placeholder,
   const handleChange = useCallback((v: string) => {
     setValue(v);
     if (v.startsWith('/')) {
-      setSlash(true, v.slice(1));
+      const query = v.slice(1);
+      // Only keep slash mode active while user is still typing the command name.
+      // Once a space appears the overlay has no matches anyway, and leaving
+      // slashMode=true would block Enter (ControlledTextInput line 131).
+      setSlash(!query.includes(' '), query);
     } else {
       setSlash(false);
     }
@@ -95,9 +107,10 @@ export function PromptBar({ onSubmit, dispatch, isDisabled = false, placeholder,
 
   const handleAcceptCommand = useCallback((cmd: SlashCommand) => {
     if (cmd.args) {
-      // Leave in input so user can fill in the required argument
+      // Leave in input so user can fill in the required argument.
+      // Disable slash mode so Enter is no longer blocked by ControlledTextInput.
       setValue(`/${cmd.name} `);
-      setSlash(true, cmd.name + ' ');
+      setSlash(false);
     } else {
       setValue('');
       setSlash(false);
@@ -108,18 +121,6 @@ export function PromptBar({ onSubmit, dispatch, isDisabled = false, placeholder,
   const handleDismissSlash = useCallback(() => {
     setSlash(false);
   }, [setSlash]);
-
-  const modelShort = currentModel
-    .replace('claude-', '')
-    .replace('-4-6', ' 4.6')
-    .replace('-4-5', ' 4.5');
-
-  const modeLabel = PERMISSION_MODE_LABELS[permissionMode] ?? permissionMode;
-  const modeColor =
-    permissionMode === 'plan' ? themeColors.warn :
-    permissionMode === 'auto' ? themeColors.success :
-    permissionMode === 'bypassPermissions' ? themeColors.error :
-    themeColors.dim;
 
   return (
     <Box flexDirection="column">
@@ -133,34 +134,19 @@ export function PromptBar({ onSubmit, dispatch, isDisabled = false, placeholder,
         />
       )}
 
-      {/* Input box — colored round border, Claude Code style */}
+      {/* Input box — round border in gray, Claude Code style */}
       <Box borderStyle="round" borderColor={promptColor} paddingX={1}>
+        <Text color={themeColors.success} bold>{'> '}</Text>
         <ControlledTextInput
           value={value}
           onChange={handleChange}
           onSubmit={handleSubmit}
           onSlashMode={handleSlashMode}
-          placeholder={placeholder ?? 'Type a concept, or / for commands, ! for bash…'}
+          placeholder={placeholder ?? 'Type a concept, or / for commands…'}
           isDisabled={isDisabled}
           focus={!isDisabled}
           slashModeActive={slashMode}
         />
-      </Box>
-
-      {/* Sub-row: model · mode · hint */}
-      <Box paddingLeft={1}>
-        <Text color={themeColors.dim}>
-          <Text color={themeColors.muted}>{modelShort}</Text>
-          <Text> · </Text>
-          <Text color={modeColor}>{modeLabel}</Text>
-          <Text color={themeColors.dim}>  (</Text>
-          <Text color={themeColors.primary} bold>/</Text>
-          <Text color={themeColors.dim}> for commands · </Text>
-          <Text color={themeColors.primary} bold>!</Text>
-          <Text color={themeColors.dim}> for bash · </Text>
-          <Text color={themeColors.primary} bold>Shift+Tab</Text>
-          <Text color={themeColors.dim}> to cycle mode)</Text>
-        </Text>
       </Box>
     </Box>
   );

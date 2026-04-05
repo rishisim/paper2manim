@@ -10,7 +10,6 @@ import { App } from './App.js';
 import { runPrintMode } from './lib/printMode.js';
 import { loadSettings, flagsToSettingsOverrides } from './lib/settings.js';
 import { createSession, loadSession, getMostRecentSession } from './lib/session.js';
-import { useGitBranch } from './hooks/useGitBranch.js';
 
 const cli = meow(
   `
@@ -231,8 +230,6 @@ if (cli.flags.printMode || outputFormat === 'json' || outputFormat === 'stream-j
       maxRetries={cli.flags.maxRetries}
       isLite={effectiveQuality === 'low'}
       quality={effectiveQuality}
-      model={settings.model}
-      theme={settings.theme}
       skipAudio={cli.flags.skipAudio}
       workspace={cli.flags.workspace}
       resumeDir={cli.flags.resume}

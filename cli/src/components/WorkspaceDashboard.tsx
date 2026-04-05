@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Box, Text, useInput, useApp } from 'ink';
 import { execSync } from 'node:child_process';
 import { resolve } from 'node:path';
-import { colors } from '../lib/theme.js';
+import { useAppContext } from '../context/AppContext.js';
 import { spawnRunner } from '../lib/process.js';
 import type { Project } from '../lib/types.js';
 
@@ -15,6 +15,7 @@ type SubScreen = 'list' | 'actions' | 'summary' | 'confirm-delete' | 'confirm-cl
 
 export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps) {
   const { exit } = useApp();
+  const { themeColors } = useAppContext();
   const [projects, setProjects] = useState<Project[]>([]);
   const [placeholderCount, setPlaceholderCount] = useState(0);
   const [selectedIdx, setSelectedIdx] = useState(0);
@@ -172,7 +173,7 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
     return (
       <Box flexDirection="column" paddingX={1}>
         <Text bold>Project Workspace</Text>
-        <Text color={colors.dim}>Loading projects...</Text>
+        <Text color={themeColors.dim}>Loading projects...</Text>
       </Box>
     );
   }
@@ -186,7 +187,7 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
           <Text>{summaryText ?? 'No pipeline summary found for this project yet.'}</Text>
         </Box>
         <Box marginTop={1}>
-          <Text color={colors.dim}>Press <Text bold>Enter</Text> to go back</Text>
+          <Text color={themeColors.dim}>Press <Text bold>Enter</Text> to go back</Text>
         </Box>
       </Box>
     );
@@ -197,8 +198,8 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
     const project = projects[selectedIdx];
     return (
       <Box flexDirection="column" paddingX={1}>
-        <Text color="red" bold>Delete project "{project?.concept}"?</Text>
-        <Text color={colors.dim}>This will permanently remove all files.</Text>
+        <Text color={themeColors.error} bold>Delete project "{project?.concept}"?</Text>
+        <Text color={themeColors.dim}>This will permanently remove all files.</Text>
         <Box marginTop={1}>
           <Text>Press <Text bold>y</Text> to confirm, any other key to cancel</Text>
         </Box>
@@ -210,7 +211,7 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
   if (subScreen === 'confirm-cleanup') {
     return (
       <Box flexDirection="column" paddingX={1}>
-        <Text color="yellow" bold>Clean {placeholderCount} stale workspace entries?</Text>
+        <Text color={themeColors.warn} bold>Clean {placeholderCount} stale workspace entries?</Text>
         <Box marginTop={1}>
           <Text>Press <Text bold>y</Text> to confirm, any other key to cancel</Text>
         </Box>
@@ -224,12 +225,12 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
     return (
       <Box flexDirection="column" paddingX={1}>
         <Text bold>{project?.concept}</Text>
-        <Text color={colors.dim}>{project?.folder}</Text>
+        <Text color={themeColors.dim}>{project?.folder}</Text>
         <Box marginTop={1} flexDirection="column">
-          <Text><Text bold color={colors.primary}>v</Text> View summary</Text>
-          <Text><Text bold color={colors.primary}>r</Text> Resume pipeline</Text>
-          <Text><Text bold color="red">d</Text> Delete project</Text>
-          <Text><Text bold color={colors.dim}>c</Text> Cancel</Text>
+          <Text><Text bold color={themeColors.primary}>v</Text> View summary</Text>
+          <Text><Text bold color={themeColors.primary}>r</Text> Resume pipeline</Text>
+          <Text><Text bold color={themeColors.error}>d</Text> Delete project</Text>
+          <Text><Text bold color={themeColors.dim}>c</Text> Cancel</Text>
         </Box>
       </Box>
     );
@@ -239,11 +240,11 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
   return (
     <Box flexDirection="column" paddingX={1}>
       <Text bold>Project Workspace</Text>
-      <Text color={colors.dim}>Resume or delete existing video projects.</Text>
+      <Text color={themeColors.dim}>Resume or delete existing video projects.</Text>
 
       {projects.length === 0 ? (
         <Box marginTop={1}>
-          <Text color="yellow">No projects found in the workspace yet.</Text>
+          <Text color={themeColors.warn}>No projects found in the workspace yet.</Text>
         </Box>
       ) : (
         <Box flexDirection="column" marginTop={1}>
@@ -256,17 +257,17 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
             const statusText = p.status === 'completed'
               ? '✓ Completed'
               : `${pct}% — ${p.progress_desc}`;
-            const statusColor = p.status === 'completed' ? colors.success : 'yellow';
+            const statusColor = p.status === 'completed' ? themeColors.success : themeColors.warn;
 
             return (
               <Box key={p.dir}>
-                <Text color={isSelected ? colors.primary : colors.dim} bold={isSelected}>
-                  {pointer} {String(idx + 1).padStart(2)}.{' '}
+                <Text color={isSelected ? themeColors.primary : themeColors.dim} bold={isSelected}>
+                  {isSelected ? '❯' : ' '} {String(idx + 1).padStart(2)}.{' '}
                 </Text>
                 <Text bold={isSelected}>{p.concept}</Text>
-                <Text color={colors.dim}>  </Text>
+                <Text color={themeColors.dim}>  </Text>
                 <Text color={statusColor}>{statusText}</Text>
-                <Text color={colors.dim}>  {p.updated_at}</Text>
+                <Text color={themeColors.dim}>  {p.updated_at}</Text>
               </Box>
             );
           })}
@@ -275,7 +276,7 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
 
       {placeholderCount > 0 && (
         <Box marginTop={1}>
-          <Text color={colors.dim}>
+          <Text color={themeColors.dim}>
             {placeholderCount} stale entries hidden — press <Text bold>x</Text> to clean
           </Text>
         </Box>
@@ -283,12 +284,12 @@ export function WorkspaceDashboard({ onResume, onBack }: WorkspaceDashboardProps
 
       {message && (
         <Box marginTop={1}>
-          <Text color={colors.success}>{message}</Text>
+          <Text color={themeColors.success}>{message}</Text>
         </Box>
       )}
 
       <Box marginTop={1}>
-        <Text color={colors.dim}>
+        <Text color={themeColors.dim}>
           <Text bold>↑↓</Text> navigate  <Text bold>Enter</Text> select  {placeholderCount > 0 && <><Text bold>x</Text> clean  </>}<Text bold>q</Text> back
         </Text>
       </Box>

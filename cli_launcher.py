@@ -29,10 +29,23 @@ def main() -> None:
         # pipeline_runner.py with the correct venv Python (not system Python).
         env = os.environ.copy()
         env["PAPER2MANIM_PYTHON"] = sys.executable
+
+        # In non-interactive mode (--print / -p), stdin may not be a TTY.
+        # Ink's useInput requires raw mode on stdin, which fails on pipes.
+        # Provide /dev/null as stdin so the print-mode codepath (which
+        # bypasses Ink rendering entirely) never triggers the raw-mode check.
+        is_print_mode = any(
+            arg in ("--print", "-p") for arg in sys.argv[1:]
+        )
+        stdin_arg: int | None = None
+        if is_print_mode or not sys.stdin.isatty():
+            stdin_arg = subprocess.DEVNULL
+
         result = subprocess.run(
             [node, cli_js, *sys.argv[1:]],
             cwd=os.path.dirname(os.path.abspath(__file__)),
             env=env,
+            stdin=stdin_arg,
         )
         sys.exit(result.returncode)
     else:

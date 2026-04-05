@@ -82,8 +82,8 @@ export function AppContextProvider({ settings: initialSettings, session: initial
   const updateSetting = useCallback(<K extends keyof Settings>(key: K, value: Settings[K]) => {
     setSettings(prev => {
       const next = { ...prev, [key]: value };
-      // Persist to user scope
-      saveSettings('user', { [key]: value });
+      // H1: Defer I/O outside the state updater to avoid blocking React's render cycle
+      queueMicrotask(() => saveSettings('user', { [key]: value }));
       return next;
     });
 
@@ -104,8 +104,8 @@ export function AppContextProvider({ settings: initialSettings, session: initial
     setPermissionModeState(current => {
       const idx = PERMISSION_MODES.indexOf(current);
       const next = PERMISSION_MODES[(idx + 1) % PERMISSION_MODES.length] ?? PERMISSION_MODES[0];
-      // H1: Persist cycled mode too
-      saveSettings('user', { defaultMode: next });
+      // H1: Persist cycled mode — deferred to avoid I/O inside a state updater
+      queueMicrotask(() => saveSettings('user', { defaultMode: next }));
       return next;
     });
   }, []);
@@ -123,8 +123,8 @@ export function AppContextProvider({ settings: initialSettings, session: initial
   const setVerboseMode = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
     setVerboseModeState(prev => {
       const next = typeof v === 'function' ? v(prev) : v;
-      // M10: Persist verbose mode as outputStyle
-      saveSettings('user', { outputStyle: next ? 'verbose' : 'default' });
+      // M10: Persist verbose mode — deferred to avoid I/O inside a state updater
+      queueMicrotask(() => saveSettings('user', { outputStyle: next ? 'verbose' : 'default' }));
       return next;
     });
   }, []);

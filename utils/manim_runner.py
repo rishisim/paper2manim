@@ -62,6 +62,8 @@ def _default_timeout_for_quality(quality_flag: str) -> int:
         return int(os.getenv("MANIM_RENDER_TIMEOUT_MEDIUM_SECONDS", "90"))
     if flag in {"-qh", "h", "high_quality"}:
         return int(os.getenv("MANIM_RENDER_TIMEOUT_HIGH_SECONDS", "240"))
+    if flag in {"-qp", "p", "production_quality"}:
+        return int(os.getenv("MANIM_RENDER_TIMEOUT_PRODUCTION_SECONDS", "420"))
     return int(os.getenv("MANIM_RENDER_TIMEOUT_SECONDS", "120"))
 
 def dry_run_manim_code(code: str, class_name: str, timeout_seconds: int = 0) -> dict:

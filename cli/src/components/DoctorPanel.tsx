@@ -116,8 +116,8 @@ export function DoctorPanel({ onBack }: DoctorPanelProps) {
 
   const statusIcon = (status: CheckResult['status']) => {
     switch (status) {
-      case 'ok': return '✓';
-      case 'fail': return '✗';
+      case 'ok': return '✔';
+      case 'fail': return '✘';
       case 'warn': return '⚠';
       case 'checking': return '…';
     }

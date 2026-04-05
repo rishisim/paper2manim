@@ -44,11 +44,16 @@ def _extract_stage_literals(filepath: str) -> list[tuple[str, int]]:
 
     stages: list[tuple[str, int]] = []
 
-    # Pattern: "stage": "value" or 'stage': 'value'
-    pattern = re.compile(r"""["']stage["']\s*:\s*["']([^"']+)["']""")
+    # Pattern 1: "stage": "value" or 'stage': 'value' (string literals)
+    pattern_str = re.compile(r"""["']stage["']\s*:\s*["']([^"']+)["']""")
+    # Pattern 2: "stage": Stage.VALUE (enum references)
+    pattern_enum = re.compile(r"""["']stage["']\s*:\s*Stage\.(\w+)""")
     for i, line in enumerate(source.splitlines(), 1):
-        for m in pattern.finditer(line):
+        for m in pattern_str.finditer(line):
             stages.append((m.group(1), i))
+        for m in pattern_enum.finditer(line):
+            # Convert enum name to value (e.g., PLAN -> plan)
+            stages.append((m.group(1).lower(), i))
 
     return stages
 

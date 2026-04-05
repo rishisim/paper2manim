@@ -27,7 +27,7 @@ from agents.validation import validate_concept
 from agents.stages import Stage
 from utils.tts_engine import generate_voiceover_async
 from utils.media_assembler import stitch_video_and_audio, concatenate_segments
-from utils.parallel_renderer import RenderJob, render_two_pass, render_parallel
+from utils.parallel_renderer import RenderJob, render_parallel
 from utils.project_state import (
     create_project,
     load_project,

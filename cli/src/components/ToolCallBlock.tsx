@@ -5,6 +5,7 @@
 
 import React, { useState } from 'react';
 import { Box, Text, useInput } from 'ink';
+import { RESULT_MARKER } from '../lib/theme.js';
 import { useAppContext } from '../context/AppContext.js';
 import type { ToolCallEntry } from '../lib/types.js';
 
@@ -34,8 +35,8 @@ export function ToolCallBlock({ entry, isFocused = false }: ToolCallBlockProps) 
     <Box flexDirection="column" paddingLeft={2}>
       {/* Tool name + summary (always visible) */}
       <Box>
-        <Text color={themeColors.accent} bold>⏺ </Text>
-        <Text color={themeColors.primary}>{entry.name}</Text>
+        <Text color={themeColors.accent} bold>{RESULT_MARKER} </Text>
+        <Text color={themeColors.primary} bold>{entry.name}</Text>
         {paramsSummary && (
           <Text color={themeColors.dim}> ({paramsSummary})</Text>
         )}

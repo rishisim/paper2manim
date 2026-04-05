@@ -15,7 +15,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def test_model_constants_exist():
-    from agents.coder import MODEL_PRO, MODEL_FAST
+    from agents.config import CLAUDE_OPUS as MODEL_PRO, CLAUDE_SONNET as MODEL_FAST
 
     assert isinstance(MODEL_PRO, str) and len(MODEL_PRO) > 0
     assert isinstance(MODEL_FAST, str) and len(MODEL_FAST) > 0
@@ -23,19 +23,22 @@ def test_model_constants_exist():
 
 
 def test_get_model_for_complexity_complex():
-    from agents.coder import _get_model_for_complexity, MODEL_PRO
+    from agents.coder import _get_model_for_complexity
+    from agents.config import CLAUDE_OPUS as MODEL_PRO
 
     assert _get_model_for_complexity("complex") == MODEL_PRO
 
 
 def test_get_model_for_complexity_simple():
-    from agents.coder import _get_model_for_complexity, MODEL_FAST
+    from agents.coder import _get_model_for_complexity
+    from agents.config import CLAUDE_SONNET as MODEL_FAST
 
     assert _get_model_for_complexity("simple") == MODEL_FAST
 
 
 def test_get_model_for_complexity_default():
-    from agents.coder import _get_model_for_complexity, MODEL_PRO
+    from agents.coder import _get_model_for_complexity
+    from agents.config import CLAUDE_OPUS as MODEL_PRO
 
     assert _get_model_for_complexity() == MODEL_PRO
 

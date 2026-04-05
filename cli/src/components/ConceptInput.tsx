@@ -1,7 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import { TextInput } from '@inkjs/ui';
-import { colors } from '../lib/theme.js';
+import { useAppContext } from '../context/AppContext.js';
 
 interface ConceptInputProps {
   onSubmit: (concept: string) => void;
@@ -11,15 +11,15 @@ interface ConceptInputProps {
 }
 
 export function ConceptInput({ onSubmit, isDisabled = false, clearKey = 0 }: ConceptInputProps) {
+  const { themeColors, promptColor } = useAppContext();
   return (
     <Box flexDirection="column">
-      <Text bold>What concept would you like to visualize?</Text>
-      <Box marginTop={1}>
-        <Text color={colors.primary} bold>{'> '}</Text>
+      <Box borderStyle="round" borderColor={promptColor} paddingX={1}>
+        <Text color={themeColors.success} bold>{'> '}</Text>
         <TextInput
           key={clearKey}
           isDisabled={isDisabled}
-          placeholder="e.g. The Dot Product, Fourier Transform..."
+          placeholder="Type a concept to visualize…"
           onSubmit={(value) => {
             const trimmed = value.trim();
             if (trimmed) onSubmit(trimmed);

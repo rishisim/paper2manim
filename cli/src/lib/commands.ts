@@ -5,10 +5,11 @@
 
 import { execSync, execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, writeFileSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { SlashCommand, AppDispatch, ThemeName, CommandCategory } from './types.js';
 import { PROMPT_COLORS } from './theme.js';
+import { pickSurprise } from './surprise.js';
 import { loadSettings, saveSettings } from './settings.js';
 import { listSessions } from './session.js';
 
@@ -33,6 +34,17 @@ Instructions and preferences loaded by paper2manim at session start.
 
 export const COMMANDS: SlashCommand[] = [
   // ── Generation ────────────────────────────────────────────────
+  {
+    name: 'surprise',
+    aliases: ['random', 'lucky', 'inspire'],
+    description: 'Pick a random fascinating topic',
+    category: 'generation' as CommandCategory,
+    handler: (_args, dispatch) => {
+      const { category, emoji, color, topic } = pickSurprise();
+      dispatch.setPromptText(topic);
+      dispatch.showMessage(`${emoji}  ${category}  — edit or press Enter to generate, /surprise to reroll`, color);
+    },
+  },
   {
     name: 'generate',
     aliases: [],
@@ -73,8 +85,8 @@ export const COMMANDS: SlashCommand[] = [
     handler: (args, dispatch) => {
       dispatch.setPermissionMode('plan');
       const concept = args.join(' ').trim();
-      if (concept) dispatch.startPipeline(concept);
       dispatch.showMessage('Switched to plan mode — storyboard only, no video generation.', undefined);
+      if (concept) dispatch.startPipeline(concept);
     },
   },
 
@@ -106,25 +118,53 @@ export const COMMANDS: SlashCommand[] = [
     handler: (args, dispatch) => {
       const dir = args[0];
       if (!dir) {
-        dispatch.showMessage('Usage: /delete <dir>', undefined);
+        dispatch.showMessage('Usage: /delete <project-folder-name>', undefined);
+        return;
+      }
+      // Safety: only allow deleting folders inside output/
+      const outputDir = resolve(process.cwd(), 'output');
+      const target = resolve(outputDir, dir);
+      if (!target.startsWith(outputDir + '/') || target === outputDir) {
+        dispatch.showMessage(`Refused: path must be inside output/ directory`, 'red');
+        return;
+      }
+      if (!existsSync(target)) {
+        dispatch.showMessage(`Not found: output/${dir}`, 'red');
         return;
       }
       try {
         // C4: Use execFileSync (no shell) to avoid injection via backticks/$()
-        execFileSync('rm', ['-rf', dir]);
-        dispatch.showMessage(`Deleted: ${dir}`, undefined);
+        execFileSync('rm', ['-rf', target]);
+        dispatch.showMessage(`Deleted: output/${dir}`, undefined);
       } catch {
-        dispatch.showMessage(`Failed to delete: ${dir}`, undefined);
+        dispatch.showMessage(`Failed to delete: output/${dir}`, 'red');
       }
     },
   },
   {
     name: 'clean',
     aliases: [],
-    description: 'Remove stale/incomplete projects',
+    description: 'Remove stale/incomplete projects from output/',
     category: 'workspace' as CommandCategory,
     handler: (_args, dispatch) => {
-      dispatch.showMessage('Running cleanup... (use --workspace to manage projects)', undefined);
+      const outputDir = resolve(process.cwd(), 'output');
+      if (!existsSync(outputDir)) {
+        dispatch.showMessage('No output/ directory found.', undefined);
+        return;
+      }
+      try {
+        // Use the Python cleanup utility
+        const result = execFileSync('python3', ['-c',
+          'from utils.project_state import cleanup_placeholder_projects; n = cleanup_placeholder_projects(); print(n)'],
+          { encoding: 'utf-8', timeout: 10_000 }).trim();
+        const count = parseInt(result, 10) || 0;
+        dispatch.showMessage(
+          count > 0 ? `Cleaned up ${count} stale project(s).` : 'No stale projects found.',
+          undefined
+        );
+      } catch {
+        dispatch.showMessage('Cleanup failed. Try /workspace to manage projects manually.', 'red');
+      }
     },
   },
 
@@ -210,13 +250,25 @@ export const COMMANDS: SlashCommand[] = [
     args: '[opus|sonnet|<model-id>]',
     category: 'settings' as CommandCategory,
     handler: (args, dispatch) => {
+      const KNOWN_ALIASES: Record<string, string> = {
+        opus: 'claude-opus-4-6',
+        sonnet: 'claude-sonnet-4-6',
+        haiku: 'claude-haiku-4-5-20251001',
+      };
+      const KNOWN_MODELS = new Set([
+        ...Object.values(KNOWN_ALIASES),
+        'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001',
+      ]);
       let model = args[0];
       if (!model) {
-        dispatch.showMessage('Usage: /model [opus|sonnet|<model-id>]', undefined);
+        dispatch.showMessage(`Usage: /model [${Object.keys(KNOWN_ALIASES).join('|')}|<model-id>]`, undefined);
         return;
       }
-      if (model === 'opus') model = 'claude-opus-4-6';
-      if (model === 'sonnet') model = 'claude-sonnet-4-6';
+      if (KNOWN_ALIASES[model]) model = KNOWN_ALIASES[model];
+      if (!KNOWN_MODELS.has(model) && !model.startsWith('claude-')) {
+        dispatch.showMessage(`Unknown model: "${model}". Use opus, sonnet, haiku, or a full claude-* model ID.`, 'red');
+        return;
+      }
       dispatch.setCurrentModel(model);
       dispatch.showMessage(`Model set to: ${model}`, undefined);
     },
@@ -263,6 +315,23 @@ export const COMMANDS: SlashCommand[] = [
       dispatch.showMessage('Vim mode is configured in /config → Editor Mode.', undefined);
     },
   },
+  {
+    name: 'tts',
+    aliases: [],
+    description: 'Switch TTS mode (batch or live)',
+    args: '[batch|live]',
+    category: 'settings' as CommandCategory,
+    handler: (args, dispatch) => {
+      const mode = args[0]?.toLowerCase();
+      if (!mode || !['batch', 'live'].includes(mode)) {
+        const current = process.env['GEMINI_TTS_MODE'] ?? 'batch';
+        dispatch.showMessage(`TTS mode: ${current}. Usage: /tts [batch|live]`, undefined);
+        return;
+      }
+      process.env['GEMINI_TTS_MODE'] = mode;
+      dispatch.showMessage(`TTS mode set to: ${mode}`, undefined);
+    },
+  },
 
   // ── Display / Output ──────────────────────────────────────────
   {
@@ -297,11 +366,11 @@ export const COMMANDS: SlashCommand[] = [
   },
   {
     name: 'cost',
-    aliases: [],
-    description: 'Show token usage and estimated cost',
+    aliases: ['tokens'],
+    description: 'Show token usage summary',
     category: 'display' as CommandCategory,
     handler: (_args, dispatch) => {
-      dispatch.showMessage('Token usage shown in footer. Detailed breakdown coming soon.', undefined);
+      dispatch.showMessage('Token usage is displayed in the footer status line. Use /verbose for detailed per-stage breakdown.', undefined);
     },
   },
   {
@@ -367,10 +436,10 @@ export const COMMANDS: SlashCommand[] = [
   {
     name: 'tasks',
     aliases: [],
-    description: 'List background processes',
+    description: 'Show pipeline status for active generation',
     category: 'tools' as CommandCategory,
     handler: (_args, dispatch) => {
-      dispatch.showMessage('No background tasks running.', undefined);
+      dispatch.showMessage('Pipeline progress is shown live during generation. Use /workspace to see all project statuses.', undefined);
     },
   },
   {
@@ -411,8 +480,12 @@ export const COMMANDS: SlashCommand[] = [
         dispatch.showMessage(`${path} already exists.`, undefined);
         return;
       }
-      writeFileSync(path, PAPER2MANIM_MD_TEMPLATE, 'utf8');
-      dispatch.showMessage(`Created ${path} — edit it to customize generation preferences.`, undefined);
+      try {
+        writeFileSync(path, PAPER2MANIM_MD_TEMPLATE, 'utf8');
+        dispatch.showMessage(`Created ${path} — edit it to customize generation preferences.`, undefined);
+      } catch (err) {
+        dispatch.showMessage(`Failed to create ${path}: ${err instanceof Error ? err.message : String(err)}`, 'red');
+      }
     },
   },
   {
@@ -442,10 +515,10 @@ export const COMMANDS: SlashCommand[] = [
   {
     name: 'insights',
     aliases: [],
-    description: 'Generate session analysis (timing, tool calls, quality)',
+    description: 'View timing and tool call breakdown from last generation',
     category: 'session' as CommandCategory,
     handler: (_args, dispatch) => {
-      dispatch.showMessage('Session insights shown in the summary table after generation completes.', undefined);
+      dispatch.showMessage('Insights (timing, tool calls, quality) are shown in the summary table after generation. Use /workspace to inspect past projects.', undefined);
     },
   },
   {
@@ -474,9 +547,9 @@ export const COMMANDS: SlashCommand[] = [
     category: 'session' as CommandCategory,
     handler: (_args, dispatch) => {
       try {
-        execSync('open https://github.com/anthropics/claude-code/issues');
+        execSync('open https://github.com/rishisim/paper2manim/issues');
       } catch {
-        dispatch.showMessage('Submit feedback at: https://github.com/anthropics/claude-code/issues', undefined);
+        dispatch.showMessage('Submit feedback at: https://github.com/rishisim/paper2manim/issues', undefined);
       }
     },
   },
@@ -492,19 +565,6 @@ export const COMMANDS: SlashCommand[] = [
       } catch {
         dispatch.showMessage('Not a git repo or no output/ directory.', undefined);
       }
-    },
-  },
-  {
-    name: 'btw',
-    aliases: [],
-    description: 'Ask a side question without affecting generation history',
-    args: '<question>',
-    category: 'session' as CommandCategory,
-    handler: (args, dispatch) => {
-      const question = args.join(' ').trim();
-      if (!question) return;
-      // Show as an inline message — does not affect pipeline state
-      dispatch.showMessage(`Side question noted: "${question}"`, undefined);
     },
   },
 ];

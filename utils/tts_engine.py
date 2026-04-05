@@ -139,6 +139,25 @@ def _get_audio_duration(path: str) -> Optional[float]:
         logger.warning("ffprobe failed for %s: %s", path, e)
     return None
 
+def _gtts_fallback(text: str, output_path: str, original_error: str) -> dict:
+    """Attempt gTTS fallback, return final result dict."""
+    try:
+        from gtts import gTTS
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fallback_mp3 = os.path.join(temp_dir, "fallback.mp3")
+            tts = gTTS(text)
+            tts.save(fallback_mp3)
+            success, error = _normalize_to_wav(fallback_mp3, output_path)
+            if not success:
+                return {"success": False, "audio_path": None, "mime_type": None, "duration": None, "error": f"Primary TTS failed: {original_error}. gTTS fallback failed: {error}"}
+        if not _is_valid_audio_file(output_path):
+            return {"success": False, "audio_path": None, "mime_type": None, "duration": None, "error": f"Primary TTS failed: {original_error}. gTTS fallback produced invalid audio."}
+        duration = _get_audio_duration(output_path)
+        return {"success": True, "audio_path": output_path, "mime_type": "audio/mpeg", "duration": duration, "error": f"Primary TTS failed, used gTTS fallback: {original_error}"}
+    except Exception as fallback_exc:
+        return {"success": False, "audio_path": None, "mime_type": None, "duration": None, "error": f"Primary TTS failed: {original_error}. gTTS fallback unavailable/failed: {fallback_exc}"}
+
+
 def generate_voiceover(text: str, output_path: str) -> Iterator[dict]:
     """
     Generates a voiceover from text using Gemini's audio capability.
@@ -154,7 +173,7 @@ def generate_voiceover(text: str, output_path: str) -> Iterator[dict]:
         tts_model = os.getenv("GEMINI_TTS_MODEL", GEMINI_TTS)
         response = client.models.generate_content(
             model=tts_model,
-            contents=f"Speak in a calm, clear, and instructional tone. Maintain a steady, measured pace. Use a thoughtful and inquisitive intonation as if explaining a complex mathematical concept to a curious student. Read the following text: {text}",
+            contents=f"Speak in a calm, clear, and instructional tone. Maintain a steady, measured pace. Use a thoughtful and inquisitive intonation as if explaining a complex mathematical concept to a curious student. When you encounter '......' (six dots), pause for about 1.5 seconds to mark a transition between video segments. Read the following text: {text}",
             config=types.GenerateContentConfig(
                 response_modalities=["AUDIO"],
                 speech_config=types.SpeechConfig(
@@ -229,16 +248,98 @@ def generate_voiceover(text: str, output_path: str) -> Iterator[dict]:
             yield {"final": True, "success": False, "audio_path": None, "mime_type": None, "error": f"Gemini TTS failed: {gemini_error}. gTTS fallback unavailable/failed: {fallback_exc}"}
 
 
-# ── Async variant for parallel segment TTS ────────────────────────────
+# ── Live API variant (WebSocket streaming) ───────────────────────────
+
+async def generate_voiceover_live(text: str, output_path: str) -> dict:
+    """Generate voiceover using Gemini Live API (WebSocket streaming).
+
+    Returns the same result dict format as generate_voiceover's final yield.
+    """
+    try:
+        client = genai.Client()
+        live_model = os.getenv("GEMINI_TTS_LIVE_MODEL", "gemini-3.1-flash-live-preview")
+
+        config = types.LiveConnectConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name="Sadaltager"
+                    )
+                )
+            ),
+        )
+
+        audio_chunks: list[bytes] = []
+
+        async with client.aio.live.connect(model=live_model, config=config) as session:
+            prompt = (
+                "Speak in a calm, clear, and instructional tone. "
+                "Maintain a steady, measured pace. Use a thoughtful and "
+                "inquisitive intonation as if explaining a complex mathematical "
+                "concept to a curious student. When you encounter '......' (six dots), "
+                "pause for about 1.5 seconds to mark a transition between video segments. "
+                "Read the following text: " + text
+            )
+            await session.send_client_content(
+                turns=types.Content(role="user", parts=[types.Part(text=prompt)]),
+                turn_complete=True,
+            )
+
+            async for message in session.receive():
+                server_content = getattr(message, "server_content", None)
+                if server_content is None:
+                    continue
+                model_turn = getattr(server_content, "model_turn", None)
+                if model_turn is None:
+                    if getattr(server_content, "turn_complete", False):
+                        break
+                    continue
+                for part in getattr(model_turn, "parts", []) or []:
+                    inline_data = getattr(part, "inline_data", None)
+                    if inline_data and getattr(inline_data, "data", None):
+                        audio_chunks.append(inline_data.data)
+
+        if not audio_chunks:
+            return _gtts_fallback(text, output_path, "No audio data received from Live API")
+
+        pcm_data = b"".join(audio_chunks)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            raw_path = os.path.join(temp_dir, "live_pcm.bin")
+            with open(raw_path, "wb") as f:
+                f.write(pcm_data)
+            success, error = _wrap_pcm_to_wav(raw_path, output_path, 24000)
+            if not success:
+                return _gtts_fallback(text, output_path, f"PCM-to-WAV conversion failed: {error}")
+
+        if not _is_valid_audio_file(output_path):
+            return _gtts_fallback(text, output_path, "Live API audio invalid after conversion")
+
+        duration = _get_audio_duration(output_path)
+        return {"final": True, "success": True, "audio_path": output_path, "mime_type": "audio/pcm;rate=24000", "duration": duration, "error": None}
+
+    except Exception as exc:
+        return _gtts_fallback(text, output_path, f"Live API error: {exc}")
+
+
+# ── Async entry point for parallel segment TTS ───────────────────────
 
 async def generate_voiceover_async(text: str, output_path: str) -> dict:
-    """Async wrapper around ``generate_voiceover``.
+    """Async TTS entry point for the pipeline.
 
-    Runs the synchronous generator in a thread-pool so multiple segments'
-    TTS can be generated concurrently via ``asyncio.gather()``.
+    Routes to Live API or batch HTTP based on GEMINI_TTS_MODE env var.
+    - "live"  -> generate_voiceover_live() (native async, WebSocket)
+    - "batch" -> generate_voiceover() (sync generator in thread pool) [default]
 
-    Returns the final result dict (the one with ``"final": True``).
+    Returns the final result dict with keys: success, audio_path, duration, error.
     """
+    mode = os.getenv("GEMINI_TTS_MODE", "batch").lower()
+
+    if mode == "live":
+        return await generate_voiceover_live(text, output_path)
+
+    # Default: batch mode via thread pool (existing behavior)
     loop = asyncio.get_running_loop()
 
     def _run_sync() -> dict:

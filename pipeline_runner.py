@@ -28,7 +28,7 @@ try:
     for _env_path in [
         os.path.join(_project_root, ".env"),
         os.path.join(os.getcwd(), ".env"),
-        os.path.expanduser("~/Documents/projects/paper2manim/.env"),
+        os.path.join(os.path.expanduser("~"), ".paper2manim", ".env"),
     ]:
         if os.path.isfile(_env_path):
             for _k, _v in dotenv_values(_env_path).items():
@@ -41,7 +41,7 @@ except ImportError:
     for _env_path in [
         os.path.join(_project_root, ".env"),
         os.path.join(os.getcwd(), ".env"),
-        os.path.expanduser("~/Documents/projects/paper2manim/.env"),
+        os.path.join(os.path.expanduser("~"), ".paper2manim", ".env"),
     ]:
         if os.path.isfile(_env_path):
             with open(_env_path) as _f:

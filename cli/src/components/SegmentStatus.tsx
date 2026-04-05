@@ -1,7 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import Spinner from 'ink-spinner';
-import { colors } from '../lib/theme.js';
+import { useAppContext } from '../context/AppContext.js';
 import type { SegmentState } from '../lib/types.js';
 
 interface SegmentStatusProps {
@@ -21,35 +21,42 @@ export function SegmentStatus({ segments }: SegmentStatusProps) {
 }
 
 function SegmentLine({ segment }: { segment: SegmentState }) {
-  const attemptStr = segment.attempt > 1 ? ` (attempt ${segment.attempt})` : '';
+  const { themeColors } = useAppContext();
 
   if (segment.done) {
+    const attemptStr = segment.attempt > 1 ? ` (attempt ${segment.attempt})` : '';
     return (
-      <Text>
-        <Text color={colors.success} bold>OK</Text>
+      <Text wrap="wrap">
+        <Text color={themeColors.success} bold>✔</Text>
         <Text bold> Segment {segment.id}</Text>
-        <Text color={colors.dim}>: Complete{attemptStr}</Text>
+        <Text color={themeColors.dim}>{attemptStr}</Text>
       </Text>
     );
   }
 
   if (segment.failed) {
+    const attemptStr = segment.attempt > 1 ? ` (attempt ${segment.attempt})` : '';
     return (
-      <Text>
-        <Text color={colors.error} bold>ERR</Text>
+      <Text wrap="wrap">
+        <Text color={themeColors.error} bold>✘</Text>
         <Text bold> Segment {segment.id}</Text>
-        <Text color={colors.error}>: Failed{attemptStr}</Text>
+        <Text color={themeColors.error}> failed{attemptStr}</Text>
       </Text>
     );
   }
 
+  const retryStr = segment.attempt > 1
+    ? <Text color={themeColors.warn} bold>{` retry ${segment.attempt - 1}/3`}</Text>
+    : null;
+
   return (
-    <Text>
-      <Text color={colors.primary}>
+    <Text wrap="wrap">
+      <Text color={themeColors.primary}>
         <Spinner type="dots" />
       </Text>
       <Text bold> Segment {segment.id}</Text>
-      <Text color={colors.dim}>: {segment.prettyPhase}{attemptStr}</Text>
+      {retryStr}
+      <Text color={themeColors.dim}> {segment.prettyPhase}</Text>
     </Text>
   );
 }

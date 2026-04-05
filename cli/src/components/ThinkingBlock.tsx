@@ -23,7 +23,7 @@ export function ThinkingBlock({ text }: ThinkingBlockProps) {
   return (
     <Box paddingLeft={2} marginTop={0}>
       <Text color={themeColors.dim} italic>
-        {'⊘ '}{display}
+{display}
       </Text>
     </Box>
   );

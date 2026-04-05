@@ -82,7 +82,7 @@ export const DEFAULT_SETTINGS: Settings = {
   model: 'claude-opus-4-6',
   theme: 'dark',
   defaultMode: 'default',
-  outputStyle: 'default',
+  outputStyle: 'verbose',
   editorMode: 'normal',
   quality: 'high',
   hooks: {},
@@ -140,6 +140,7 @@ export interface AppDispatch {
   killPipeline: () => void;
   exit: () => void;
   showMessage: (text: string, color?: string) => void;
+  setPromptText: (text: string) => void;
 }
 
 export interface SlashCommand {
@@ -182,8 +183,9 @@ export interface PipelineUpdate {
 
   // Phase 5 extensions — token usage, thinking, tool calls
   token_usage?: { input: number; output: number; cache_read?: number };
-  thinking?: string;
+  thinking?: string | boolean;
   tool_call?: { name: string; params: Record<string, unknown>; output?: string };
+  tool_result?: { name: string; output: string };
 }
 
 /** Questionnaire question from Python. */
@@ -237,6 +239,12 @@ export interface SegmentState {
   attempt: number;
   done: boolean;
   failed: boolean;
+  startedAt?: number;
+  finishedAt?: number;
+  // Agent activity (Claude Code-style display)
+  isThinking?: boolean;
+  lastToolCall?: { name: string; params: Record<string, unknown> };
+  lastToolResult?: { name: string; output: string };
 }
 
 /** A project entry from the workspace. */
