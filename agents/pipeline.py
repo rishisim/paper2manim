@@ -23,6 +23,7 @@ from typing import Any, Iterator
 from agents.planner import plan_segmented_storyboard, plan_segmented_storyboard_lite
 from agents.planner_math2manim import run_math2manim_planner
 from agents.coder import run_coder_agent
+from agents.validation import validate_concept
 from utils.tts_engine import generate_voiceover_async
 from utils.media_assembler import stitch_video_and_audio, concatenate_segments
 from utils.parallel_renderer import RenderJob, render_two_pass, render_parallel
@@ -138,7 +139,11 @@ def run_segmented_pipeline(
 
     Each yielded dict has at least ``{"stage", "status"}``.
     The final yield has ``{"stage": "done", "final": True, ...}``.
+
+    Raises ``ValueError`` if the concept string is invalid.
     """
+
+    concept = validate_concept(concept)
 
     # ── Step 1: Planning ──────────────────────────────────────────────
 
