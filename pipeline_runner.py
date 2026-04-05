@@ -171,6 +171,7 @@ def main() -> None:
     questionnaire_answers: dict | None = args.get("questionnaire_answers")
     render_timeout: int = int(args.get("render_timeout") or 0)
     tts_timeout: int = int(args.get("tts_timeout") or 0)
+    force_restart: bool = args.get("force_restart", False)
     # Phase 5-6 extensions (new optional args — fully backward-compatible)
     system_prompt_prefix: str = args.get("system_prompt_prefix") or ""
     max_turns: int = int(args.get("max_turns") or 0)
@@ -289,6 +290,7 @@ def main() -> None:
             skip_audio=skip_audio,
             render_timeout_seconds=render_timeout,
             tts_timeout_seconds=tts_timeout,
+            force_restart=force_restart,
         ):
             _emit({"type": "pipeline", "update": update})
 
