@@ -22,7 +22,7 @@ from typing import Any, Iterator
 
 from agents.planner import plan_segmented_storyboard, plan_segmented_storyboard_lite
 from agents.planner_math2manim import run_math2manim_planner
-from agents.coder import run_coder_agent
+from agents.coder import run_coder_agent, fix_manim_script
 from utils.tts_engine import generate_voiceover_async
 from utils.media_assembler import stitch_video_and_audio, concatenate_segments
 from utils.parallel_renderer import RenderJob, render_two_pass, render_parallel
@@ -34,6 +34,7 @@ from utils.project_state import (
     mark_segment_stage,
     mark_project_complete,
 )
+from utils.code_verifier import verify_segment_code
 
 
 def _format_duration(seconds: float) -> str:
@@ -275,6 +276,95 @@ def run_segmented_pipeline(
             last_update = update
             if emit_to_queue:
                 status_queue.put({"segment_id": seg_id, **update})
+
+        # ── Code verification (pre-render quality gate) ──────────────
+        # Only verify if the coder succeeded and produced code.
+        # One retry: if issues are found, feed them back to the coder.
+        code = last_update.get("code", "")
+        code_validated = last_update.get("code_validated", False)
+
+        if code and code_validated:
+            try:
+                if emit_to_queue:
+                    status_queue.put({
+                        "segment_id": seg_id,
+                        "status": f"Reviewing generated code...",
+                        "phase": "verify",
+                    })
+
+                segment_context = ""
+                if isinstance(coder_instructions, dict):
+                    segment_context = coder_instructions.get("visual_instructions", "")
+                elif isinstance(coder_instructions, str):
+                    segment_context = coder_instructions
+
+                audio_dur = tts_r.get("duration", 0.0) or 0.0
+                verification = verify_segment_code(
+                    segment_id=seg_id,
+                    code=code,
+                    segment_context=segment_context,
+                    audio_duration=audio_dur,
+                )
+
+                if not verification.passed and verification.issues:
+                    # Feed verification issues back to the coder for one fix attempt
+                    issue_text = "\n".join(f"- {issue}" for issue in verification.issues)
+                    if emit_to_queue:
+                        status_queue.put({
+                            "segment_id": seg_id,
+                            "status": f"Found {len(verification.issues)} issue(s), requesting fix...",
+                            "phase": "verify_fix",
+                        })
+
+                    fix_prompt = (
+                        "A code reviewer found the following visual issues in your Manim code:\n\n"
+                        f"{issue_text}\n\n"
+                        "Fix these issues in the code. Return the COMPLETE corrected Python file."
+                    )
+                    fixed_code = ""
+                    for chunk in fix_manim_script(
+                        code,
+                        fix_prompt,
+                        complexity=seg.get("complexity", "complex"),
+                        tool_call_counts=last_update.get("tool_call_counts"),
+                    ):
+                        if chunk == "looking up docs":
+                            continue
+                        fixed_code = chunk
+
+                    if fixed_code:
+                        # Update the result with the fixed code
+                        last_update["code"] = fixed_code
+                        if emit_to_queue:
+                            status_queue.put({
+                                "segment_id": seg_id,
+                                "status": "Code verified and fixed",
+                                "phase": "verify",
+                            })
+                    else:
+                        # Fix attempt produced no code — keep the original
+                        if emit_to_queue:
+                            status_queue.put({
+                                "segment_id": seg_id,
+                                "status": "Verification fix produced no code, keeping original",
+                                "phase": "verify",
+                            })
+                else:
+                    if emit_to_queue:
+                        status_queue.put({
+                            "segment_id": seg_id,
+                            "status": "Code verified OK",
+                            "phase": "verify",
+                        })
+            except Exception:
+                # Verification failure must never block the pipeline
+                if emit_to_queue:
+                    status_queue.put({
+                        "segment_id": seg_id,
+                        "status": "Code verification skipped (error)",
+                        "phase": "verify",
+                    })
+
         return last_update
 
     max_workers = max(1, min(5, num_segments))

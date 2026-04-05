@@ -114,7 +114,7 @@ export const TIPS = [
   'Use --model to override the Claude model',
 ];
 
-export type StageName = 'plan' | 'tts' | 'code' | 'render' | 'stitch' | 'concat' | 'done';
+export type StageName = 'plan' | 'tts' | 'code' | 'verify' | 'render' | 'stitch' | 'concat' | 'done';
 
 export interface StageConfig {
   icon: string;
@@ -126,6 +126,7 @@ export const stageConfig: Record<StageName, StageConfig> = {
   plan:   { icon: '⏺', color: '#64B4FF', label: 'Plan storyboard' },
   tts:    { icon: '⏺', color: '#9C78FF', label: 'Generate voiceover' },
   code:   { icon: '⏺', color: '#00B4D8', label: 'Generate Manim code' },
+  verify: { icon: '⏺', color: '#E0A040', label: 'Verify code quality' },
   render: { icon: '⏺', color: '#FF6496', label: 'Render HD segments' },
   stitch: { icon: '⏺', color: '#FFB432', label: 'Stitch audio/video' },
   concat: { icon: '⏺', color: '#00C853', label: 'Assemble final video' },
@@ -139,6 +140,8 @@ export const segmentPhaseLabels: Record<string, string> = {
   self_correct: 'Self-correcting',
   fix_docs: 'Fix: looking up docs',
   apply_fix: 'Applying fix',
+  verify: 'Verifying code quality',
+  verify_fix: 'Fixing verification issues',
   done: 'Complete',
   failed: 'Failed',
   running: 'Running',
