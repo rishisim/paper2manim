@@ -28,3 +28,7 @@ paper2manim = "cli_launcher:main"
 [tool.setuptools]
 packages = ["agents", "utils"]
 py-modules = ["cli_fallback", "cli_launcher", "pipeline_runner"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
