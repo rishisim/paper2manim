@@ -25,7 +25,8 @@ from agents.coder import run_coder_agent
 from agents.config import CLAUDE_OPUS, CLAUDE_SONNET, estimate_cost, merge_token_usage, new_token_counter
 from agents.planner import plan_segmented_storyboard_lite
 from agents.planner_math2manim import run_math2manim_planner
-from utils.media_assembler import concatenate_segments, stitch_video_and_audio
+from utils.media_assembler import concatenate_segments, mux_subtitles, stitch_video_and_audio
+from utils.subtitle_generator import generate_combined_srt, write_srt
 from utils.parallel_renderer import RenderJob, render_parallel
 from utils.project_state import (
     create_project,
@@ -144,7 +145,7 @@ def _save_pipeline_summary(
     lines.append(f"{'Status':<8} {'Stage':<25} {'Time':>16}")
     lines.append("-" * 58)
     for name, status, elapsed in timings:
-        tag = "OK" if status == "ok" else "ERR"
+        tag = {"ok": "OK", "skipped": "SKIP", "partial": "WARN"}.get(status, "ERR")
         lines.append(f"{tag:<8} {name:<25} {_format_duration(elapsed):>16}")
     lines.append("-" * 58)
     lines.append(f"{'':8} {'Total':<25} {_format_duration(total):>16}")
@@ -197,14 +198,26 @@ def _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, tts_ap
     total_in = pipeline_tokens["input_tokens"]
     total_out = pipeline_tokens["output_tokens"]
     total_calls = pipeline_tokens["api_calls"]
-    planning_cost = estimate_cost(planning_tokens["input_tokens"], planning_tokens["output_tokens"], model=CLAUDE_SONNET)
-    coding_cost = estimate_cost(coding_tokens["input_tokens"], coding_tokens["output_tokens"], model=CLAUDE_OPUS)
+    planning_cost = estimate_cost(
+        planning_tokens["input_tokens"], planning_tokens["output_tokens"], model=CLAUDE_SONNET,
+        cache_creation_tokens=planning_tokens.get("cache_creation_input_tokens", 0),
+        cache_read_tokens=planning_tokens.get("cache_read_input_tokens", 0),
+    )
+    coding_cost = estimate_cost(
+        coding_tokens["input_tokens"], coding_tokens["output_tokens"], model=CLAUDE_OPUS,
+        cache_creation_tokens=coding_tokens.get("cache_creation_input_tokens", 0),
+        cache_read_tokens=coding_tokens.get("cache_read_input_tokens", 0),
+    )
     total_cost = planning_cost + coding_cost
+    total_cache_created = pipeline_tokens.get("cache_creation_input_tokens", 0)
+    total_cache_read = pipeline_tokens.get("cache_read_input_tokens", 0)
     return {
         "total_input_tokens": total_in,
         "total_output_tokens": total_out,
         "total_api_calls": total_calls,
         "tts_api_calls": tts_api_calls,
+        "cache_creation_input_tokens": total_cache_created,
+        "cache_read_input_tokens": total_cache_read,
         "estimated_cost_usd": round(total_cost, 4),
         "breakdown": {
             "planning": {
@@ -217,6 +230,8 @@ def _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, tts_ap
                 "input_tokens": coding_tokens["input_tokens"],
                 "output_tokens": coding_tokens["output_tokens"],
                 "api_calls": coding_tokens["api_calls"],
+                "cache_creation_input_tokens": coding_tokens.get("cache_creation_input_tokens", 0),
+                "cache_read_input_tokens": coding_tokens.get("cache_read_input_tokens", 0),
                 "cost_usd": round(coding_cost, 4),
             },
         },
@@ -465,6 +480,24 @@ def run_segmented_pipeline(
 
             yield {"stage": "tts", "status": f"TTS complete: {tts_ok}/{num_segments} succeeded", "tts_results": tts_results}
 
+    # ── Step 2.5: Complexity downgrade heuristic ────────────────────
+    # Downgrade "complex" → "medium" for segments that look straightforward,
+    # allowing them to use Sonnet instead of Opus (cheaper).
+
+    _3D_KEYWORDS = {"threedscene", "3d", "surface", "camera_rotation", "set_camera_orientation"}
+    _UPDATER_KEYWORDS = {"always_redraw", "valuetracker", "updater", "add_updater"}
+
+    for seg in segments:
+        if seg.get("complexity") != "complex":
+            continue
+        vis = (seg.get("visual_instructions") or "").lower()
+        eqs = seg.get("equations_latex", [])
+        anims = seg.get("animations", [])
+        has_3d = any(kw in vis for kw in _3D_KEYWORDS)
+        has_updaters = any(kw in vis for kw in _UPDATER_KEYWORDS)
+        if not has_3d and not has_updaters and len(eqs) <= 2 and len(anims) <= 5:
+            seg["complexity"] = "medium"
+
     # ── Step 3: Parallel code generation ──────────────────────────────
 
     code_results: dict[int, dict] = {}
@@ -662,6 +695,11 @@ def run_segmented_pipeline(
         }
 
         failed_segs = [seg for seg in segments if seg["id"] in failed_seg_ids]
+
+        # Escalate "medium" → "complex" (Sonnet → Opus) for failed segments
+        for seg in failed_segs:
+            if seg.get("complexity") == "medium":
+                seg["complexity"] = "complex"
 
         retry_max_workers = max(1, min(5, len(failed_segs)))
         retry_futures_map: dict[Any, dict] = {}
@@ -881,7 +919,12 @@ def run_segmented_pipeline(
                     if error:
                         yield {"stage": "stitch", "status": f"Segment {seg_id}: {error}"}
                     else:
-                        yield {"stage": "stitch", "status": f"Segment {seg_id} stitched."}
+                        yield {
+                            "stage": "stitch",
+                            "status": f"Segment {seg_id} stitched.",
+                            "playable_segment": path,
+                            "segment_id": seg_id,
+                        }
 
             # Reassemble in order
             stitched_paths: list[str] = []
@@ -891,7 +934,10 @@ def run_segmented_pipeline(
                 if error:
                     stitch_errors.append(error)
 
-            yield {"stage": "stitch", "status": f"Stitching done. Errors: {len(stitch_errors)}"}
+            if stitch_errors:
+                yield {"stage": "stitch", "status": f"Stitching done ({len(stitch_errors)} fell back to raw video)"}
+            else:
+                yield {"stage": "stitch", "status": "Stitching done"}
 
             stitch_elapsed = time.perf_counter() - stitch_start
             timings.append(("Stitch", "ok" if len(stitch_errors) == 0 else "partial", stitch_elapsed))
@@ -972,6 +1018,37 @@ def run_segmented_pipeline(
         timings.append(("Concat", "ok", concat_elapsed))
         mark_stage_done(project_dir, "concat", artifacts=[final_output])
         mark_project_complete(project_dir)
+
+        # ── Step 5.5: Generate subtitles ──────────────────────────────
+        srt_path = None
+        if not skip_audio and tts_results:
+            try:
+                yield {"stage": "subtitles", "status": "Generating subtitles..."}
+                srt_content = generate_combined_srt(segments, tts_results)
+                if srt_content.strip():
+                    srt_path = os.path.join(project_dir, f"{slug}.srt")
+                    write_srt(srt_content, srt_path)
+
+                    # Mux subtitles into the final video
+                    subbed_output = final_output.replace(".mp4", "_subbed.mp4")
+                    mux_result = None
+                    for mux_update in mux_subtitles(final_output, srt_path, subbed_output):
+                        if "status" in mux_update:
+                            yield {"stage": "subtitles", "status": mux_update["status"]}
+                        if mux_update.get("final"):
+                            mux_result = mux_update
+
+                    if mux_result and mux_result.get("success"):
+                        # Replace the original with the subtitled version
+                        os.replace(subbed_output, final_output)
+                        yield {"stage": "subtitles", "status": "Subtitles embedded in video"}
+                    else:
+                        yield {"stage": "subtitles", "status": "Subtitle muxing failed — SRT file still available"}
+                else:
+                    yield {"stage": "subtitles", "status": "No subtitle content generated (missing transcripts)"}
+            except Exception as exc:
+                yield {"stage": "subtitles", "status": f"Subtitle generation failed: {exc}"}
+
         token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, tts_api_calls)
         _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=token_summary)
         yield {
@@ -979,6 +1056,7 @@ def run_segmented_pipeline(
             "status": "Pipeline complete!",
             "final": True,
             "video_path": final_output,
+            "srt_path": srt_path,
             "project_dir": project_dir,
             "num_segments": num_segments,
             "stitch_errors": stitch_errors,

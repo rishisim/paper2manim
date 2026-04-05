@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from utils.media_assembler import (
     _size_based_timeout,
     concatenate_segments,
+    mux_subtitles,
     stitch_video_and_audio,
 )
 
@@ -258,3 +259,69 @@ def test_concat_empty_list(tmp_path):
     # Empty list has nothing missing but the status says 0 segments
     # Behavior depends on implementation — just check it doesn't crash
     assert len(updates) >= 1
+
+
+# ---------------------------------------------------------------------------
+# mux_subtitles
+# ---------------------------------------------------------------------------
+
+def test_mux_subtitles_missing_video(tmp_path):
+    srt = tmp_path / "subs.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n")
+
+    updates = list(mux_subtitles(
+        str(tmp_path / "missing.mp4"), str(srt), str(tmp_path / "out.mp4")
+    ))
+    final = updates[-1]
+    assert final["final"] is True
+    assert final["success"] is False
+    assert "video" in final["error"].lower()
+
+
+def test_mux_subtitles_missing_srt(tmp_path):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 100)
+
+    updates = list(mux_subtitles(
+        str(video), str(tmp_path / "missing.srt"), str(tmp_path / "out.mp4")
+    ))
+    final = updates[-1]
+    assert final["final"] is True
+    assert final["success"] is False
+    assert "subtitle" in final["error"].lower()
+
+
+@patch("utils.media_assembler.subprocess.run")
+def test_mux_subtitles_ffmpeg_command(mock_run, tmp_path):
+    video = tmp_path / "video.mp4"
+    srt = tmp_path / "subs.srt"
+    output = tmp_path / "out.mp4"
+    video.write_bytes(b"\x00" * 100)
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n")
+
+    mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+    updates = list(mux_subtitles(str(video), str(srt), str(output)))
+    final = updates[-1]
+    assert final["success"] is True
+
+    cmd = mock_run.call_args[0][0]
+    assert cmd[0] == "ffmpeg"
+    assert "-c:s" in cmd and cmd[cmd.index("-c:s") + 1] == "mov_text"
+    assert "-c:v" in cmd and cmd[cmd.index("-c:v") + 1] == "copy"
+    assert "-c:a" in cmd and cmd[cmd.index("-c:a") + 1] == "copy"
+
+
+@patch("utils.media_assembler.subprocess.run")
+def test_mux_subtitles_ffmpeg_failure(mock_run, tmp_path):
+    video = tmp_path / "video.mp4"
+    srt = tmp_path / "subs.srt"
+    video.write_bytes(b"\x00" * 100)
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n")
+
+    mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="mux error")
+
+    updates = list(mux_subtitles(str(video), str(srt), str(tmp_path / "out.mp4")))
+    final = updates[-1]
+    assert final["success"] is False
+    assert "mux error" in final["error"]

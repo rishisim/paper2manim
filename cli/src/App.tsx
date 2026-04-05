@@ -562,6 +562,26 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
       setStatusDetail(cleanStatus(latest.status));
     }
 
+    // ── Streaming segment playback ──────────────────────────────
+    if (latest.playable_segment) {
+      const segPath = latest.playable_segment;
+      addLog({
+        type: 'log',
+        text: `  ▶ Playing segment ${latest.segment_id ?? '?'}`,
+        color: themeColors.accent,
+      });
+      try {
+        const platform = os.platform();
+        if (platform === 'darwin') {
+          execFileSync('open', [segPath]);
+        } else if (platform === 'win32') {
+          execFileSync('cmd', ['/c', 'start', '', segPath]);
+        } else {
+          execFileSync('xdg-open', [segPath]);
+        }
+      } catch { /* ignore if player is unavailable */ }
+    }
+
     // ── Final update ────────────────────────────────────────────
     if (latest.final) {
       if (currentStage && currentStage !== 'done') {

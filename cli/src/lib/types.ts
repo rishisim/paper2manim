@@ -171,6 +171,9 @@ export interface PipelineUpdate {
   segment_phase?: string;
   segment_final?: boolean;
 
+  // Streaming playback (emitted when a segment's stitch completes)
+  playable_segment?: string;
+
   // Completion
   final?: boolean;
   error?: string;

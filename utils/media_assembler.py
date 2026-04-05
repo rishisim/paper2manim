@@ -227,3 +227,65 @@ def concatenate_segments(
             "output_path": None,
             "error": str(exc),
         }
+
+
+# ── Subtitle muxing ─────────────────────────────────────────────────
+
+def mux_subtitles(
+    video_path: str,
+    srt_path: str,
+    output_path: str,
+) -> Iterator[dict]:
+    """Embed an SRT subtitle track into an MP4 as a soft subtitle stream.
+
+    Uses ``mov_text`` codec which is a fast remux — no video/audio re-encoding.
+    Yields status dicts and finally ``{"final": True, ...}``.
+    """
+    yield {"status": "Muxing subtitles into video..."}
+
+    for path, label in [(video_path, "video"), (srt_path, "subtitle")]:
+        if not os.path.exists(path):
+            yield {
+                "final": True,
+                "success": False,
+                "output_path": None,
+                "error": f"Missing {label} file: {path}",
+            }
+            return
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", srt_path,
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-c:s", "mov_text",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=_size_based_timeout([video_path]),
+        )
+        if result.returncode == 0:
+            yield {
+                "final": True,
+                "success": True,
+                "output_path": output_path,
+                "error": None,
+            }
+        else:
+            yield {
+                "final": True,
+                "success": False,
+                "output_path": None,
+                "error": result.stderr or result.stdout,
+            }
+    except subprocess.TimeoutExpired as exc:
+        logger.error("Subtitle muxing timed out: %s", exc)
+        yield {"final": True, "success": False, "output_path": None, "error": str(exc)}
+    except OSError as exc:
+        logger.error("Subtitle muxing failed: %s", exc)
+        yield {"final": True, "success": False, "output_path": None, "error": str(exc)}

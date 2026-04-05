@@ -114,14 +114,25 @@ def _call_llm(client: anthropic.Anthropic, prompt: str, model: str = CLAUDE_OPUS
         token_counter: If provided, input/output token counts from the response
             are accumulated into this dict.
     """
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system="You are an expert JSON generator. Output ONLY valid JSON — no markdown fences, no explanation, no preamble. Your response must start with '{' or '['.",
-        messages=[
-            {"role": "user", "content": prompt + "\n\nRespond with ONLY the JSON object, nothing else."},
-        ],
-    )
+    # Retry with exponential backoff on rate limits (429)
+    _MAX_RL_RETRIES = 5
+    for _attempt in range(_MAX_RL_RETRIES):
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system="You are an expert JSON generator. Output ONLY valid JSON — no markdown fences, no explanation, no preamble. Your response must start with '{' or '['.",
+                messages=[
+                    {"role": "user", "content": prompt + "\n\nRespond with ONLY the JSON object, nothing else."},
+                ],
+            )
+            break
+        except anthropic.RateLimitError:
+            if _attempt == _MAX_RL_RETRIES - 1:
+                raise
+            wait = min(2 ** (_attempt + 1), 60)
+            print(f"[planner] Rate limited (429), retrying in {wait}s (attempt {_attempt + 1}/{_MAX_RL_RETRIES})", file=sys.stderr)
+            time.sleep(wait)
     # Track token usage if a counter was provided
     if token_counter is not None:
         try:

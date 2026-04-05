@@ -27,6 +27,7 @@ VALID_STAGES = {
     "stitch",
     "timing",
     "concat",
+    "subtitles",
     "overlay",
     "done",
 }

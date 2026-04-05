@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from typing import Iterator
 
 import anthropic
@@ -21,7 +22,9 @@ from agents.config import (
     CLAUDE_SONNET,
     MAX_TOOL_CALLS_COMPLEX,
     MAX_TOOL_CALLS_FIX_COMPLEX,
+    MAX_TOOL_CALLS_FIX_MEDIUM,
     MAX_TOOL_CALLS_FIX_SIMPLE,
+    MAX_TOOL_CALLS_MEDIUM,
     MAX_TOOL_CALLS_SIMPLE,
     new_token_counter,
 )
@@ -133,6 +136,55 @@ self.play(FadeIn(bullet2, shift=RIGHT * 0.3), run_time=0.8)
 self.wait(1.0)
 self.play(FadeIn(bullet3, shift=RIGHT * 0.3), run_time=0.8)
 self.wait(1.5)
+
+Golden snippet G (graph with vertices, edges, and BFS highlight):
+g = Graph([1,2,3,4], [(1,2),(1,3),(2,4),(3,4)], labels=True,
+    layout={1:[-2,0,0], 2:[0,1,0], 3:[0,-1,0], 4:[2,0,0]},
+    vertex_config={"radius": 0.3, "fill_color": BLUE, "fill_opacity": 0.8})
+self.play(Create(g), run_time=2.0)
+for v in [1, 2, 3, 4]:
+    self.play(g.vertices[v].animate.set_fill(YELLOW, opacity=1.0), run_time=0.5)
+
+Golden snippet H (camera zoom with MovingCameraScene):
+# Inherit from MovingCameraScene, not Scene
+self.play(self.camera.frame.animate.set(width=4).move_to(target_obj), run_time=2.0, rate_func=smooth)
+self.wait(1.5)
+self.play(self.camera.frame.animate.set(width=14).move_to(ORIGIN), run_time=2.0)
+
+Golden snippet I (step-by-step proof derivation):
+eq1 = MathTex("x^2", "+", "6x", "=", "-5")
+eq2 = MathTex("x^2", "+", "6x", "+", "9", "=", "4")
+label = Text("Add 9 to both sides", font_size=22, color=GREY_B).next_to(eq2, DOWN, buff=0.6)
+self.play(TransformMatchingTex(eq1, eq2), run_time=1.5)
+self.play(FadeIn(label, shift=UP * 0.2), run_time=0.6)
+
+Golden snippet J (dot moving along curve with traced path):
+curve = axes.plot(lambda x: np.sin(x) + 1, x_range=[0, 2*PI], color=BLUE)
+dot = Dot(color=YELLOW).move_to(curve.get_start())
+traced = TracedPath(dot.get_center, stroke_color=RED, stroke_width=3)
+self.add(traced)
+self.play(MoveAlongPath(dot, curve), run_time=4.0, rate_func=linear)
+
+Golden snippet K (matrix with diagonal highlighting):
+m = Matrix([[2, -1], [3, 4]], left_bracket="[", right_bracket="]")
+entries = m.get_entries()
+highlight = SurroundingRectangle(entries[0], color=YELLOW, buff=0.1)
+self.play(Write(m), run_time=2.0)
+self.play(Create(highlight), run_time=0.8)
+
+Golden snippet L (gradient color on shape + morphing):
+circle = Circle(radius=1.5, fill_opacity=0.8).set_color(color=[BLUE, GREEN, YELLOW])
+square = Square(side_length=3, fill_opacity=0.8).set_color(color=[RED, ORANGE, YELLOW])
+self.play(Create(circle), run_time=2.0)
+self.play(Transform(circle, square), run_time=2.5, rate_func=smooth)
+
+Golden snippet M (number line with brace and interval):
+nl = NumberLine(x_range=[-2, 8, 1], length=10, include_numbers=True)
+interval = Line(nl.n2p(2), nl.n2p(6), color=GREEN, stroke_width=6)
+brace = Brace(interval, DOWN, color=YELLOW)
+brace_label = brace.get_tex(r"\\Delta x = 4")
+self.play(Create(nl), run_time=1.5)
+self.play(Create(interval), Create(brace), Write(brace_label), run_time=1.5)
 """
 
 SYSTEM_INSTRUCTION = f"""You are an expert Manim animator and mathematical educator. Your goal is to write a single,
@@ -219,9 +271,20 @@ Embedded style snippets you can reuse directly:
 
 def _get_model_for_complexity(complexity: str = "complex") -> str:
     """Return the appropriate model name based on segment complexity."""
-    if complexity == "simple":
+    if complexity in ("simple", "medium"):
         return CLAUDE_SONNET
     return CLAUDE_OPUS
+
+
+def _get_tool_budget(complexity: str = "complex", *, fix: bool = False) -> int:
+    """Return the tool-call budget for a given complexity and mode."""
+    if fix:
+        return {"simple": MAX_TOOL_CALLS_FIX_SIMPLE, "medium": MAX_TOOL_CALLS_FIX_MEDIUM}.get(
+            complexity, MAX_TOOL_CALLS_FIX_COMPLEX
+        )
+    return {"simple": MAX_TOOL_CALLS_SIMPLE, "medium": MAX_TOOL_CALLS_MEDIUM}.get(
+        complexity, MAX_TOOL_CALLS_COMPLEX
+    )
 
 
 def _build_tools() -> list[dict]:
@@ -309,11 +372,12 @@ def _dispatch_tool_call(name: str, input_args: dict) -> str:
 def _send_and_extract(
     client: anthropic.Anthropic,
     model: str,
-    system: str,
+    system: str | list[dict],
     user_message: str,
     max_tool_calls: int,
     tool_call_counts: dict[str, int] | None = None,
     token_counter: dict | None = None,
+    on_status: object | None = None,
 ) -> str:
     """Send a message via Anthropic Messages API, handle tool calls,
     and return the final text with code fences stripped."""
@@ -334,7 +398,30 @@ def _send_and_extract(
         if tools and calls < max_tool_calls:
             kwargs["tools"] = tools
 
-        response = client.messages.create(**kwargs)
+        # Retry with exponential backoff on rate limits (429)
+        _MAX_RATE_LIMIT_RETRIES = 5
+        for _attempt in range(_MAX_RATE_LIMIT_RETRIES):
+            try:
+                response = client.messages.create(**kwargs)
+                break
+            except anthropic.RateLimitError as e:
+                if _attempt == _MAX_RATE_LIMIT_RETRIES - 1:
+                    raise
+                # Use retry-after header when available, else exponential backoff
+                wait = 2 ** (_attempt + 1)
+                resp = getattr(e, "response", None)
+                if resp:
+                    ra = getattr(resp, "headers", {}).get("retry-after")
+                    if ra:
+                        try:
+                            wait = max(wait, float(ra))
+                        except ValueError:
+                            pass
+                msg = f"Rate limited (429), retrying in {wait:.0f}s (attempt {_attempt + 1}/{_MAX_RATE_LIMIT_RETRIES})"
+                _log.warning(msg)
+                if callable(on_status):
+                    on_status(msg)
+                time.sleep(wait)
 
         # Track token usage from this API call
         if token_counter is not None:
@@ -342,6 +429,12 @@ def _send_and_extract(
                 token_counter["input_tokens"] += getattr(response.usage, "input_tokens", 0)
                 token_counter["output_tokens"] += getattr(response.usage, "output_tokens", 0)
                 token_counter["api_calls"] += 1
+                token_counter["cache_creation_input_tokens"] += getattr(
+                    response.usage, "cache_creation_input_tokens", 0
+                ) or 0
+                token_counter["cache_read_input_tokens"] += getattr(
+                    response.usage, "cache_read_input_tokens", 0
+                ) or 0
             except Exception:
                 pass  # Don't let tracking failures break the pipeline
 
@@ -401,13 +494,17 @@ def generate_manim_script(
     color_palette: dict[str, str] | None = None,
     few_shot_example: str = "",
     token_counter: dict | None = None,
+    on_status: object | None = None,
 ) -> Iterator[str]:
     """Yield the final generated code (single yield after tool calls resolve)."""
     model = _get_model_for_complexity(complexity)
-    max_tool_calls = MAX_TOOL_CALLS_SIMPLE if complexity == "simple" else MAX_TOOL_CALLS_COMPLEX
+    max_tool_calls = _get_tool_budget(complexity)
     client = anthropic.Anthropic()
 
-    system = SYSTEM_INSTRUCTION + f"\n\nHard tool budget for this segment: {max_tool_calls} total function calls."
+    system = [
+        {"type": "text", "text": SYSTEM_INSTRUCTION, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": f"Hard tool budget for this segment: {max_tool_calls} total function calls."},
+    ]
 
     # Build the prompt dynamically based on whether it's Lite (str) or Pro (dict)
     if isinstance(instructions, str):
@@ -487,6 +584,7 @@ def generate_manim_script(
         max_tool_calls=max_tool_calls,
         tool_call_counts=tool_call_counts,
         token_counter=token_counter,
+        on_status=on_status,
     )
     if not code:
         _log.debug("falling back to tool-less generation (model=%s)", model)
@@ -495,6 +593,7 @@ def generate_manim_script(
             max_tool_calls=0,
             tool_call_counts=tool_call_counts,
             token_counter=token_counter,
+            on_status=on_status,
         )
 
     # Lightweight spec compliance check for Pro segments
@@ -541,6 +640,7 @@ def fix_manim_script(
     error: str,
     complexity: str = "complex",
     tool_call_counts: dict[str, int] | None = None,
+    on_status: object | None = None,
     original_instructions: str = "",
     repair_attempt: int = 0,
     token_counter: dict | None = None,
@@ -552,10 +652,12 @@ def fix_manim_script(
             Controls the escalating repair strategy hint appended to the prompt.
     """
     model = _get_model_for_complexity(complexity)
-    max_tool_calls = MAX_TOOL_CALLS_FIX_SIMPLE if complexity == "simple" else MAX_TOOL_CALLS_FIX_COMPLEX
+    max_tool_calls = _get_tool_budget(complexity, fix=True)
     client = anthropic.Anthropic()
 
-    system = SYSTEM_INSTRUCTION
+    system = [
+        {"type": "text", "text": SYSTEM_INSTRUCTION, "cache_control": {"type": "ephemeral"}},
+    ]
 
     compact = _compact_error(error)
 
@@ -613,6 +715,7 @@ def fix_manim_script(
         max_tool_calls=max_tool_calls,
         tool_call_counts=tool_call_counts,
         token_counter=token_counter,
+        on_status=on_status,
     )
     if fixed:
         yield fixed
@@ -659,6 +762,12 @@ def run_coder_agent(
         "status": f"{_seg}Generating Manim script [{complexity}] via {model_label}...",
         "phase": "generate",
     }
+    # Collect rate-limit notifications to surface as status updates
+    _rate_limit_msgs: list[str] = []
+
+    def _on_rate_limit(msg: str) -> None:
+        _rate_limit_msgs.append(msg)
+
     spec_gaps = ""
     for chunk in generate_manim_script(
         instructions, audio_script, audio_duration,
@@ -668,7 +777,11 @@ def run_coder_agent(
         color_palette=color_palette,
         few_shot_example=few_shot_example,
         token_counter=coder_tokens,
+        on_status=_on_rate_limit,
     ):
+        # Surface any rate-limit notifications collected during API calls
+        while _rate_limit_msgs:
+            yield {"status": f"{_seg}{_rate_limit_msgs.pop(0)}", "phase": "rate_limited"}
         if chunk == "looking up docs":
             yield {"status": f"{_seg}Generating with Claude...", "phase": "docs"}
             continue
@@ -717,10 +830,13 @@ def run_coder_agent(
                     code, error_msg,
                     complexity=complexity,
                     tool_call_counts=tool_call_counts,
+                    on_status=_on_rate_limit,
                     original_instructions=original_instructions,
                     repair_attempt=attempt,
                     token_counter=coder_tokens,
                 ):
+                    while _rate_limit_msgs:
+                        yield {"status": f"{_seg}{_rate_limit_msgs.pop(0)}", "phase": "rate_limited"}
                     if chunk == "looking up docs":
                         yield {"status": f"{_seg}Looking up docs for fix (attempt {attempt + 1}/{max_retries})...", "phase": "fix_docs"}
                         continue
@@ -792,10 +908,13 @@ def run_coder_agent(
                 error_context,
                 complexity=complexity,
                 tool_call_counts=tool_call_counts,
+                on_status=_on_rate_limit,
                 original_instructions=original_instructions,
                 repair_attempt=attempt,
                 token_counter=coder_tokens,
             ):
+                while _rate_limit_msgs:
+                    yield {"status": f"{_seg}{_rate_limit_msgs.pop(0)}", "phase": "rate_limited"}
                 if chunk == "looking up docs":
                     yield {"status": f"{_seg}Looking up docs for fix (attempt {attempt + 1}/{max_retries})...", "phase": "fix_docs"}
                     continue
