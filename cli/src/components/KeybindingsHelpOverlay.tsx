@@ -19,6 +19,16 @@ interface ShortcutGroup {
 
 const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
+    label: 'First-Run Essentials',
+    shortcuts: [
+      { key: 'Enter',      description: 'Advance to the next onboarding step, then generate on Step 3' },
+      { key: 'Tab',        description: 'Move focus between onboarding steps' },
+      { key: '/',          description: 'Open command search (for /generate, /list, /config)' },
+      { key: '?',          description: 'Open this full shortcut guide' },
+      { key: 'Esc',        description: 'Back out of the current panel or menu' },
+    ],
+  },
+  {
     label: 'Global',
     shortcuts: [
       { key: 'Ctrl+C',    description: 'Cancel current generation (press twice outside run to exit)' },
@@ -28,7 +38,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { key: 'Shift+Tab', description: 'Cycle permission mode (default → acceptEdits → plan → auto → bypass)' },
       { key: 'Alt+T',     description: 'Toggle thinking/planning text display' },
       { key: 'Alt+O',     description: 'Toggle fast/lite mode (quality low ↔ high)' },
-      { key: 'Alt+P',     description: 'Cycle model (opus ↔ sonnet), persists to settings' },
+      { key: 'Alt+P',     description: 'Cycle provider profile (openai-default ↔ anthropic-legacy), persists to settings' },
       { key: 'Esc+Esc',   description: 'Rewind to previous checkpoint or go back to input' },
       { key: '?',         description: 'Toggle this help (during generation)' },
     ],
@@ -37,7 +47,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     label: 'Text Input',
     shortcuts: [
       { key: 'Ctrl+K',     description: 'Delete from cursor to end of line' },
-      { key: 'Ctrl+U',     description: 'Clear entire input line' },
+      { key: 'Ctrl+U',     description: 'Delete from start of line to cursor' },
       { key: 'Ctrl+W',     description: 'Delete word before cursor' },
       { key: 'Ctrl+A',     description: 'Move cursor to start of line' },
       { key: 'Ctrl+E',     description: 'Move cursor to end of line' },
@@ -45,7 +55,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { key: 'Alt+B',      description: 'Move cursor back one word' },
       { key: 'Alt+F',      description: 'Move cursor forward one word' },
       { key: '↑/↓',        description: 'Navigate command history' },
-      { key: '\\+Enter',   description: 'Insert newline (multiline input)' },
+      { key: 'Shift+Enter', description: 'Insert newline (multiline input)' },
       { key: 'Alt+Enter',  description: 'Insert newline (multiline input)' },
     ],
   },
@@ -55,7 +65,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { key: '/',          description: 'Open slash command menu (e.g. /generate, /help)' },
       { key: '!',          description: 'Run shell command directly (bash mode)' },
       { key: 'Tab',        description: 'Accept first slash command autocomplete suggestion' },
-      { key: 'Esc',        description: 'Dismiss slash command dropdown / cancel prompt' },
+      { key: 'Esc',        description: 'Dismiss slash command dropdown' },
     ],
   },
   {

@@ -6,7 +6,7 @@
  *   SessionContext  — changes per-event (token usage, stage, checkpoints)
  */
 
-import React, { createContext, useContext, useState, useCallback, type ReactNode } from 'react';
+import React, { createContext, useContext, useState, useCallback, useRef, useEffect, type ReactNode } from 'react';
 import type {
   Settings,
   Session,
@@ -76,6 +76,10 @@ export function AppContextProvider({ settings: initialSettings, session: initial
   const [thinkingVisible, setThinkingVisibleState] = useState<boolean>(false);
   const [quality, setQualityState] = useState<'low' | 'medium' | 'high'>(initialSettings.quality);
   const [gitBranch, setGitBranchState] = useState<string | null>(initialBranch);
+  const verboseModeRef = useRef(verboseMode);
+  useEffect(() => {
+    verboseModeRef.current = verboseMode;
+  }, [verboseMode]);
 
   const themeColors = getThemeColors(settings.theme);
 
@@ -121,12 +125,13 @@ export function AppContextProvider({ settings: initialSettings, session: initial
   }, []);
 
   const setVerboseMode = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
-    setVerboseModeState(prev => {
-      const next = typeof v === 'function' ? v(prev) : v;
-      // M10: Persist verbose mode — deferred to avoid I/O inside a state updater
-      queueMicrotask(() => saveSettings('user', { outputStyle: next ? 'verbose' : 'default' }));
-      return next;
-    });
+    const prev = verboseModeRef.current;
+    const next = typeof v === 'function' ? v(prev) : v;
+    if (next === prev) return;
+    verboseModeRef.current = next;
+    setVerboseModeState(next);
+    // M10: Persist verbose mode — deferred to avoid sync I/O in render paths
+    queueMicrotask(() => saveSettings('user', { outputStyle: next ? 'verbose' : 'default' }));
   }, []);
 
   const setThinkingVisible = useCallback((v: boolean | ((prev: boolean) => boolean)) => {

@@ -9,12 +9,15 @@ and returns a structured critique with a pass/fail verdict.
 from __future__ import annotations
 
 import base64
+import json
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
 
-import anthropic
+from agents.config import StageModelConfig, infer_provider, resolve_fallback_stage_model, resolve_stage_model
+from utils.llm_provider import run_text_completion
 
 
 @dataclass
@@ -25,6 +28,7 @@ class CritiqueResult:
     score: float  # 0.0 – 1.0
     issues: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
+    sub_scores: dict[str, float] = field(default_factory=dict)
     raw_feedback: str = ""
 
 
@@ -62,6 +66,11 @@ def _extract_key_frames(video_path: str, num_frames: int = 4, output_dir: str | 
     # Calculate timestamps for evenly-spaced frames (skip first/last 5%)
     margin = duration * 0.05
     usable = duration - 2 * margin
+    if duration >= 45:
+        num_frames = max(num_frames, 6)
+    elif duration >= 20:
+        num_frames = max(num_frames, 5)
+
     timestamps = [margin + usable * i / max(num_frames - 1, 1) for i in range(num_frames)]
 
     frame_paths: list[str] = []
@@ -82,6 +91,53 @@ def _extract_key_frames(video_path: str, num_frames: int = 4, output_dir: str | 
             continue
 
     return frame_paths
+
+
+def _analyze_frame_image(path: str) -> dict[str, float]:
+    """Return basic brightness/coverage heuristics for a PNG frame."""
+    try:
+        from PIL import Image, ImageStat
+    except Exception:
+        return {"mean_brightness": 0.5, "non_dark_ratio": 0.5, "stddev": 0.2}
+
+    with Image.open(path) as img:
+        gray = img.convert("L")
+        stat = ImageStat.Stat(gray)
+        pixels = list(gray.getdata())
+        total = max(len(pixels), 1)
+        non_dark = sum(1 for px in pixels if px > 24)
+        return {
+            "mean_brightness": (stat.mean[0] if stat.mean else 0.0) / 255.0,
+            "non_dark_ratio": non_dark / total,
+            "stddev": (stat.stddev[0] if stat.stddev else 0.0) / 255.0,
+        }
+
+
+def _heuristic_frame_issues(frame_paths: list[str]) -> tuple[list[str], dict[str, float]]:
+    analyses = [_analyze_frame_image(path) for path in frame_paths]
+    if not analyses:
+        return (["No frames available for heuristic analysis."], {})
+
+    mean_brightness = sum(a["mean_brightness"] for a in analyses) / len(analyses)
+    non_dark_ratio = sum(a["non_dark_ratio"] for a in analyses) / len(analyses)
+    detail_stddev = sum(a["stddev"] for a in analyses) / len(analyses)
+    last_frame = analyses[-1]
+
+    issues: list[str] = []
+    if non_dark_ratio < 0.08 or mean_brightness < 0.04:
+        issues.append("Frames appear mostly empty or black.")
+    if detail_stddev > 0.35 and non_dark_ratio > 0.75:
+        issues.append("Frames appear visually overloaded or cluttered.")
+    if last_frame["non_dark_ratio"] < 0.08:
+        issues.append("Final frame is nearly empty instead of holding a meaningful anchor visual.")
+
+    sub_scores = {
+        "readability": max(0.0, min(1.0, 0.45 + detail_stddev)),
+        "clutter": max(0.0, min(1.0, 1.0 - max(0.0, detail_stddev - 0.18) * 2.5)),
+        "content_coverage": max(0.0, min(1.0, non_dark_ratio * 1.6)),
+        "end_frame_quality": max(0.0, min(1.0, last_frame["non_dark_ratio"] * 1.8)),
+    }
+    return issues, sub_scores
 
 
 def _encode_image_base64(path: str) -> str:
@@ -106,6 +162,12 @@ Output ONLY valid JSON:
 {
   "score": 0.0-1.0,
   "passed": true/false,
+  "sub_scores": {
+    "readability": 0.0-1.0,
+    "clutter": 0.0-1.0,
+    "content_coverage": 0.0-1.0,
+    "end_frame_quality": 0.0-1.0
+  },
   "issues": ["issue 1", "issue 2"],
   "suggestions": ["suggestion 1", "suggestion 2"]
 }
@@ -116,7 +178,7 @@ Scoring guide:
 - 0.4-0.6: Needs improvement (overlapping elements, poor layout, hard to read)
 - 0.0-0.4: Major problems (mostly empty, completely overlapping, unreadable)
 
-Set "passed" to true if score >= 0.6.
+Set "passed" to true if score >= 0.7.
 Keep issues and suggestions concise (max 3 each)."""
 
 
@@ -124,7 +186,8 @@ def critique_video(
     video_path: str,
     segment_context: str = "",
     num_frames: int = 4,
-    model: str = "claude-sonnet-4-6",
+    model: str | None = None,
+    token_counter: dict | None = None,
 ) -> CritiqueResult:
     """Run visual critique on a rendered video.
 
@@ -147,7 +210,17 @@ def critique_video(
             raw_feedback="Frame extraction failed",
         )
 
-    # Check for mostly-black frames (empty scene)
+    heuristic_issues, heuristic_sub_scores = _heuristic_frame_issues(frames)
+    if any("mostly empty or black" in issue.lower() or "visually overloaded" in issue.lower() for issue in heuristic_issues):
+        return CritiqueResult(
+            passed=False,
+            score=min(heuristic_sub_scores.values()) if heuristic_sub_scores else 0.0,
+            issues=heuristic_issues,
+            suggestions=["Reduce clutter and preserve a clearer, meaningful composition."],
+            sub_scores=heuristic_sub_scores,
+            raw_feedback="Heuristic visual failure",
+        )
+
     # Build vision API request
     content: list[dict] = []
 
@@ -161,28 +234,33 @@ def critique_video(
     for i, frame_path in enumerate(frames):
         b64 = _encode_image_base64(frame_path)
         content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": b64,
-            },
+            "type": "image_base64",
+            "media_type": "image/png",
+            "data": b64,
         })
         content.append({"type": "text", "text": f"Frame {i + 1}/{len(frames)}"})
 
     try:
-        client = anthropic.Anthropic()
-        response = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            system=_CRITIQUE_SYSTEM,
-            messages=[{"role": "user", "content": content}],
+        primary = resolve_stage_model("vision")
+        if model:
+            primary = StageModelConfig(
+                provider=infer_provider(model),
+                model=model,
+                reasoning_effort=primary.reasoning_effort,
+                cache_retention=primary.cache_retention,
+                cache_key_prefix=primary.cache_key_prefix,
+            )
+        result = run_text_completion(
+            primary=primary,
+            fallback=resolve_fallback_stage_model("vision"),
+            system_sections=[_CRITIQUE_SYSTEM],
+            user_content=content,
+            max_output_tokens=1024,
+            token_counter=token_counter,
+            cache_key_parts=("critique",),
         )
+        raw = result.text or ""
 
-        raw = response.content[0].text or ""
-
-        import json
-        import re
         # Extract JSON from response
         text = raw.strip()
         text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -193,11 +271,23 @@ def critique_video(
         else:
             data = json.loads(text)
 
+        sub_scores = data.get("sub_scores") or {}
+        merged_sub_scores = dict(heuristic_sub_scores)
+        for key, value in sub_scores.items():
+            try:
+                merged_sub_scores[key] = float(value)
+            except Exception:
+                continue
+        issues = heuristic_issues + data.get("issues", [])
+        score = float(data.get("score", 0.0))
+        passed = bool(data.get("passed", False)) and score >= 0.7 and not heuristic_issues
+
         return CritiqueResult(
-            passed=data.get("passed", False),
-            score=float(data.get("score", 0.0)),
-            issues=data.get("issues", []),
+            passed=passed,
+            score=score,
+            issues=issues,
             suggestions=data.get("suggestions", []),
+            sub_scores=merged_sub_scores,
             raw_feedback=raw,
         )
 
@@ -207,6 +297,7 @@ def critique_video(
             passed=True,
             score=0.5,
             issues=[f"Critique model error: {str(e)}"],
+            sub_scores=heuristic_sub_scores,
             raw_feedback=str(e),
         )
     finally:
@@ -294,7 +385,8 @@ Set "smooth" to true if the transition looks natural. Keep issues concise (max 2
 
 def verify_transitions(
     segment_video_paths: dict[int, str],
-    model: str = "claude-sonnet-4-6",
+    model: str | None = None,
+    token_counter: dict | None = None,
 ) -> list[TransitionResult]:
     """Check visual continuity between consecutive segment pairs.
 
@@ -309,7 +401,6 @@ def verify_transitions(
         return []
 
     results: list[TransitionResult] = []
-    client = anthropic.Anthropic()
 
     for i in range(len(sorted_ids) - 1):
         id_a, id_b = sorted_ids[i], sorted_ids[i + 1]
@@ -329,27 +420,32 @@ def verify_transitions(
             content: list[dict] = [
                 {"type": "text", "text": f"Reviewing transition from Segment {id_a} to Segment {id_b}."},
                 {"type": "text", "text": "LAST frame of outgoing segment:"},
-                {"type": "image", "source": {
-                    "type": "base64", "media_type": "image/png",
-                    "data": _encode_image_base64(last_a),
-                }},
+                {"type": "image_base64", "media_type": "image/png", "data": _encode_image_base64(last_a)},
                 {"type": "text", "text": "FIRST frame of incoming segment:"},
-                {"type": "image", "source": {
-                    "type": "base64", "media_type": "image/png",
-                    "data": _encode_image_base64(first_b),
-                }},
+                {"type": "image_base64", "media_type": "image/png", "data": _encode_image_base64(first_b)},
             ]
-
-            response = client.messages.create(
-                model=model,
-                max_tokens=512,
-                system=_TRANSITION_SYSTEM,
-                messages=[{"role": "user", "content": content}],
+            primary = resolve_stage_model("vision")
+            if model:
+                primary = StageModelConfig(
+                    provider=infer_provider(model),
+                    model=model,
+                    reasoning_effort=primary.reasoning_effort,
+                    cache_retention=primary.cache_retention,
+                    cache_key_prefix=primary.cache_key_prefix,
+                )
+            result = run_text_completion(
+                primary=primary,
+                fallback=resolve_fallback_stage_model("vision"),
+                system_sections=[_TRANSITION_SYSTEM],
+                user_content=content,
+                max_output_tokens=512,
+                token_counter=token_counter,
+                cache_key_parts=("critique-transition",),
             )
 
             import json as _json
             import re as _re
-            raw = response.content[0].text or ""
+            raw = result.text or ""
             text = raw.strip()
             text = _re.sub(r"^```(?:json)?\s*", "", text)
             text = _re.sub(r"\s*```$", "", text)
@@ -376,3 +472,30 @@ def verify_transitions(
                         pass
 
     return results
+
+
+@dataclass
+class ProjectConsistencyResult:
+    passed: bool
+    issues: list[str] = field(default_factory=list)
+    transition_results: list[TransitionResult] = field(default_factory=list)
+
+
+def critique_project_consistency(
+    segment_video_paths: dict[int, str],
+    token_counter: dict | None = None,
+) -> ProjectConsistencyResult:
+    """Project-level visual continuity check before concat."""
+    transition_results = verify_transitions(segment_video_paths, token_counter=token_counter)
+    issues: list[str] = []
+    for result in transition_results:
+        if not result.smooth:
+            issues.extend(
+                f"Segments {result.segment_a_id}->{result.segment_b_id}: {issue}"
+                for issue in result.issues
+            )
+    return ProjectConsistencyResult(
+        passed=not issues,
+        issues=issues,
+        transition_results=transition_results,
+    )

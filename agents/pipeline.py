@@ -17,12 +17,19 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from queue import Empty, Queue
 from typing import Any, Iterator
 
 from agents.coder import run_coder_agent
-from agents.config import CLAUDE_OPUS, CLAUDE_SONNET, estimate_cost, merge_token_usage, new_token_counter
+from agents.config import (
+    estimate_cache_savings,
+    estimate_cost,
+    merge_token_usage,
+    model_profile_summary,
+    new_token_counter,
+    resolve_stage_model,
+)
 from agents.planner import plan_segmented_storyboard_lite
 from agents.planner_math2manim import run_math2manim_planner
 from utils.media_assembler import concatenate_segments, mux_subtitles, stitch_video_and_audio
@@ -37,7 +44,9 @@ from utils.project_state import (
     mark_segment_stage,
     mark_stage_done,
 )
+from utils.code_verifier import verify_code_transitions, verify_segment_code
 from utils.tts_engine import generate_voiceover_async
+from utils.visual_critique import critique_project_consistency, critique_video
 
 
 def _format_duration(seconds: float) -> str:
@@ -55,6 +64,34 @@ def _slugify(text: str) -> str:
 
 def _has_valid_code(result: dict) -> bool:
     return bool(result.get("video_path")) or result.get("code_validated", False)
+
+
+def _quality_mode_settings(questionnaire_answers: dict | None) -> dict[str, Any]:
+    mode = (questionnaire_answers or {}).get("quality_mode", "balanced")
+    settings = {
+        "quality_mode": mode,
+        "allow_repair": mode != "fast",
+        "critique_threshold": 0.78 if mode == "polished" else 0.7,
+        "base_render_quality": "-qm" if mode == "fast" else "-qh",
+        "repair_render_quality": "-qp" if mode == "polished" else "-qh",
+    }
+    return settings
+
+
+def _build_repair_feedback(
+    *,
+    verify_issues: list[str] | None = None,
+    critique_issues: list[str] | None = None,
+    transition_issues: list[str] | None = None,
+) -> str:
+    parts: list[str] = []
+    if verify_issues:
+        parts.append("Verifier issues:\n- " + "\n- ".join(verify_issues[:4]))
+    if critique_issues:
+        parts.append("Visual critique issues:\n- " + "\n- ".join(critique_issues[:4]))
+    if transition_issues:
+        parts.append("Transition issues to fix in this segment:\n- " + "\n- ".join(transition_issues[:4]))
+    return "\n\n".join(parts)
 
 
 def _find_existing_project(output_base: str, slug: str) -> str | None:
@@ -120,6 +157,24 @@ def _drain_status_queue(q: Queue) -> Iterator[dict]:
             yield msg
 
 
+def _iter_completed_futures(
+    futures_map: dict[Any, Any],
+    status_queue: Queue,
+    poll_interval: float = 0.1,
+) -> Iterator[tuple[Any, Any]]:
+    """Yield futures as they complete while continuously draining worker status.
+
+    This keeps the CLI responsive during long-running segment work instead of
+    buffering all status updates until a whole segment finishes.
+    """
+    pending = set(futures_map)
+    while pending:
+        done, pending = wait(pending, timeout=poll_interval, return_when=FIRST_COMPLETED)
+        yield from ((None, msg) for msg in _drain_status_queue(status_queue))
+        for fut in done:
+            yield fut, futures_map[fut]
+
+
 def _save_pipeline_summary(
     timings: list[tuple[str, str, float]],
     project_dir: str,
@@ -167,15 +222,27 @@ def _save_pipeline_summary(
         lines.append("=" * 50)
         lines.append(f"Total input tokens  : {token_summary.get('total_input_tokens', 0):,}")
         lines.append(f"Total output tokens : {token_summary.get('total_output_tokens', 0):,}")
+        lines.append(f"Cached input tokens : {token_summary.get('cached_input_tokens', 0):,}")
         lines.append(f"Total API calls     : {token_summary.get('total_api_calls', 0)}")
         lines.append(f"TTS API calls       : {token_summary.get('tts_api_calls', 0)}")
         lines.append(f"Estimated cost      : ${token_summary.get('estimated_cost_usd', 0):.4f}")
+        lines.append(f"Estimated savings   : ${token_summary.get('estimated_cache_savings_usd', 0):.4f}")
+        if token_summary.get("fallback_invocations", 0):
+            lines.append(f"Provider fallbacks  : {token_summary.get('fallback_invocations', 0)}")
         lines.append("")
+        if token_summary.get("model_profile"):
+            lines.append("Models")
+            lines.append("=" * 50)
+            for stage_name, stage_model in token_summary["model_profile"].items():
+                lines.append(f"{stage_name:<12}: {stage_model}")
+            lines.append("")
         breakdown = token_summary.get("breakdown", {})
         for stage_name, stage_data in breakdown.items():
             lines.append(f"  {stage_name.capitalize()}:")
             lines.append(f"    Input tokens  : {stage_data.get('input_tokens', 0):,}")
             lines.append(f"    Output tokens : {stage_data.get('output_tokens', 0):,}")
+            if stage_data.get("cached_input_tokens", 0):
+                lines.append(f"    Cached input  : {stage_data.get('cached_input_tokens', 0):,}")
             lines.append(f"    API calls     : {stage_data.get('api_calls', 0)}")
             lines.append(f"    Cost          : ${stage_data.get('cost_usd', 0):.4f}")
             lines.append("")
@@ -189,46 +256,78 @@ def _save_pipeline_summary(
 
 # ── Token summary builder ────────────────────────────────────────────
 
-def _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, tts_api_calls=0):
+def _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, verification_tokens, tts_api_calls=0):
     """Build a summary dict of token usage and estimated cost across stages."""
+    planning_model = resolve_stage_model("plan").model
+    coding_model = resolve_stage_model("code").model
+    verify_model = resolve_stage_model("verify").model
     total_in = pipeline_tokens["input_tokens"]
     total_out = pipeline_tokens["output_tokens"]
     total_calls = pipeline_tokens["api_calls"]
     planning_cost = estimate_cost(
-        planning_tokens["input_tokens"], planning_tokens["output_tokens"], model=CLAUDE_SONNET,
+        planning_tokens["input_tokens"], planning_tokens["output_tokens"], model=planning_model,
+        cached_input_tokens=planning_tokens.get("cached_input_tokens", 0),
         cache_creation_tokens=planning_tokens.get("cache_creation_input_tokens", 0),
         cache_read_tokens=planning_tokens.get("cache_read_input_tokens", 0),
     )
     coding_cost = estimate_cost(
-        coding_tokens["input_tokens"], coding_tokens["output_tokens"], model=CLAUDE_OPUS,
+        coding_tokens["input_tokens"], coding_tokens["output_tokens"], model=coding_model,
+        cached_input_tokens=coding_tokens.get("cached_input_tokens", 0),
         cache_creation_tokens=coding_tokens.get("cache_creation_input_tokens", 0),
         cache_read_tokens=coding_tokens.get("cache_read_input_tokens", 0),
     )
     total_cost = planning_cost + coding_cost
-    total_cache_created = pipeline_tokens.get("cache_creation_input_tokens", 0)
-    total_cache_read = pipeline_tokens.get("cache_read_input_tokens", 0)
+    verification_cost = estimate_cost(
+        verification_tokens["input_tokens"], verification_tokens["output_tokens"], model=verify_model,
+        cached_input_tokens=verification_tokens.get("cached_input_tokens", 0),
+        cache_creation_tokens=verification_tokens.get("cache_creation_input_tokens", 0),
+        cache_read_tokens=verification_tokens.get("cache_read_input_tokens", 0),
+    )
+    total_cost += verification_cost
+    total_cached_input = pipeline_tokens.get("cached_input_tokens", 0)
+    total_cache_savings = (
+        estimate_cache_savings(planning_model, cached_input_tokens=planning_tokens.get("cached_input_tokens", 0), cache_read_tokens=planning_tokens.get("cache_read_input_tokens", 0))
+        + estimate_cache_savings(coding_model, cached_input_tokens=coding_tokens.get("cached_input_tokens", 0), cache_read_tokens=coding_tokens.get("cache_read_input_tokens", 0))
+        + estimate_cache_savings(verify_model, cached_input_tokens=verification_tokens.get("cached_input_tokens", 0), cache_read_tokens=verification_tokens.get("cache_read_input_tokens", 0))
+    )
     return {
         "total_input_tokens": total_in,
         "total_output_tokens": total_out,
+        "cached_input_tokens": total_cached_input,
         "total_api_calls": total_calls,
         "tts_api_calls": tts_api_calls,
-        "cache_creation_input_tokens": total_cache_created,
-        "cache_read_input_tokens": total_cache_read,
+        "cache_creation_input_tokens": pipeline_tokens.get("cache_creation_input_tokens", 0),
+        "cache_read_input_tokens": pipeline_tokens.get("cache_read_input_tokens", 0),
+        "fallback_invocations": pipeline_tokens.get("fallback_invocations", 0),
         "estimated_cost_usd": round(total_cost, 4),
+        "estimated_cache_savings_usd": round(total_cache_savings, 4),
+        "model_profile": model_profile_summary(),
         "breakdown": {
             "planning": {
+                "model": planning_model,
                 "input_tokens": planning_tokens["input_tokens"],
                 "output_tokens": planning_tokens["output_tokens"],
+                "cached_input_tokens": planning_tokens.get("cached_input_tokens", 0),
                 "api_calls": planning_tokens["api_calls"],
                 "cost_usd": round(planning_cost, 4),
             },
             "coding": {
+                "model": coding_model,
                 "input_tokens": coding_tokens["input_tokens"],
                 "output_tokens": coding_tokens["output_tokens"],
+                "cached_input_tokens": coding_tokens.get("cached_input_tokens", 0),
                 "api_calls": coding_tokens["api_calls"],
                 "cache_creation_input_tokens": coding_tokens.get("cache_creation_input_tokens", 0),
                 "cache_read_input_tokens": coding_tokens.get("cache_read_input_tokens", 0),
                 "cost_usd": round(coding_cost, 4),
+            },
+            "verification": {
+                "model": verify_model,
+                "input_tokens": verification_tokens["input_tokens"],
+                "output_tokens": verification_tokens["output_tokens"],
+                "cached_input_tokens": verification_tokens.get("cached_input_tokens", 0),
+                "api_calls": verification_tokens["api_calls"],
+                "cost_usd": round(verification_cost, 4),
             },
         },
     }
@@ -247,6 +346,7 @@ def run_segmented_pipeline(
     skip_audio: bool = False,
     render_timeout_seconds: int = 0,
     tts_timeout_seconds: int = 0,
+    resume_dir: str | None = None,
     force_restart: bool = False,
 ) -> Iterator[dict]:
     """Run the full segmented pipeline, yielding progress updates.
@@ -260,11 +360,13 @@ def run_segmented_pipeline(
     """
 
     slug = _slugify(concept)
+    quality_settings = _quality_mode_settings(questionnaire_answers)
 
     # ── Token tracking accumulators ──────────────────────────────────
     pipeline_tokens = new_token_counter()
     planning_tokens = new_token_counter()
     coding_tokens = new_token_counter()
+    verification_tokens = new_token_counter()
     tts_api_calls = 0
 
     # ── Resumability: look for an existing incomplete project ─────────
@@ -273,17 +375,28 @@ def run_segmented_pipeline(
     state: dict | None = None
 
     if not force_restart:
-        existing_dir = _find_existing_project(output_base, slug)
-        if existing_dir:
-            state = load_project(existing_dir)
+        if resume_dir:
+            state = load_project(resume_dir)
             if state:
-                project_dir = existing_dir
+                project_dir = resume_dir
                 resumed = True
                 yield {
                     "stage": "plan",
-                    "status": f"Resuming from previous run ({os.path.basename(existing_dir)})...",
+                    "status": f"Resuming from selected project ({os.path.basename(resume_dir)})...",
                     "resumed": True,
                 }
+        else:
+            existing_dir = _find_existing_project(output_base, slug)
+            if existing_dir:
+                state = load_project(existing_dir)
+                if state:
+                    project_dir = existing_dir
+                    resumed = True
+                    yield {
+                        "stage": "plan",
+                        "status": f"Resuming from previous run ({os.path.basename(existing_dir)})...",
+                        "resumed": True,
+                    }
 
     # ── Step 1: Planning ──────────────────────────────────────────────
 
@@ -409,7 +522,7 @@ def run_segmented_pipeline(
 
     # ── Per-segment pipeline worker ──────────────────────────────────
 
-    def _run_segment_pipeline(seg: dict, few_shot_example: str = "") -> dict:
+    def _run_segment_pipeline(seg: dict, few_shot_example: str = "", repair_feedback: str = "") -> dict:
         """Run the full pipeline for one segment: TTS → Code → HD Render → Stitch.
 
         Returns a result dict with tts_result, code_result, stitch_path, etc.
@@ -423,11 +536,16 @@ def run_segmented_pipeline(
             "segment_id": seg_id,
             "tts_result": {"success": False, "audio_path": None, "duration": 0.0},
             "code_result": {"success": False},
+            "verify_result": None,
+            "critique_result": None,
             "stitch_path": None,
             "stitch_error": None,
             "token_usage": None,
+            "verify_token_usage": None,
             "tool_call_counts": None,
             "tts_api_call": False,
+            "repair_attempted": False,
+            "final_accepted_critique_score": None,
         }
 
         # ── Phase 1: TTS ──────────────────────────────────────────
@@ -498,7 +616,118 @@ def run_segmented_pipeline(
                 finally:
                     loop.close()
 
-        # ── Phase 2: Code generation ──────────────────────────────
+        def _run_codegen(extra_repair_feedback: str = "") -> dict:
+            tts_r = result["tts_result"]
+            coder_instructions = seg["visual_instructions"] if is_lite else seg
+            last_update: dict = {}
+            for update in run_coder_agent(
+                instructions=coder_instructions,
+                max_retries=max_retries,
+                audio_script=seg.get("audio_script", ""),
+                audio_duration=tts_r.get("duration", 0.0) or 0.0,
+                complexity=seg.get("complexity", "complex"),
+                scene_class_name=f"Segment{seg_id}Scene",
+                output_dir=seg_output_dir,
+                theme_name=theme_name,
+                color_palette=color_palette,
+                segment_id=seg_id,
+                few_shot_example=few_shot_example,
+                repair_feedback="\n\n".join(part for part in [repair_feedback, extra_repair_feedback] if part),
+                quality_mode=quality_settings["quality_mode"],
+            ):
+                last_update = update
+                status_queue.put({
+                    "stage": "code", "segment_id": seg_id,
+                    "status": update.get("status", ""),
+                    "segment_phase": update.get("phase", "running"),
+                    "segment_final": bool(update.get("final")),
+                    "code": update.get("code"),
+                })
+            return last_update
+
+        def _verify_and_render(code_r: dict, render_quality: str) -> tuple[dict | None, dict | None]:
+            verify_result = None
+            critique_result = None
+            if code_r.get("code"):
+                verify_tokens = result.get("verify_token_usage") or new_token_counter()
+                status_queue.put({
+                    "stage": "verify", "segment_id": seg_id,
+                    "status": f"Segment {seg_id}: verifying code quality...",
+                    "segment_phase": "running", "segment_final": False,
+                })
+                verify_result = verify_segment_code(
+                    seg_id,
+                    code_r["code"],
+                    segment_context=seg.get("visual_instructions", ""),
+                    audio_duration=result["tts_result"].get("duration", 0.0) or 0.0,
+                    token_counter=verify_tokens,
+                )
+                result["verify_token_usage"] = verify_tokens
+                status_queue.put({
+                    "stage": "verify", "segment_id": seg_id,
+                    "status": (
+                        f"Segment {seg_id}: verification passed"
+                        if verify_result.passed
+                        else f"Segment {seg_id}: verification warnings - {'; '.join(verify_result.issues[:2])}"
+                    ),
+                    "segment_phase": "done" if verify_result.passed else "failed",
+                    "segment_final": True,
+                })
+
+            if _has_valid_code(code_r) and code_r.get("code"):
+                status_queue.put({
+                    "stage": "render", "segment_id": seg_id,
+                    "status": f"Segment {seg_id}: HD rendering...",
+                    "segment_phase": "running", "segment_final": False,
+                })
+                hd_job = RenderJob(
+                    segment_id=seg_id,
+                    code=code_r["code"],
+                    quality_flag=render_quality,
+                    timeout_seconds=render_timeout_seconds or 300,
+                    output_dir=seg_output_dir,
+                )
+                hd_results = render_parallel([hd_job])
+                hd_result = hd_results[0] if hd_results else None
+                if hd_result and hd_result.success and hd_result.video_path:
+                    code_r["video_path"] = hd_result.video_path
+                    with _state_lock:
+                        mark_segment_stage(project_dir, seg_id, "hd_render", done=True, artifacts=[hd_result.video_path])
+                    status_queue.put({
+                        "stage": "render", "segment_id": seg_id,
+                        "status": f"Segment {seg_id}: HD render done",
+                        "segment_phase": "done", "segment_final": True,
+                    })
+                    critique_tokens = result.get("verify_token_usage") or new_token_counter()
+                    critique_result = critique_video(
+                        hd_result.video_path,
+                        segment_context=seg.get("visual_instructions", ""),
+                        token_counter=critique_tokens,
+                    )
+                    result["verify_token_usage"] = critique_tokens
+                    result["final_accepted_critique_score"] = critique_result.score
+                    status_queue.put({
+                        "stage": "verify", "segment_id": seg_id,
+                        "status": (
+                            f"Segment {seg_id}: visual critique passed"
+                            if critique_result.passed
+                            else f"Segment {seg_id}: visual critique warnings - {'; '.join(critique_result.issues[:2])}"
+                        ),
+                        "segment_phase": "done" if critique_result.passed else "failed",
+                        "segment_final": True,
+                    })
+                else:
+                    err = hd_result.error if hd_result else "Unknown"
+                    with _state_lock:
+                        mark_segment_stage(project_dir, seg_id, "hd_render", done=False, error=err or "Unknown")
+                    status_queue.put({
+                        "stage": "render", "segment_id": seg_id,
+                        "status": f"Segment {seg_id}: HD render failed, using preview",
+                        "segment_phase": "failed", "segment_final": True,
+                    })
+            return verify_result, critique_result
+
+        # ── Phase 2-3: Code generation, verification, render, repair ──
         code_cached = False
         if resumed and state and is_segment_stage_done(state, seg_id, "code"):
             seg_artifacts = state.get("segments", {}).get(str(seg_id), {}).get("code", {}).get("artifacts", [])
@@ -526,98 +755,66 @@ def run_segmented_pipeline(
                 })
 
         if not code_cached:
-            tts_r = result["tts_result"]
-            coder_instructions = seg["visual_instructions"] if is_lite else seg
-            last_update: dict = {}
-            for update in run_coder_agent(
-                instructions=coder_instructions,
-                max_retries=max_retries,
-                audio_script=seg.get("audio_script", ""),
-                audio_duration=tts_r.get("duration", 0.0) or 0.0,
-                complexity=seg.get("complexity", "complex"),
-                scene_class_name=f"Segment{seg_id}Scene",
-                output_dir=seg_output_dir,
-                theme_name=theme_name,
-                color_palette=color_palette,
-                segment_id=seg_id,
-                few_shot_example=few_shot_example,
-            ):
-                last_update = update
-                status_queue.put({
-                    "stage": "code", "segment_id": seg_id,
-                    "status": update.get("status", ""),
-                    "segment_phase": update.get("phase", "running"),
-                    "segment_final": bool(update.get("final")),
-                })
+            initial_update = _run_codegen()
+            result["code_result"] = initial_update
+            result["token_usage"] = initial_update.get("token_usage")
+            result["tool_call_counts"] = initial_update.get("tool_call_counts")
 
-            result["code_result"] = last_update
-            result["token_usage"] = last_update.get("token_usage")
-            result["tool_call_counts"] = last_update.get("tool_call_counts")
-
-            has_code = _has_valid_code(last_update)
+            has_code = _has_valid_code(initial_update)
             with _state_lock:
                 if has_code:
-                    mark_segment_stage(project_dir, seg_id, "code", done=True,
-                                       artifacts=[last_update.get("video_path", "")])
-                    if last_update.get("video_path"):
-                        mark_segment_stage(project_dir, seg_id, "render", done=True,
-                                           artifacts=[last_update.get("video_path", "")])
+                    mark_segment_stage(project_dir, seg_id, "code", done=True, artifacts=[initial_update.get("video_path", "")])
                 else:
-                    mark_segment_stage(project_dir, seg_id, "code", done=False,
-                                       error=last_update.get("error", "Code generation failed"))
+                    mark_segment_stage(project_dir, seg_id, "code", done=False, error=initial_update.get("error", "Code generation failed"))
 
-        # ── Phase 3: HD Render ────────────────────────────────────
-        code_r = result["code_result"]
-        if _has_valid_code(code_r) and code_r.get("code"):
-            hd_cached = False
-            if resumed and state and is_segment_stage_done(state, seg_id, "hd_render"):
-                hd_info = state.get("segments", {}).get(str(seg_id), {}).get("hd_render", {})
-                hd_found = next((a for a in hd_info.get("artifacts", []) if a and os.path.isfile(a)), None)
-                if hd_found:
-                    code_r["video_path"] = hd_found
-                    hd_cached = True
-                    status_queue.put({
-                        "stage": "render", "segment_id": seg_id,
-                        "status": f"Segment {seg_id}: HD render cached",
-                        "segment_phase": "done", "segment_final": True,
-                        "skipped": True,
-                    })
+            code_r = result["code_result"]
+            verify_result, critique_result = _verify_and_render(code_r, quality_settings["base_render_quality"])
+            result["verify_result"] = verify_result
+            result["critique_result"] = critique_result
 
-            if not hd_cached:
+            critique_needs_repair = bool(
+                critique_result
+                and (
+                    not critique_result.passed
+                    or critique_result.score < quality_settings["critique_threshold"]
+                )
+            )
+            verify_needs_repair = bool(verify_result and not verify_result.passed)
+
+            if quality_settings["allow_repair"] and _has_valid_code(code_r) and (verify_needs_repair or critique_needs_repair):
+                result["repair_attempted"] = True
+                repair_feedback = _build_repair_feedback(
+                    verify_issues=(verify_result.issues if verify_result else []),
+                    critique_issues=(critique_result.issues if critique_result else []),
+                )
                 status_queue.put({
-                    "stage": "render", "segment_id": seg_id,
-                    "status": f"Segment {seg_id}: HD rendering...",
+                    "stage": "code_retry", "segment_id": seg_id,
+                    "status": f"Segment {seg_id}: repairing quality issues...",
                     "segment_phase": "running", "segment_final": False,
                 })
-                hd_job = RenderJob(
-                    segment_id=seg_id,
-                    code=code_r["code"],
-                    quality_flag="-qh",
-                    timeout_seconds=render_timeout_seconds or 300,
-                    output_dir=seg_output_dir,
-                )
-                hd_results = render_parallel([hd_job])
-                hd_result = hd_results[0] if hd_results else None
-                if hd_result and hd_result.success and hd_result.video_path:
-                    code_r["video_path"] = hd_result.video_path
-                    with _state_lock:
-                        mark_segment_stage(project_dir, seg_id, "hd_render", done=True,
-                                           artifacts=[hd_result.video_path])
-                    status_queue.put({
-                        "stage": "render", "segment_id": seg_id,
-                        "status": f"Segment {seg_id}: HD render done",
-                        "segment_phase": "done", "segment_final": True,
-                    })
-                else:
-                    err = hd_result.error if hd_result else "Unknown"
-                    with _state_lock:
-                        mark_segment_stage(project_dir, seg_id, "hd_render", done=False,
-                                           error=err or "Unknown")
-                    status_queue.put({
-                        "stage": "render", "segment_id": seg_id,
-                        "status": f"Segment {seg_id}: HD render failed, using preview",
-                        "segment_phase": "failed", "segment_final": True,
-                    })
+                repaired_update = _run_codegen(extra_repair_feedback=repair_feedback)
+                result["code_result"] = repaired_update
+                result["token_usage"] = repaired_update.get("token_usage") or result["token_usage"]
+                result["tool_call_counts"] = repaired_update.get("tool_call_counts") or result["tool_call_counts"]
+                code_r = result["code_result"]
+                repaired_verify, repaired_critique = _verify_and_render(code_r, quality_settings["repair_render_quality"])
+                result["verify_result"] = repaired_verify or verify_result
+                result["critique_result"] = repaired_critique or critique_result
+                with _state_lock:
+                    if _has_valid_code(code_r):
+                        mark_segment_stage(project_dir, seg_id, "code", done=True, artifacts=[code_r.get("video_path", "")])
+                status_queue.put({
+                    "stage": "code_retry", "segment_id": seg_id,
+                    "status": (
+                        f"Segment {seg_id}: repair complete"
+                        if _has_valid_code(code_r)
+                        else f"Segment {seg_id}: repair failed"
+                    ),
+                    "segment_phase": "done" if _has_valid_code(code_r) else "failed",
+                    "segment_final": True,
+                })
+        else:
+            code_r = result["code_result"]
 
         # ── Phase 4: Stitch ───────────────────────────────────────
         if not skip_audio:
@@ -703,10 +900,10 @@ def run_segmented_pipeline(
         for seg in segments:
             futures_map[executor.submit(_run_segment_pipeline, seg)] = seg
 
-        for fut in as_completed(futures_map):
-            yield from _drain_status_queue(status_queue)
-
-            seg = futures_map[fut]
+        for fut, seg in _iter_completed_futures(futures_map, status_queue):
+            if fut is None:
+                yield seg
+                continue
             seg_id = seg["id"]
             try:
                 seg_result = fut.result()
@@ -752,6 +949,10 @@ def run_segmented_pipeline(
         if seg_tu:
             merge_token_usage(coding_tokens, seg_tu)
             merge_token_usage(pipeline_tokens, seg_tu)
+        seg_verify_tu = seg_r.get("verify_token_usage")
+        if seg_verify_tu:
+            merge_token_usage(verification_tokens, seg_verify_tu)
+            merge_token_usage(pipeline_tokens, seg_verify_tu)
         _merge_tool_calls(seg_r.get("tool_call_counts"))
         if seg_r.get("tts_api_call"):
             tts_api_calls += 1
@@ -767,8 +968,6 @@ def run_segmented_pipeline(
         ])
     if code_ok == num_segments:
         mark_stage_done(project_dir, "code", artifacts=[])
-    if code_ok > 0 and not stitch_errors:
-        mark_stage_done(project_dir, "stitch", artifacts=[])
     state = load_project(project_dir)
 
     timings.append(("Parallel Pipeline", "ok" if code_ok > 0 else "failed", pipeline_elapsed))
@@ -814,9 +1013,10 @@ def run_segmented_pipeline(
                     _run_segment_pipeline, seg, few_shot
                 )] = seg
 
-            for fut in as_completed(retry_futures):
-                yield from _drain_status_queue(status_queue)
-                seg = retry_futures[fut]
+            for fut, seg in _iter_completed_futures(retry_futures, status_queue):
+                if fut is None:
+                    yield seg
+                    continue
                 sid = seg["id"]
                 try:
                     retry_r = fut.result()
@@ -841,6 +1041,10 @@ def run_segmented_pipeline(
                 if retry_tu:
                     merge_token_usage(coding_tokens, retry_tu)
                     merge_token_usage(pipeline_tokens, retry_tu)
+                retry_verify_tu = retry_r.get("verify_token_usage")
+                if retry_verify_tu:
+                    merge_token_usage(verification_tokens, retry_verify_tu)
+                    merge_token_usage(pipeline_tokens, retry_verify_tu)
                 _merge_tool_calls(retry_r.get("tool_call_counts"))
 
                 has_code = _has_valid_code(retry_r["code_result"])
@@ -859,6 +1063,67 @@ def run_segmented_pipeline(
                     }
 
             yield from _drain_status_queue(status_queue)
+
+    # ── Step 3.2: Transition quality checks and targeted repair ──────
+    final_code_map = {
+        sid: res.get("code", "")
+        for sid, res in code_results.items()
+        if res.get("code")
+    }
+    if len(final_code_map) >= 2:
+        yield {"stage": "verify", "status": "Checking cross-segment code transitions..."}
+        transition_checks = verify_code_transitions(final_code_map, token_counter=verification_tokens)
+        transition_repairs = [check for check in transition_checks if not check.smooth]
+
+        for check in transition_checks:
+            yield {
+                "stage": "verify",
+                "segment_id": check.segment_b_id,
+                "status": (
+                    f"Transition {check.segment_a_id}->{check.segment_b_id} passed"
+                    if check.smooth
+                    else f"Transition {check.segment_a_id}->{check.segment_b_id} warnings - {'; '.join(check.issues[:2])}"
+                ),
+                "segment_phase": "done" if check.smooth else "failed",
+                "segment_final": True,
+            }
+
+        if quality_settings["allow_repair"]:
+            for check in transition_repairs:
+                target_seg = next((seg for seg in segments if seg["id"] == check.segment_b_id), None)
+                if not target_seg:
+                    continue
+                feedback = _build_repair_feedback(transition_issues=check.issues)
+                yield {
+                    "stage": "code_retry",
+                    "segment_id": check.segment_b_id,
+                    "status": f"Repairing Segment {check.segment_b_id} for transition continuity...",
+                    "segment_phase": "running",
+                    "segment_final": False,
+                }
+                repaired = _run_segment_pipeline(target_seg, repair_feedback=feedback)
+                segment_results[check.segment_b_id] = repaired
+                code_results[check.segment_b_id] = repaired.get("code_result", {})
+                tts_results[check.segment_b_id] = repaired.get("tts_result", {})
+                repair_tu = repaired.get("token_usage")
+                if repair_tu:
+                    merge_token_usage(coding_tokens, repair_tu)
+                    merge_token_usage(pipeline_tokens, repair_tu)
+                repair_verify_tu = repaired.get("verify_token_usage")
+                if repair_verify_tu:
+                    merge_token_usage(verification_tokens, repair_verify_tu)
+                    merge_token_usage(pipeline_tokens, repair_verify_tu)
+                _merge_tool_calls(repaired.get("tool_call_counts"))
+                yield {
+                    "stage": "code_retry",
+                    "segment_id": check.segment_b_id,
+                    "status": f"Transition repair complete for Segment {check.segment_b_id}",
+                    "segment_phase": "done" if _has_valid_code(repaired.get("code_result", {})) else "failed",
+                    "segment_final": True,
+                }
+
+    code_ok = sum(1 for r in code_results.values() if _has_valid_code(r))
+    tts_ok = sum(1 for r in tts_results.values() if r.get("success"))
 
     # ── Build ordered valid_paths for concat ──────────────────────────
 
@@ -882,21 +1147,72 @@ def run_segmented_pipeline(
             for seg in segments
             if segment_results.get(seg["id"], {}).get("stitch_path")
         ]
+        if code_ok > 0 and not stitch_errors:
+            mark_stage_done(project_dir, "stitch", artifacts=[])
+
+    project_consistency = None
+    segment_video_paths = {
+        seg["id"]: segment_results.get(seg["id"], {}).get("stitch_path") or code_results.get(seg["id"], {}).get("video_path")
+        for seg in segments
+        if (segment_results.get(seg["id"], {}).get("stitch_path") or code_results.get(seg["id"], {}).get("video_path"))
+    }
+    if len(segment_video_paths) >= 2:
+        yield {"stage": "verify", "status": "Checking project-level visual consistency before concat..."}
+        project_consistency = critique_project_consistency(segment_video_paths, token_counter=verification_tokens)
+        if project_consistency is not None:
+            yield {
+                "stage": "verify",
+                "status": (
+                    "Project-level visual consistency passed"
+                    if project_consistency.passed
+                    else f"Project-level consistency warnings - {'; '.join(project_consistency.issues[:2])}"
+                ),
+            }
+
+    # ── Build per-segment failure summary for error reporting ────────
+
+    def _build_segment_failures() -> list[dict]:
+        """Build a list of {id, title, stage, error} for each failed segment."""
+        failures = []
+        for seg in segments:
+            sid = seg["id"]
+            cr = code_results.get(sid, {})
+            sr = segment_results.get(sid, {})
+            if not _has_valid_code(cr) or sr.get("stitch_error"):
+                stage = "stitch" if _has_valid_code(cr) else "code"
+                err = sr.get("stitch_error") or cr.get("error") or "Unknown error"
+                failures.append({
+                    "id": sid,
+                    "title": seg.get("title", f"Segment {sid}"),
+                    "stage": stage,
+                    "error": str(err)[:200],
+                })
+        return failures
 
     # ── Step 5: Concatenate all segments ──────────────────────────────
 
     if not valid_paths:
-        token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, tts_api_calls)
+        token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, verification_tokens, tts_api_calls)
         yield {
             "stage": "done",
             "status": "No segments produced a video.",
             "error": "All segments failed.",
             "final": True,
             "project_dir": project_dir,
+            "num_segments": num_segments,
+            "failed_segments": _build_segment_failures(),
             "timings": timings,
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
             "total_tool_calls": sum(tool_call_counts.values()),
             "token_summary": token_summary,
+            "project_consistency": project_consistency,
+            "segment_quality": {
+                sid: {
+                    "repair_attempted": segment_results.get(sid, {}).get("repair_attempted", False),
+                    "final_accepted_critique_score": segment_results.get(sid, {}).get("final_accepted_critique_score"),
+                }
+                for sid in segment_results
+            },
         }
         _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=token_summary)
         return
@@ -907,7 +1223,7 @@ def run_segmented_pipeline(
     if resumed and state and is_stage_done(state, "concat") and os.path.isfile(final_output):
         timings.append(("Concat", "skipped", 0.0))
         mark_project_complete(project_dir)
-        token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, tts_api_calls)
+        token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, verification_tokens, tts_api_calls)
         _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=token_summary)
         yield {
             "stage": "concat",
@@ -926,6 +1242,14 @@ def run_segmented_pipeline(
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
             "total_tool_calls": sum(tool_call_counts.values()),
             "token_summary": token_summary,
+            "project_consistency": project_consistency,
+            "segment_quality": {
+                sid: {
+                    "repair_attempted": segment_results.get(sid, {}).get("repair_attempted", False),
+                    "final_accepted_critique_score": segment_results.get(sid, {}).get("final_accepted_critique_score"),
+                }
+                for sid in segment_results
+            },
         }
         return
 
@@ -976,7 +1300,7 @@ def run_segmented_pipeline(
             except Exception as exc:
                 yield {"stage": "subtitles", "status": f"Subtitle generation failed: {exc}"}
 
-        token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, tts_api_calls)
+        token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, verification_tokens, tts_api_calls)
         _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=token_summary)
         yield {
             "stage": "done",
@@ -991,11 +1315,19 @@ def run_segmented_pipeline(
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
             "total_tool_calls": sum(tool_call_counts.values()),
             "token_summary": token_summary,
+            "project_consistency": project_consistency,
+            "segment_quality": {
+                sid: {
+                    "repair_attempted": segment_results.get(sid, {}).get("repair_attempted", False),
+                    "final_accepted_critique_score": segment_results.get(sid, {}).get("final_accepted_critique_score"),
+                }
+                for sid in segment_results
+            },
         }
     else:
         err = concat_result.get("error", "unknown") if concat_result else "unknown"
         timings.append(("Concat", "failed", concat_elapsed))
-        token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, tts_api_calls)
+        token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, verification_tokens, tts_api_calls)
         _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=token_summary)
         # If concat fails but we have segments, return the first one
         yield {
@@ -1006,8 +1338,17 @@ def run_segmented_pipeline(
             "error": err,
             "project_dir": project_dir,
             "num_segments": num_segments,
+            "failed_segments": _build_segment_failures(),
             "timings": timings,
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
             "total_tool_calls": sum(tool_call_counts.values()),
             "token_summary": token_summary,
+            "project_consistency": project_consistency,
+            "segment_quality": {
+                sid: {
+                    "repair_attempted": segment_results.get(sid, {}).get("repair_attempted", False),
+                    "final_accepted_critique_score": segment_results.get(sid, {}).get("final_accepted_critique_score"),
+                }
+                for sid in segment_results
+            },
         }

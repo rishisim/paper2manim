@@ -89,6 +89,81 @@ def _read_stdin_line(timeout_seconds: float = 30.0) -> str | None:
     return line.strip() if line else None
 
 
+def _parse_summary_metadata(project_dir: str) -> dict:
+    """Parse pipeline_summary.txt for total time and estimated cost."""
+    import re
+    summary_path = os.path.join(project_dir, "pipeline_summary.txt")
+    result: dict = {"total_time_secs": None, "estimated_cost_usd": None}
+    if not os.path.exists(summary_path):
+        return result
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        total_match = re.search(r"Total\s+([\d.]+)s", text)
+        if total_match:
+            result["total_time_secs"] = float(total_match.group(1))
+        cost_match = re.search(r"Estimated cost\s*:\s*\$([\d.]+)", text)
+        if cost_match:
+            result["estimated_cost_usd"] = float(cost_match.group(1))
+    except Exception:
+        pass
+    return result
+
+
+def _find_video_info(project_dir: str, state: dict) -> dict:
+    """Locate the final concatenated video for a project."""
+    result: dict = {"has_video": False, "video_path": None, "video_size_mb": None}
+
+    # Check concat artifacts
+    for artifact in state.get("stages", {}).get("concat", {}).get("artifacts", []):
+        if os.path.isabs(artifact):
+            path = artifact
+        else:
+            # Resolve relative artifacts against the project first, then cwd.
+            project_rel = os.path.join(project_dir, artifact)
+            cwd_rel = os.path.join(os.getcwd(), artifact)
+            path = project_rel if os.path.isfile(project_rel) else cwd_rel
+        if os.path.isfile(path) and path.endswith(".mp4"):
+            result["has_video"] = True
+            result["video_path"] = path
+            try:
+                result["video_size_mb"] = round(os.path.getsize(path) / (1024 * 1024), 1)
+            except OSError:
+                pass
+            return result
+
+    # Fall back to <slug>.mp4
+    slug = state.get("slug", "")
+    if slug:
+        candidate = os.path.join(project_dir, f"{slug}.mp4")
+        if os.path.isfile(candidate):
+            result["has_video"] = True
+            result["video_path"] = candidate
+            try:
+                result["video_size_mb"] = round(os.path.getsize(candidate) / (1024 * 1024), 1)
+            except OSError:
+                pass
+            return result
+
+    # Fall back to any root-level .mp4 (not segment files)
+    try:
+        for name in os.listdir(project_dir):
+            if name.endswith(".mp4") and not name.startswith("segment_"):
+                full_path = os.path.join(project_dir, name)
+                if os.path.isfile(full_path):
+                    result["has_video"] = True
+                    result["video_path"] = full_path
+                    try:
+                        result["video_size_mb"] = round(os.path.getsize(full_path) / (1024 * 1024), 1)
+                    except OSError:
+                        pass
+                    return result
+    except OSError:
+        pass
+
+    return result
+
+
 def _handle_workspace_command(args: dict) -> None:
     """Handle workspace management commands (list, delete, cleanup)."""
     from utils.project_state import (
@@ -107,6 +182,8 @@ def _handle_workspace_command(args: dict) -> None:
         result = []
         for pdir, state in projects:
             done, total, desc = calculate_progress(state)
+            summary_meta = _parse_summary_metadata(pdir)
+            video_info = _find_video_info(pdir, state)
             result.append({
                 "dir": pdir,
                 "folder": os.path.basename(pdir),
@@ -116,6 +193,13 @@ def _handle_workspace_command(args: dict) -> None:
                 "progress_done": done,
                 "progress_total": total,
                 "progress_desc": desc,
+                "created_at": state.get("created_at"),
+                "total_segments": state.get("total_segments", 1),
+                "total_time_secs": summary_meta["total_time_secs"],
+                "estimated_cost_usd": summary_meta["estimated_cost_usd"],
+                "has_video": video_info["has_video"],
+                "video_path": video_info["video_path"],
+                "video_size_mb": video_info["video_size_mb"],
             })
         _emit({
             "type": "workspace_projects",
@@ -178,11 +262,24 @@ def main() -> None:
     system_prompt_prefix: str = args.get("system_prompt_prefix") or ""
     max_turns: int = int(args.get("max_turns") or 0)
     model_override: str = args.get("model") or ""
+    default_questionnaire_answers = {
+        "video_length": "Medium (3-5 min)",
+        "target_audience": "Undergraduate",
+        "visual_style": "Let the AI decide",
+        "pacing": "Balanced",
+        "quality_mode": "balanced",
+        "narration_style": "standard",
+    }
 
     # ── Resume mode: load concept from existing project ──────────────
     resume_dir: str | None = args.get("resume_dir")
     if resume_dir:
         from utils.project_state import load_project
+        # Allow both explicit paths and workspace folder names.
+        if not os.path.isabs(resume_dir):
+            candidate = os.path.join("output", resume_dir)
+            if os.path.isdir(candidate):
+                resume_dir = candidate
         state = load_project(resume_dir)
         if not state:
             _emit({"type": "error", "message": f"Cannot resume: no valid project at {resume_dir}"})
@@ -195,6 +292,10 @@ def main() -> None:
         sys.exit(1)
 
     # ── Questionnaire phase (single round, no LLM calls) ────────────
+    # True resume (without force_restart) should not re-prompt.
+    if questionnaire_answers is None and resume_dir and not force_restart:
+        questionnaire_answers = default_questionnaire_answers.copy()
+
     if questionnaire_answers is None:
         questions: list[dict] = [
             {
@@ -235,6 +336,26 @@ def main() -> None:
                 ],
                 "default": "Balanced",
             },
+            {
+                "id": "quality_mode",
+                "question": "Quality mode:",
+                "options": [
+                    "fast",
+                    "balanced",
+                    "polished",
+                ],
+                "default": "balanced",
+            },
+            {
+                "id": "narration_style",
+                "question": "Narration style:",
+                "options": [
+                    "concise",
+                    "standard",
+                    "intuitive",
+                ],
+                "default": "standard",
+            },
         ]
 
         _emit({"type": "questions", "questions": questions})
@@ -256,14 +377,22 @@ def main() -> None:
         ta = questionnaire_answers.get("target_audience", "Undergraduate")
         vs = questionnaire_answers.get("visual_style", "Let the AI decide")
         pa = questionnaire_answers.get("pacing", "Balanced")
+        qm = questionnaire_answers.get("quality_mode", "balanced")
+        ns = questionnaire_answers.get("narration_style", "standard")
         _emit({
             "type": "preferences_summary",
-            "summary": f"Creating a {vl} video for {ta} | Style: {vs} | Pacing: {pa}",
+            "summary": f"Creating a {vl} video for {ta} | Style: {vs} | Pacing: {pa} | Quality: {qm} | Narration: {ns}",
         })
+
+    from agents.config import DEFAULT_MODEL_PROFILE, FALLBACK_MODEL_PROFILE, normalize_model_selection
 
     # ── Preflight: verify API keys are usable ────────────────────────
     missing_keys = []
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    active_profile = normalize_model_selection(model_override or os.environ.get("PAPER2MANIM_MODEL_PROFILE"))
+    if active_profile == DEFAULT_MODEL_PROFILE:
+        if not os.environ.get("OPENAI_API_KEY"):
+            missing_keys.append("OPENAI_API_KEY")
+    elif not os.environ.get("ANTHROPIC_API_KEY"):
         missing_keys.append("ANTHROPIC_API_KEY")
     if not skip_audio and not os.environ.get("GEMINI_API_KEY"):
         missing_keys.append("GEMINI_API_KEY")
@@ -278,9 +407,23 @@ def main() -> None:
     if system_prompt_prefix:
         os.environ["PAPER2MANIM_SYSTEM_PROMPT_PREFIX"] = system_prompt_prefix
     if model_override:
-        os.environ["PAPER2MANIM_MODEL_OVERRIDE"] = model_override
+        normalized = normalize_model_selection(model_override)
+        if normalized in {DEFAULT_MODEL_PROFILE, FALLBACK_MODEL_PROFILE}:
+            os.environ["PAPER2MANIM_MODEL_PROFILE"] = normalized
+        else:
+            os.environ["PAPER2MANIM_MODEL_OVERRIDE"] = model_override
     if max_turns:
         os.environ["PAPER2MANIM_MAX_TURNS"] = str(max_turns)
+
+    active_profile = normalize_model_selection(os.environ.get("PAPER2MANIM_MODEL_PROFILE") or model_override)
+    if active_profile == DEFAULT_MODEL_PROFILE and not os.environ.get("ANTHROPIC_API_KEY"):
+        _emit({
+            "type": "pipeline",
+            "update": {
+                "stage": "plan",
+                "status": "Warning: Anthropic fallback disabled because ANTHROPIC_API_KEY is not set.",
+            },
+        })
 
     try:
         for update in run_segmented_pipeline(
@@ -292,6 +435,7 @@ def main() -> None:
             skip_audio=skip_audio,
             render_timeout_seconds=render_timeout,
             tts_timeout_seconds=tts_timeout,
+            resume_dir=resume_dir,
             force_restart=force_restart,
         ):
             _emit({"type": "pipeline", "update": update})

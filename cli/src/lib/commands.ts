@@ -89,6 +89,15 @@ export const COMMANDS: SlashCommand[] = [
       if (concept) dispatch.startPipeline(concept);
     },
   },
+  {
+    name: 'retry',
+    aliases: [],
+    description: 'Retry the last failed pipeline run',
+    category: 'generation' as CommandCategory,
+    handler: (_args, dispatch) => {
+      dispatch.retryPipeline();
+    },
+  },
 
   // ── Workspace ─────────────────────────────────────────────────
   {
@@ -214,11 +223,13 @@ export const COMMANDS: SlashCommand[] = [
     description: 'Show version, model, and API key status',
     category: 'settings' as CommandCategory,
     handler: (_args, dispatch) => {
+      const hasOpenAIKey = !!process.env['OPENAI_API_KEY'];
       const hasAnthropicKey = !!process.env['ANTHROPIC_API_KEY'];
       const hasGeminiKey = !!process.env['GEMINI_API_KEY'] || !!process.env['GOOGLE_API_KEY'];
       dispatch.showMessage(
         [
           'paper2manim v0.1.0',
+          `OPENAI_API_KEY: ${hasOpenAIKey ? '✓ set' : '✗ not set'}`,
           `ANTHROPIC_API_KEY: ${hasAnthropicKey ? '✓ set' : '✗ not set'}`,
           `GEMINI_API_KEY: ${hasGeminiKey ? '✓ set' : '✗ not set'}`,
         ].join('\n'),
@@ -246,18 +257,26 @@ export const COMMANDS: SlashCommand[] = [
   {
     name: 'model',
     aliases: [],
-    description: 'Switch Claude model',
-    args: '[opus|sonnet|<model-id>]',
+    description: 'Switch model profile',
+    args: '[openai|anthropic|<profile-or-model-id>]',
     category: 'settings' as CommandCategory,
     handler: (args, dispatch) => {
       const KNOWN_ALIASES: Record<string, string> = {
-        opus: 'claude-opus-4-6',
-        sonnet: 'claude-sonnet-4-6',
-        haiku: 'claude-haiku-4-5-20251001',
+        openai: 'openai-default',
+        anthropic: 'anthropic-legacy',
+        opus: 'anthropic-legacy',
+        sonnet: 'anthropic-legacy',
       };
       const KNOWN_MODELS = new Set([
         ...Object.values(KNOWN_ALIASES),
-        'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001',
+        'openai-default',
+        'anthropic-legacy',
+        'gpt-5.4',
+        'gpt-5.3-codex',
+        'gpt-5.4-mini',
+        'claude-opus-4-6',
+        'claude-sonnet-4-6',
+        'claude-haiku-4-5-20251001',
       ]);
       let model = args[0];
       if (!model) {
@@ -265,8 +284,12 @@ export const COMMANDS: SlashCommand[] = [
         return;
       }
       if (KNOWN_ALIASES[model]) model = KNOWN_ALIASES[model];
-      if (!KNOWN_MODELS.has(model) && !model.startsWith('claude-')) {
-        dispatch.showMessage(`Unknown model: "${model}". Use opus, sonnet, haiku, or a full claude-* model ID.`, 'red');
+      if (
+        !KNOWN_MODELS.has(model)
+        && !model.startsWith('claude-')
+        && !model.startsWith('gpt-')
+      ) {
+        dispatch.showMessage(`Unknown model: "${model}". Use openai, anthropic, or a full gpt-*/claude-* model ID.`, 'red');
         return;
       }
       dispatch.setCurrentModel(model);

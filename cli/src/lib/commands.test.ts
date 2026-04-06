@@ -21,6 +21,7 @@ function mockDispatch(): AppDispatch {
     setQuality: vi.fn(),
     startPipeline: vi.fn(),
     resumePipeline: vi.fn(),
+    retryPipeline: vi.fn(),
     compactLogs: vi.fn(),
     exportSession: vi.fn(() => null),
     killPipeline: vi.fn(),
@@ -198,25 +199,25 @@ describe('command handlers', () => {
     );
   });
 
-  it('/model opus expands to claude-opus-4-6', () => {
+  it('/model openai expands to openai-default', () => {
     const dispatch = mockDispatch();
     const cmd = findCommand('model')!;
-    cmd.handler(['opus'], dispatch);
-    expect(dispatch.setCurrentModel).toHaveBeenCalledWith('claude-opus-4-6');
+    cmd.handler(['openai'], dispatch);
+    expect(dispatch.setCurrentModel).toHaveBeenCalledWith('openai-default');
   });
 
-  it('/model sonnet expands to claude-sonnet-4-6', () => {
+  it('/model anthropic expands to anthropic-legacy', () => {
     const dispatch = mockDispatch();
     const cmd = findCommand('model')!;
-    cmd.handler(['sonnet'], dispatch);
-    expect(dispatch.setCurrentModel).toHaveBeenCalledWith('claude-sonnet-4-6');
+    cmd.handler(['anthropic'], dispatch);
+    expect(dispatch.setCurrentModel).toHaveBeenCalledWith('anthropic-legacy');
   });
 
   it('/model with a custom model id passes it through', () => {
     const dispatch = mockDispatch();
     const cmd = findCommand('model')!;
-    cmd.handler(['claude-custom-model'], dispatch);
-    expect(dispatch.setCurrentModel).toHaveBeenCalledWith('claude-custom-model');
+    cmd.handler(['gpt-5.4'], dispatch);
+    expect(dispatch.setCurrentModel).toHaveBeenCalledWith('gpt-5.4');
   });
 
   it('/model with no args shows usage', () => {
@@ -298,7 +299,7 @@ describe('command handlers', () => {
     const dispatch = mockDispatch();
     const cmd = findCommand('color')!;
     cmd.handler(['red'], dispatch);
-    expect(dispatch.setPromptColor).toHaveBeenCalledWith('#FF6B80');
+    expect(dispatch.setPromptColor).toHaveBeenCalledWith('#D28A96');
   });
 
   it('/color with an invalid name shows available colors', () => {

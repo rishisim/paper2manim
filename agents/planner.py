@@ -45,6 +45,11 @@ class SegmentedStoryboardLite(BaseModel):
 class ProSegment(BaseModel):
     id: int = Field(ge=1)
     title: str = Field(description="e.g. 'Prerequisite: The Dot Product' or 'Core Proof'")
+    learning_goal: str = Field(description="The one thing the viewer should understand by the end of this segment")
+    must_show: list[str] = Field(description="Critical visual beats or objects that must appear on screen")
+    end_state: str = Field(description="What meaningful object or visual summary remains on screen at the end")
+    carry_over_from_previous: str = Field(description="How this segment should acknowledge or reset previous visual state")
+    visual_density: Literal["low", "medium", "high"] = Field(default="medium")
 
     # Mathematical Rigor
     equations_latex: list[str] = Field(description="Raw LaTeX strings (double backslashes)")

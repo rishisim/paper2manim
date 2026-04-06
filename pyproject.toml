@@ -24,6 +24,7 @@ dependencies = [
 
 [project.scripts]
 paper2manim = "cli_launcher:main"
+p2m = "cli_launcher:main"
 
 [tool.setuptools]
 packages = ["agents", "utils"]

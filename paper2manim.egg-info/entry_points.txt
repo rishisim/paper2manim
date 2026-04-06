@@ -1,2 +1,3 @@
 [console_scripts]
+p2m = cli_launcher:main
 paper2manim = cli_launcher:main

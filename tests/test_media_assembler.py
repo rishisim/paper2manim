@@ -158,6 +158,54 @@ def test_stitch_yields_status_before_final(mock_run, tmp_path):
         assert "status" in u
 
 
+@patch("utils.media_assembler.subprocess.run")
+def test_stitch_pads_video_when_audio_is_longer(mock_run, tmp_path):
+    video = tmp_path / "v.mp4"
+    audio = tmp_path / "a.wav"
+    output = tmp_path / "out.mp4"
+    video.write_bytes(b"\x00" * 100)
+    audio.write_bytes(b"\x00" * 100)
+
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="5.0\n", stderr=""),
+        MagicMock(returncode=0, stdout="7.0\n", stderr=""),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+
+    updates = list(stitch_video_and_audio(str(video), str(audio), str(output)))
+    final = updates[-1]
+    assert final["success"] is True
+
+    ffmpeg_cmd = mock_run.call_args_list[-1][0][0]
+    assert "-filter:v" in ffmpeg_cmd
+    assert "tpad=stop_mode=clone:stop_duration=2.000" in ffmpeg_cmd
+    assert "-c:v" in ffmpeg_cmd and ffmpeg_cmd[ffmpeg_cmd.index("-c:v") + 1] == "libx264"
+
+
+@patch("utils.media_assembler.subprocess.run")
+def test_stitch_trims_video_when_it_overshoots_audio(mock_run, tmp_path):
+    video = tmp_path / "v.mp4"
+    audio = tmp_path / "a.wav"
+    output = tmp_path / "out.mp4"
+    video.write_bytes(b"\x00" * 100)
+    audio.write_bytes(b"\x00" * 100)
+
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="8.0\n", stderr=""),
+        MagicMock(returncode=0, stdout="6.5\n", stderr=""),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+
+    updates = list(stitch_video_and_audio(str(video), str(audio), str(output)))
+    final = updates[-1]
+    assert final["success"] is True
+
+    ffmpeg_cmd = mock_run.call_args_list[-1][0][0]
+    assert "-t" in ffmpeg_cmd
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-t") + 1] == "6.500"
+    assert "-c:v" in ffmpeg_cmd and ffmpeg_cmd[ffmpeg_cmd.index("-c:v") + 1] == "libx264"
+
+
 # ---------------------------------------------------------------------------
 # concatenate_segments — missing inputs
 # ---------------------------------------------------------------------------

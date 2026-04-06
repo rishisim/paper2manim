@@ -38,40 +38,40 @@ export interface ThemeColors {
 
 export const THEMES: Record<ThemeName, ThemeColors> = {
   dark: {
-    primary: '#D77757',      // Claude terracotta orange
-    success: '#4EBA65',      // Claude green
-    error: '#FF6B80',        // Claude soft pink-red
-    warn: '#FFC107',         // Claude yellow
-    accent: '#B1B9F9',       // Claude lavender (permission/suggestion)
+    primary: '#3FA7C6',      // paper2manim electric cyan
+    success: '#4AB07A',
+    error: '#CF6D7A',
+    warn: '#E7A83A',
+    accent: '#F58A3A',       // warm accent for action hints
     text: '#FFFFFF',
     muted: '#999999',        // Claude "inactive"
     dim: '#888888',          // Claude "promptBorder"
     bg: '#000000',
-    surface: '#1A1A1A',
-    separator: '#505050',    // Claude "subtle"
-    progressFill: '#D77757',
+    surface: '#12181D',
+    separator: '#3A4A57',
+    progressFill: '#3FA7C6',
     progressTrack: '#333333',
-    contextLow: '#4EBA65',
-    contextMid: '#FFC107',
-    contextHigh: '#FF6B80',
+    contextLow: '#4AB07A',
+    contextMid: '#E7A83A',
+    contextHigh: '#CF6D7A',
   },
   light: {
-    primary: '#D77757',      // Claude brand stays same
-    success: '#2C7A39',      // Claude light-mode green
-    error: '#AB2B3F',        // Claude light-mode red
-    warn: '#966C1E',         // Claude light-mode yellow
-    accent: '#5769F7',       // Claude light-mode suggestion
+    primary: '#1E7F9F',
+    success: '#2D8A5D',
+    error: '#B93A52',
+    warn: '#9A6B14',
+    accent: '#B05B1D',
     text: '#000000',
     muted: '#666666',        // Claude light "inactive"
     dim: '#999999',          // Claude light "promptBorder"
     bg: '#FFFFFF',
-    surface: '#F0EEE6',      // Claude light surface
-    separator: '#AFAFAF',    // Claude light "subtle"
-    progressFill: '#D77757',
+    surface: '#EAF2F5',
+    separator: '#9AABB4',
+    progressFill: '#1E7F9F',
     progressTrack: '#DDDDDD',
-    contextLow: '#2C7A39',
-    contextMid: '#966C1E',
-    contextHigh: '#AB2B3F',
+    contextLow: '#2D8A5D',
+    contextMid: '#9A6B14',
+    contextHigh: '#B93A52',
   },
   minimal: {
     primary: '#E0E0E0',
@@ -130,7 +130,7 @@ export const THEMES: Record<ThemeName, ThemeColors> = {
 };
 
 export const PROMPT_COLORS: Record<string, string> = {
-  red:    '#FF6B80',
+  red:    '#D28A96',
   blue:   '#7AB4E8',
   green:  '#4EBA65',
   yellow: '#FFC107',
@@ -141,6 +141,32 @@ export const PROMPT_COLORS: Record<string, string> = {
   white:  '#FFFFFF',
   default: '#888888',     // Claude Code uses gray prompt border
 };
+
+function parseHexColor(hex: string): { r: number; g: number; b: number } | null {
+  const normalized = hex.trim().toLowerCase();
+  const match = normalized.match(/^#([0-9a-f]{6})$/);
+  if (!match) return null;
+  const raw = match[1];
+  return {
+    r: Number.parseInt(raw.slice(0, 2), 16),
+    g: Number.parseInt(raw.slice(2, 4), 16),
+    b: Number.parseInt(raw.slice(4, 6), 16),
+  };
+}
+
+/** Detect eye-straining "alert red" prompt borders and remap to calmer primary tone. */
+export function getSafePromptBorderColor(promptColor: string, theme: ThemeColors): string {
+  const rgb = parseHexColor(promptColor);
+  if (!rgb) return promptColor;
+
+  const { r, g, b } = rgb;
+  const redDominant = r >= 180 && g <= 110 && b <= 130;
+  const highContrastDangerRed = r - Math.max(g, b) >= 70;
+  if (redDominant && highContrastDangerRed) {
+    return theme.primary;
+  }
+  return promptColor;
+}
 
 export function getThemeColors(theme: ThemeName): ThemeColors {
   return THEMES[theme] ?? THEMES.dark;
@@ -165,10 +191,10 @@ export const TIPS = [
   'Press Ctrl+O to toggle verbose mode live',
   'Use --output-format json for scripting',
   'Pass a concept as an argument to skip the prompt',
-  'Use --model to override the Claude model',
+  'Use --model to override the default model',
 ];
 
-export type StageName = 'plan' | 'pipeline' | 'tts' | 'code' | 'code_retry' | 'verify' | 'render' | 'stitch' | 'timing' | 'concat' | 'overlay' | 'done';
+export type StageName = 'plan' | 'pipeline' | 'tts' | 'code' | 'code_retry' | 'verify' | 'render' | 'stitch' | 'timing' | 'concat' | 'subtitles' | 'overlay' | 'done';
 
 export interface StageConfig {
   icon: string;
@@ -179,33 +205,34 @@ export interface StageConfig {
 /** Derive stage colors from the active theme instead of hardcoding hex values. */
 export function getStageConfig(theme: ThemeColors): Record<StageName, StageConfig> {
   return {
-    plan:       { icon: '⏺', color: theme.primary,  label: 'Plan storyboard' },
+    plan:       { icon: '⏺', color: theme.primary,  label: 'Planning storyboard' },
     pipeline:   { icon: '⏺', color: theme.primary,  label: 'Processing segments' },
-    tts:        { icon: '⏺', color: theme.accent,   label: 'Generate voiceover' },
-    code:       { icon: '⏺', color: theme.primary,  label: 'Generate Manim code' },
-    code_retry: { icon: '⏺', color: theme.warn,     label: 'Retrying failed segments' },
-    verify:      { icon: '⏺', color: theme.warn,     label: 'Verify code quality' },
-    render:      { icon: '⏺', color: theme.accent,   label: 'Render HD segments' },
-    stitch:      { icon: '⏺', color: theme.accent,   label: 'Stitch audio + video' },
-    timing:      { icon: '⏺', color: theme.accent,   label: 'Check audio/video timing' },
-    concat:      { icon: '⏺', color: theme.success,  label: 'Assemble final video' },
-    overlay:     { icon: '⏺', color: theme.success,  label: 'Overlay audio track' },
+    tts:        { icon: '⏺', color: theme.accent,   label: 'Generating voiceover' },
+    code:       { icon: '⏺', color: theme.primary,  label: 'Building Manim code' },
+    code_retry: { icon: '⏺', color: theme.warn,     label: 'Fixing failed segments' },
+    verify:      { icon: '⏺', color: theme.warn,     label: 'Checking code quality' },
+    render:      { icon: '⏺', color: theme.accent,   label: 'Rendering HD segments' },
+    stitch:      { icon: '⏺', color: theme.accent,   label: 'Stitching audio + video' },
+    timing:      { icon: '⏺', color: theme.accent,   label: 'Checking audio/video timing' },
+    concat:      { icon: '⏺', color: theme.success,  label: 'Assembling final video' },
+    subtitles:   { icon: '⏺', color: theme.success,  label: 'Embedding subtitles' },
+    overlay:     { icon: '⏺', color: theme.success,  label: 'Finalizing audio overlay' },
     done:        { icon: '✔', color: theme.success,  label: 'Complete' },
   };
 }
 
 export const segmentPhaseLabels: Record<string, string> = {
-  generate: 'Generating initial script',
-  docs: 'Looking up docs',
-  execute: 'Rendering draft (-ql)',
-  self_correct: 'Self-correcting',
-  fix_docs: 'Fix: looking up docs',
-  apply_fix: 'Applying fix',
-  verify: 'Verifying code quality',
-  verify_fix: 'Fixing verification issues',
+  generate: 'Doing: generating initial script',
+  docs: 'Checking: looking up docs',
+  execute: 'Doing: rendering draft (-ql)',
+  self_correct: 'Fixing: self-correcting',
+  fix_docs: 'Checking: looking up fix docs',
+  apply_fix: 'Fixing: applying patch',
+  verify: 'Checking: verifying code quality',
+  verify_fix: 'Fixing: verification issues',
   done: 'Complete',
   failed: 'Failed',
-  running: 'Running',
+  running: 'Doing: running',
   retry_queued: 'Queued for retry',
 };
 
@@ -215,14 +242,17 @@ export function truncatePath(p: string, maxLen: number): string {
 }
 
 export const VERSION = '0.1.0';
-export const MODEL_TAG = 'claude-opus-4.6 + gemini-2.5-tts + gemini-3.1-live';
+export const MODEL_TAG = 'openai-default + gemini-2.5-tts + gemini-3.1-live';
 
 /**
  * Clean up a raw pipeline status string for user-facing display.
  * Strips internal prefixes, technical detail, and redundant info.
  */
 export function cleanStatus(raw: string): string {
-  let s = raw.trim();
+  let s = raw
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 
   // Strip "Stage X/Y: " prefix — stage is already shown in the header
   s = s.replace(/^Stage \d+\/\d+:\s*/i, '');

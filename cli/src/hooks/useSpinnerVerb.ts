@@ -43,6 +43,7 @@ const STAGE_VERBS: Partial<Record<StageName, string[]>> = {
   render:      ['Rendering frames', 'Processing video', 'Compositing scenes'],
   timing:      ['Aligning audio/video', 'Syncing tracks', 'Checking timing'],
   concat:      ['Assembling final video', 'Concatenating segments', 'Finalizing'],
+  subtitles:   ['Generating subtitles', 'Embedding captions', 'Muxing subtitle track'],
   overlay:     ['Overlaying audio', 'Mixing final track', 'Merging media'],
 };
 

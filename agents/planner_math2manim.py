@@ -19,10 +19,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Iterator, List, Literal
 
-import anthropic
 from pydantic import BaseModel, Field
 
-from agents.config import CLAUDE_OPUS, CLAUDE_SONNET, new_token_counter
+from agents.config import (
+    model_profile_summary,
+    new_token_counter,
+    resolve_fallback_stage_model,
+    resolve_stage_model,
+)
+from utils.llm_provider import run_text_completion
 
 # ── Duration presets: map user's video-length choice to hard constraints ──
 
@@ -50,7 +55,7 @@ class ConceptAnalysis(BaseModel):
     key_insights: List[str] = Field(description="3-5 'aha moments' that make this concept click")
     common_misconceptions: List[str] = Field(description="2-3 common mistakes or misunderstandings to address")
     narrative_arc: str = Field(description="Suggested story arc: e.g. 'intuition → formalism → application'")
-    suggested_segment_count: int = Field(ge=3, le=8, description="Recommended number of video segments")
+    suggested_segment_count: int = Field(ge=2, le=8, description="Recommended number of video segments")
 
 
 class ConceptNode(BaseModel):
@@ -91,6 +96,78 @@ class VisualDesign(BaseModel):
     segment_designs: List[SegmentVisualDesign] = Field(description="Per-segment visual blueprints")
 
 
+def _planner_preference_context(questionnaire_answers: dict | None, duration_preset: dict) -> tuple[str, str]:
+    """Return enriched concept context and a prompt suffix derived from user preferences."""
+    if not questionnaire_answers:
+        return "", ""
+
+    target_audience = questionnaire_answers.get("target_audience", "Undergraduate")
+    visual_style = questionnaire_answers.get("visual_style", "Let the AI decide")
+    pacing = questionnaire_answers.get("pacing", "Balanced")
+    narration_style = questionnaire_answers.get("narration_style", "standard")
+    quality_mode = questionnaire_answers.get("quality_mode", "balanced")
+
+    audience_guidance = {
+        "High school student": "Prefer intuition-first explanations, define symbols before use, and avoid compressed notation leaps.",
+        "Undergraduate": "Balance intuition with formal notation and introduce symbols right before they are used.",
+        "Graduate / Professional": "Assume mathematical maturity, but still keep symbol introductions explicit and purposeful.",
+        "General audience": "Minimize jargon, prioritize metaphor and visual intuition, and define every symbol in plain language.",
+    }.get(target_audience, "Introduce notation carefully and keep the explanation audience-appropriate.")
+
+    style_guidance = {
+        "Geometric intuition": "Prioritize diagrams, spatial metaphors, and motion that builds intuition before algebraic detail.",
+        "Step-by-step derivation": "Keep the screen sparse and structure each segment around one derivation step at a time.",
+        "Real-world applications": "Anchor each segment in motivating examples and reserve equations for the minimum needed formalism.",
+        "Let the AI decide": "Choose the visual approach that best supports understanding while keeping scenes uncluttered.",
+    }.get(visual_style, "Choose the visual approach that best supports understanding while keeping scenes uncluttered.")
+
+    pacing_guidance = {
+        "Fast and dense": ("Move briskly, but still avoid clutter and leave a brief hold after each major beat.", "high"),
+        "Balanced": ("Use a clear beat structure with breathing room after important reveals.", "medium"),
+        "Slow and exploratory": ("Use fewer simultaneous objects, longer holds, and especially low visual density.", "low"),
+    }.get(pacing, ("Use a clear beat structure with breathing room after important reveals.", "medium"))
+
+    narration_guidance = {
+        "concise": "Keep narration efficient and low on repetition.",
+        "standard": "Use clear, natural narration with a moderate amount of intuition.",
+        "intuitive": "Spend more words on intuition, analogy, and why each step matters.",
+    }.get(narration_style, "Use clear, natural narration with a moderate amount of intuition.")
+
+    quality_guidance = {
+        "fast": "Optimize for reliable, simpler scenes over ambitious density.",
+        "balanced": "Aim for polished results with one strong idea on screen at a time.",
+        "polished": "Favor the most polished, consistent output with especially strong transitions and end frames.",
+    }.get(quality_mode, "Aim for polished results with one strong idea on screen at a time.")
+
+    pref_parts = [
+        f"Video length: {questionnaire_answers.get('video_length', 'Medium (3-5 min)')} (HARD CONSTRAINT: ~{duration_preset['target_seconds']}s)",
+        f"Target audience: {target_audience}",
+        f"Visual style: {visual_style}",
+        f"Pacing: {pacing}",
+        f"Narration style: {narration_style}",
+        f"Quality mode: {quality_mode}",
+        f"Maximum visual density: {pacing_guidance[1]}",
+    ]
+    for q, a in questionnaire_answers.get("custom_preferences", {}).items():
+        pref_parts.append(f"{q}: {a}")
+
+    preference_suffix = (
+        "\n\nImplementation preferences:\n"
+        f"- {audience_guidance}\n"
+        f"- {style_guidance}\n"
+        f"- {pacing_guidance[0]}\n"
+        f"- {narration_guidance}\n"
+        f"- {quality_guidance}\n"
+        "- Explicitly forbid introducing symbols before defining them.\n"
+        "- Explicitly forbid overloading the screen with too many simultaneous independent objects.\n"
+        "- Every segment must end on a stable, meaningful frame.\n"
+        "- Every segment must either acknowledge carry-over from the previous segment or begin from a clean reset.\n"
+    )
+
+    enriched_concept = "\n\nUser preferences:\n" + "\n".join(f"- {p}" for p in pref_parts)
+    return enriched_concept, preference_suffix
+
+
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def _extract_json_text(raw_text: str) -> str:
@@ -105,8 +182,14 @@ def _extract_json_text(raw_text: str) -> str:
     return match.group(0) if match else text
 
 
-def _call_llm(client: anthropic.Anthropic, prompt: str, model: str = CLAUDE_OPUS, max_tokens: int = 4096, token_counter: dict | None = None) -> str:
-    """Make a single Claude API call and return the raw text.
+def _call_llm(
+    prompt: str,
+    *,
+    max_tokens: int = 4096,
+    token_counter: dict | None = None,
+    cache_key_label: str = "planner",
+) -> str:
+    """Make a single planner LLM call and return the raw text.
 
     Args:
         max_tokens: Output token ceiling. Stages 1-4 produce small JSON so 4096
@@ -114,34 +197,20 @@ def _call_llm(client: anthropic.Anthropic, prompt: str, model: str = CLAUDE_OPUS
         token_counter: If provided, input/output token counts from the response
             are accumulated into this dict.
     """
-    # Retry with exponential backoff on rate limits (429)
-    _MAX_RL_RETRIES = 5
-    for _attempt in range(_MAX_RL_RETRIES):
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system="You are an expert JSON generator. Output ONLY valid JSON — no markdown fences, no explanation, no preamble. Your response must start with '{' or '['.",
-                messages=[
-                    {"role": "user", "content": prompt + "\n\nRespond with ONLY the JSON object, nothing else."},
-                ],
-            )
-            break
-        except anthropic.RateLimitError:
-            if _attempt == _MAX_RL_RETRIES - 1:
-                raise
-            wait = min(2 ** (_attempt + 1), 60)
-            print(f"[planner] Rate limited (429), retrying in {wait}s (attempt {_attempt + 1}/{_MAX_RL_RETRIES})", file=sys.stderr)
-            time.sleep(wait)
-    # Track token usage if a counter was provided
-    if token_counter is not None:
-        try:
-            token_counter["input_tokens"] += getattr(response.usage, "input_tokens", 0)
-            token_counter["output_tokens"] += getattr(response.usage, "output_tokens", 0)
-            token_counter["api_calls"] += 1
-        except Exception:
-            pass  # Don't let tracking failures break the pipeline
-    return response.content[0].text or ""
+    primary = resolve_stage_model("plan")
+    fallback = resolve_fallback_stage_model("plan")
+    result = run_text_completion(
+        primary=primary,
+        fallback=fallback,
+        system_sections=[
+            "You are an expert JSON generator. Output ONLY valid JSON - no markdown fences, no explanation, no preamble. Your response must start with '{' or '['."
+        ],
+        user_content=prompt + "\n\nRespond with ONLY the JSON object, nothing else.",
+        max_output_tokens=max_tokens,
+        token_counter=token_counter,
+        cache_key_parts=(cache_key_label, primary.model),
+    )
+    return result.text
 
 
 def _call_stage_with_retries(fn, *args, max_retries: int = 3, stage_name: str = "stage"):
@@ -162,6 +231,20 @@ def _call_stage_with_retries(fn, *args, max_retries: int = 3, stage_name: str = 
         if attempt < max_retries - 1:
             time.sleep(min(2 ** attempt, 8))
     return None, last_error
+
+
+def _friendly_planner_error(err: str | None) -> str:
+    """Map low-level planner errors to concise, user-actionable text."""
+    if not err:
+        return "unknown error"
+    low = err.lower()
+    if "credit balance" in low or "billing" in low:
+        return "LLM billing/credit issue"
+    if "authentication" in low or "invalid x-api-key" in low or "api key" in low or "401" in low:
+        return "LLM authentication failed (check your API keys, especially ANTHROPIC_API_KEY / OPENAI_API_KEY)"
+    if "model" in low and ("not found" in low or "does not exist" in low or "invalid" in low):
+        return "configured model is unavailable"
+    return err
 
 
 def _default_prerequisite_tree(concept: str, analysis: ConceptAnalysis | None) -> PrerequisiteTree:
@@ -188,7 +271,7 @@ def _default_enriched_tree(tree: PrerequisiteTree) -> EnrichedTree:
 
 # ── Stage 1: Concept Analysis ────────────────────────────────────────
 
-def analyze_concept(concept: str, client: anthropic.Anthropic, duration_preset: dict | None = None, token_counter: dict | None = None) -> ConceptAnalysis | None:
+def analyze_concept(concept: str, client: object | None, duration_preset: dict | None = None, token_counter: dict | None = None) -> ConceptAnalysis:
     preset = duration_preset or DEFAULT_DURATION_PRESET
     min_seg, max_seg = preset["min_segments"], preset["max_segments"]
     target_secs = preset["target_seconds"]
@@ -216,20 +299,18 @@ Think about:
 - What narrative flow would be most engaging for a 3Blue1Brown-style video?
 - How to fit this into {min_seg}-{max_seg} segments of ~{preset['per_segment_seconds']}s each?
 """
-    try:
-        text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET, token_counter=token_counter))
-        analysis = ConceptAnalysis.model_validate(json.loads(text))
-        # Hard clamp segment count to preset range
-        analysis.suggested_segment_count = max(min_seg, min(max_seg, analysis.suggested_segment_count))
-        return analysis
-    except Exception as e:
-        print(f"Failed concept analysis: {e}", file=sys.stderr)
-        return None
+    text = _extract_json_text(_call_llm(prompt, token_counter=token_counter, cache_key_label="planner-stage1"))
+    if not text.strip():
+        raise ValueError("empty response from model")
+    analysis = ConceptAnalysis.model_validate(json.loads(text))
+    # Hard clamp segment count to preset range
+    analysis.suggested_segment_count = max(min_seg, min(max_seg, analysis.suggested_segment_count))
+    return analysis
 
 
 # ── Stage 2: Prerequisite Discovery ──────────────────────────────────
 
-def build_prerequisite_tree(concept: str, analysis: ConceptAnalysis | None, client: anthropic.Anthropic, token_counter: dict | None = None) -> PrerequisiteTree | None:
+def build_prerequisite_tree(concept: str, analysis: ConceptAnalysis | None, client: object | None, token_counter: dict | None = None) -> PrerequisiteTree | None:
     analysis_context = ""
     if analysis:
         analysis_context = f"""
@@ -262,13 +343,13 @@ Output as JSON:
   ]
 }}
 """
-    text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET, token_counter=token_counter))
+    text = _extract_json_text(_call_llm(prompt, token_counter=token_counter, cache_key_label="planner-stage2"))
     return PrerequisiteTree.model_validate(json.loads(text))
 
 
 # ── Stage 3: Mathematical Enrichment ─────────────────────────────────
 
-def enrich_concept_tree(tree: PrerequisiteTree, analysis: ConceptAnalysis | None, client: anthropic.Anthropic, token_counter: dict | None = None) -> EnrichedTree | None:
+def enrich_concept_tree(tree: PrerequisiteTree, analysis: ConceptAnalysis | None, client: object | None, token_counter: dict | None = None) -> EnrichedTree | None:
     misconceptions_note = ""
     if analysis and analysis.common_misconceptions:
         misconceptions_note = f"\nCommon misconceptions to address: {json.dumps(analysis.common_misconceptions)}"
@@ -300,13 +381,13 @@ Output as JSON:
   ]
 }}
 """
-    text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET, token_counter=token_counter))
+    text = _extract_json_text(_call_llm(prompt, token_counter=token_counter, cache_key_label="planner-stage3"))
     return EnrichedTree.model_validate(json.loads(text))
 
 
 # ── Stage 4: Visual Design ───────────────────────────────────────────
 
-def design_visuals(enriched_tree: EnrichedTree, analysis: ConceptAnalysis | None, client: anthropic.Anthropic, token_counter: dict | None = None) -> VisualDesign | None:
+def design_visuals(enriched_tree: EnrichedTree, analysis: ConceptAnalysis | None, client: object | None, token_counter: dict | None = None) -> VisualDesign | None:
     prompt = f"""You are an expert cinematic visual designer for mathematical animation videos (3Blue1Brown style).
 
 Here is the enriched teaching sequence:
@@ -343,7 +424,7 @@ Design rules:
 - Design layouts that avoid clutter — use screen space intentionally
 - Plan transitions so segments flow naturally into each other
 """
-    text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET, token_counter=token_counter))
+    text = _extract_json_text(_call_llm(prompt, token_counter=token_counter, cache_key_label="planner-stage4"))
     return VisualDesign.model_validate(json.loads(text))
 
 
@@ -356,10 +437,11 @@ def _compose_single_segment(
     visual_design: VisualDesign | None,
     analysis: ConceptAnalysis | None,
     enriched_tree: EnrichedTree,
-    client: anthropic.Anthropic,
+    client: object | None,
     max_retries: int = 2,
     per_segment_seconds: int = 50,
     token_counter: dict | None = None,
+    planner_preferences: str = "",
 ) -> dict | None:
     """Compose a single segment's narrative. Returns the segment dict or None."""
 
@@ -400,6 +482,7 @@ HARD DURATION CONSTRAINT: This segment MUST be exactly ~{per_segment_seconds} se
 - The audio_script MUST be approximately {target_word_count} words (at ~150 words/min speaking pace)
 - Do NOT write a longer audio_script — this directly controls video length
 {narrative_context}
+{planner_preferences}
 
 Segment Source Data:
 {json.dumps(node.model_dump(), indent=2)}
@@ -413,6 +496,11 @@ Output a SINGLE JSON object for this segment:
 {{
   "id": {node.id},
   "title": "{node.title}",
+  "learning_goal": "What the viewer should understand by the end of this segment",
+  "must_show": ["critical object or beat 1", "critical object or beat 2"],
+  "end_state": "Meaningful object or visual summary that remains visible at the end",
+  "carry_over_from_previous": "Either describe the carried-over anchor object or say 'clean reset'",
+  "visual_density": "low",
   "equations_latex": ["exact LaTeX strings with DOUBLE backslashes"],
   "variable_definitions": {{"symbol": "meaning"}},
   "elements": ["visual objects to create"],
@@ -438,6 +526,13 @@ CRITICAL RULES FOR visual_instructions:
    Never leave old elements on screen when new ones enter the same zone.
 9. Spatial relationships: .next_to(), .align_to(), .shift(), .move_to() as appropriate.
    Labels on graphs/arrows MUST use .next_to(target, direction, buff=0.2) — never .move_to(ORIGIN)
+10. The final beat MUST keep at least one meaningful object visible on screen until the narration ends.
+    Never spend the last several seconds on an empty or fully black frame.
+11. Beat timestamps should cover the full narration span with no large dead zone after the final explanatory beat.
+12. Set visual_density to low, medium, or high based on how many independent visual ideas appear simultaneously. Respect the user pacing preference.
+13. learning_goal must be a single pedagogical objective, not a summary paragraph.
+14. must_show should list the non-negotiable visuals or transformations for this segment.
+15. carry_over_from_previous must explicitly say whether to preserve an anchor object or reset cleanly.
 
 {"This is the FIRST segment — establish foundational context before diving in." if segment_index == 0 else ""}
 {"This is the FINAL segment — build to a satisfying conclusion." if segment_index == total_segments - 1 else ""}
@@ -447,7 +542,7 @@ Respond with ONLY the JSON object, nothing else."""
     last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
-            text = _extract_json_text(_call_llm(client, prompt, model=CLAUDE_SONNET, max_tokens=8192, token_counter=token_counter))
+            text = _extract_json_text(_call_llm(prompt, max_tokens=8192, token_counter=token_counter, cache_key_label="planner-compose"))
             return json.loads(text)
         except Exception as e:
             last_error = e
@@ -463,10 +558,11 @@ def compose_narrative(
     enriched_tree: EnrichedTree,
     visual_design: VisualDesign | None,
     analysis: ConceptAnalysis | None,
-    client: anthropic.Anthropic,
+    client: object | None,
     max_retries: int = 3,
     duration_preset: dict | None = None,
     token_counter: dict | None = None,
+    planner_preferences: str = "",
 ) -> Iterator[dict]:
     """Compose all segments in parallel for speed, then assemble the storyboard."""
     from agents.planner import ProSegmentedStoryboard  # lazy import
@@ -488,7 +584,7 @@ def compose_narrative(
             pool.submit(
                 _compose_single_segment,
                 node, i, total, visual_design, analysis, enriched_tree, client,
-                max_retries, per_segment_seconds, token_counter,
+                max_retries, per_segment_seconds, token_counter, planner_preferences,
             ): i
             for i, node in enumerate(enriched_tree.nodes)
         }
@@ -515,9 +611,9 @@ def compose_narrative(
             err_detail = segment_errors.get(i, "unknown error")
             # Surface billing/auth errors clearly
             if "credit balance" in err_detail.lower() or "billing" in err_detail.lower():
-                yield {"final": True, "error": "Anthropic API billing error: your account has insufficient credits. Visit https://console.anthropic.com/settings/billing to add credits."}
+                yield {"final": True, "error": "LLM billing error: check your provider account credits."}
             elif "authentication" in err_detail.lower() or "401" in err_detail:
-                yield {"final": True, "error": "Anthropic API key is invalid. Check your ANTHROPIC_API_KEY in .env."}
+                yield {"final": True, "error": "LLM authentication failed. Check your configured API keys in .env."}
             else:
                 yield {"final": True, "error": f"Failed to compose segment {i + 1} ({enriched_tree.nodes[i].title}): {err_detail}"}
             return
@@ -548,7 +644,7 @@ def compose_narrative(
             try:
                 new_seg = _compose_single_segment(
                     node, i, total, visual_design, analysis, enriched_tree,
-                    client, max_retries, per_segment_seconds, token_counter,
+                    client, max_retries, per_segment_seconds, token_counter, planner_preferences,
                 )
                 if new_seg:
                     new_words = len(new_seg.get("audio_script", "").split())
@@ -590,7 +686,7 @@ def run_math2manim_planner(concept: str, max_retries: int = 3, previous_storyboa
     4. Visual Design — specify colors, layouts, transitions
     5. Narrative Composition — produce verbose 2000+ token storyboard
     """
-    client = anthropic.Anthropic()
+    client = None
     planner_tokens = new_token_counter()
 
     # Resolve duration preset from questionnaire
@@ -601,24 +697,23 @@ def run_math2manim_planner(concept: str, max_retries: int = 3, previous_storyboa
 
     # Enrich concept with questionnaire preferences if available
     enriched_concept = concept
+    planner_preferences = ""
     if questionnaire_answers:
-        pref_parts = [f"Video length: {video_length} (HARD CONSTRAINT: ~{duration_preset['target_seconds']}s)"]
-        pref_parts.append(f"Target audience: {questionnaire_answers.get('target_audience', 'Undergraduate')}")
-        if questionnaire_answers.get("visual_style"):
-            pref_parts.append(f"Visual style: {questionnaire_answers['visual_style']}")
-        if questionnaire_answers.get("pacing"):
-            pref_parts.append(f"Pacing: {questionnaire_answers['pacing']}")
-        for q, a in questionnaire_answers.get("custom_preferences", {}).items():
-            pref_parts.append(f"{q}: {a}")
-        enriched_concept = f"{concept}\n\nUser preferences:\n" + "\n".join(f"- {p}" for p in pref_parts)
+        enriched_pref_context, planner_preferences = _planner_preference_context(questionnaire_answers, duration_preset)
+        enriched_concept = f"{concept}{enriched_pref_context}"
 
     # ── Stage 1: Concept Analysis ──
     yield {"status": f"Stage 1/5: Analyzing concept (target: {duration_preset['target_seconds']}s, {duration_preset['min_segments']}-{duration_preset['max_segments']} segments)..."}
-    analysis = analyze_concept(enriched_concept, client, duration_preset=duration_preset, token_counter=planner_tokens)
+    analysis, analysis_err = _call_stage_with_retries(
+        analyze_concept, enriched_concept, client, duration_preset, planner_tokens,
+        max_retries=max_retries, stage_name="Stage 1 (concept analysis)",
+    )
     if analysis:
         yield {"status": f"  → Domain: {analysis.domain} | Audience: {analysis.target_audience} | Arc: {analysis.narrative_arc[:60]}..."}
     else:
-        yield {"status": "  → Concept analysis returned empty, proceeding with defaults..."}
+        reason = _friendly_planner_error(analysis_err)
+        yield {"status": f"  → Concept analysis failed after {max_retries} attempts: {reason}"}
+        yield {"status": "  → Proceeding with defaults..."}
 
     # ── Stage 2: Prerequisite Discovery ──
     yield {"status": "Stage 2/5: Building reverse knowledge tree (what must be understood first?)..."}
@@ -664,8 +759,18 @@ def run_math2manim_planner(concept: str, max_retries: int = 3, previous_storyboa
 
     # ── Stage 5: Narrative Composition (parallel) ──
     yield {"status": "Stage 5/5: Composing verbose narrative storyboard (parallel, 2000+ tokens per segment)..."}
-    for update in compose_narrative(enriched, visual_design, analysis, client, max_retries, duration_preset=duration_preset, token_counter=planner_tokens):
+    for update in compose_narrative(
+        enriched,
+        visual_design,
+        analysis,
+        client,
+        max_retries,
+        duration_preset=duration_preset,
+        token_counter=planner_tokens,
+        planner_preferences=planner_preferences,
+    ):
         if update.get("final"):
             # Attach planner token usage to the final update
             update["token_usage"] = dict(planner_tokens)
+            update["model_profile"] = model_profile_summary()
         yield update

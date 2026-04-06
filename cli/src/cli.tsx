@@ -19,7 +19,7 @@ const cli = meow(
   Options
     --max-retries, -r    Maximum self-correction attempts (default: 3)
     --quality, -q        Generation quality: low, medium, high (default: high)
-    --model              Override the Claude model (e.g. claude-sonnet-4-6)
+    --model              Override the model profile or stage model (e.g. openai-default, gpt-5.4)
     --theme              Color theme: dark, light, minimal, colorblind, ansi (default: dark)
     --output-format      Output format: text, json, stream-json (default: text)
     --print, -p          Non-interactive mode: plain text output
@@ -45,7 +45,7 @@ const cli = meow(
     $ paper2manim -p 'Fourier Transform'
     $ paper2manim --quality low 'Linear Algebra: Dot Products'
     $ paper2manim --output-format json 'SVD'
-    $ paper2manim --model claude-sonnet-4-6 'Bayes Theorem'
+    $ paper2manim --model openai-default 'Bayes Theorem'
     $ paper2manim --skip-audio 'Fourier Transform'
     $ paper2manim --workspace
     $ paper2manim --resume output/chain_rule_1234

@@ -1,7 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import { getStageConfig, RESULT_MARKER } from '../lib/theme.js';
-import { formatDuration, formatTokenCount } from '../lib/format.js';
+import { formatDuration, formatTokenCount, formatCost } from '../lib/format.js';
 import { useAppContext } from '../context/AppContext.js';
 import type { CompletedStage, PipelineUpdate } from '../lib/types.js';
 
@@ -10,12 +10,6 @@ interface SummaryTableProps {
   toolCallCounts?: Record<string, number>;
   totalToolCalls?: number;
   tokenSummary?: PipelineUpdate['token_summary'];
-}
-
-function formatCost(usd: number): string {
-  if (usd < 0.01) return `$${usd.toFixed(4)}`;
-  if (usd < 1) return `$${usd.toFixed(3)}`;
-  return `$${usd.toFixed(2)}`;
 }
 
 export function SummaryTable({ stages, toolCallCounts, totalToolCalls, tokenSummary }: SummaryTableProps) {
@@ -63,10 +57,28 @@ export function SummaryTable({ stages, toolCallCounts, totalToolCalls, tokenSumm
             {'  '}Tokens: {formatTokenCount(tokenSummary.total_input_tokens)} in / {formatTokenCount(tokenSummary.total_output_tokens)} out
             {'  '}({tokenSummary.total_api_calls} API calls)
           </Text>
+          {tokenSummary.cached_input_tokens !== undefined && tokenSummary.cached_input_tokens > 0 && (
+            <Text color={themeColors.dim}>
+              {'  '}Cached input: {formatTokenCount(tokenSummary.cached_input_tokens)}
+              {tokenSummary.estimated_cache_savings_usd !== undefined && (
+                <Text color={themeColors.dim}>  saved ~{formatCost(tokenSummary.estimated_cache_savings_usd)}</Text>
+              )}
+            </Text>
+          )}
           <Text color={themeColors.muted}>
             {'  '}Estimated cost: <Text color={themeColors.warn}>{formatCost(tokenSummary.estimated_cost_usd)}</Text>
             <Text color={themeColors.dim}> (approximate)</Text>
           </Text>
+          {tokenSummary.fallback_invocations !== undefined && tokenSummary.fallback_invocations > 0 && (
+            <Text color={themeColors.dim}>
+              {'  '}Provider fallbacks: {tokenSummary.fallback_invocations}
+            </Text>
+          )}
+          {tokenSummary.model_profile && Object.entries(tokenSummary.model_profile).map(([stage, model]) => (
+            <Text key={stage} color={themeColors.dim}>
+              {'    '}{stage.padEnd(12)} {model}
+            </Text>
+          ))}
           {tokenSummary.breakdown && Object.entries(tokenSummary.breakdown).map(([stage, data]) => (
             <Text key={stage} color={themeColors.dim}>
               {'    '}{stage.padEnd(12)} {formatTokenCount(data.input_tokens)} in / {formatTokenCount(data.output_tokens)} out  ~{formatCost(data.cost_usd)}

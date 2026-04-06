@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from agents.config import (
+    DEFAULT_MODEL_PROFILE,
+    OPENAI_GPT_53_CODEX,
+    OPENAI_GPT_54,
     estimate_cost,
     merge_token_usage,
     new_token_counter,
+    resolve_stage_model,
 )
 
 
@@ -15,8 +19,10 @@ from agents.config import (
 
 def test_token_counter_has_cache_fields():
     counter = new_token_counter()
+    assert "cached_input_tokens" in counter
     assert "cache_creation_input_tokens" in counter
     assert "cache_read_input_tokens" in counter
+    assert counter["cached_input_tokens"] == 0
     assert counter["cache_creation_input_tokens"] == 0
     assert counter["cache_read_input_tokens"] == 0
 
@@ -88,22 +94,26 @@ def test_estimate_cost_zero_tokens():
     assert estimate_cost(0, 0) == 0.0
 
 
+def test_estimate_cost_openai_cached_input_is_discounted():
+    cost_no_cache = estimate_cost(1000, 500, model=OPENAI_GPT_54)
+    cost_with_cache = estimate_cost(1000, 500, model=OPENAI_GPT_54, cached_input_tokens=800)
+    assert cost_with_cache < cost_no_cache
+
+
 # ---------------------------------------------------------------------------
 # Model routing (medium tier)
 # ---------------------------------------------------------------------------
 
 def test_model_routing_medium():
     from agents.coder import _get_model_for_complexity
-    from agents.config import CLAUDE_SONNET
 
-    assert _get_model_for_complexity("medium") == CLAUDE_SONNET
+    assert _get_model_for_complexity("medium") == OPENAI_GPT_53_CODEX
 
 
 def test_model_routing_complex():
     from agents.coder import _get_model_for_complexity
-    from agents.config import CLAUDE_OPUS
 
-    assert _get_model_for_complexity("complex") == CLAUDE_OPUS
+    assert _get_model_for_complexity("complex") == OPENAI_GPT_53_CODEX
 
 
 def test_tool_budget_medium():
@@ -112,3 +122,9 @@ def test_tool_budget_medium():
 
     assert _get_tool_budget("medium") == MAX_TOOL_CALLS_MEDIUM
     assert _get_tool_budget("medium", fix=True) == MAX_TOOL_CALLS_FIX_MEDIUM
+
+
+def test_default_profile_is_openai():
+    plan_cfg = resolve_stage_model("plan", profile=DEFAULT_MODEL_PROFILE)
+    assert plan_cfg.model == OPENAI_GPT_54
+    assert plan_cfg.provider == "openai"

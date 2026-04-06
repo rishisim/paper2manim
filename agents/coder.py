@@ -4,7 +4,7 @@ The model can call ``fetch_manim_docs``, ``fetch_manim_file``, ``search_web``
 during generation to read real source code, docstrings, and community
 examples — enabling higher-quality animations.
 
-Uses Claude Opus 4.6 (Anthropic) for code generation.
+Uses the configured provider profile for code generation, with OpenAI-first defaults.
 """
 
 from __future__ import annotations
@@ -12,14 +12,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
 from typing import Iterator
 
-import anthropic
-
 from agents.config import (
-    CLAUDE_OPUS,
-    CLAUDE_SONNET,
     MAX_TOOL_CALLS_COMPLEX,
     MAX_TOOL_CALLS_FIX_COMPLEX,
     MAX_TOOL_CALLS_FIX_MEDIUM,
@@ -27,8 +22,11 @@ from agents.config import (
     MAX_TOOL_CALLS_MEDIUM,
     MAX_TOOL_CALLS_SIMPLE,
     new_token_counter,
+    resolve_fallback_stage_model,
+    resolve_stage_model,
 )
 from utils.golden_scenes import fetch_golden_scenes
+from utils.llm_provider import run_tool_completion
 from utils.manim_docs import (
     fetch_manim_docs,
     fetch_manim_file,
@@ -259,6 +257,11 @@ HARD RULES — violating these WILL produce overlapping elements:
 - Pace visuals rhythmically: introduce concept → pause → animate → pause → transition.
 - Use `self.wait()` generously. Better to have breathing room than a rushed scene.
 - A good rule: 2-3 seconds per equation, 1-2 seconds per geometric construction, 0.5-1s pauses between beats.
+- The LAST 1-2 seconds must hold a meaningful visual summary frame. Never fade everything out to a blank screen while narration is still speaking.
+- Do not end with an empty stage unless the audio is also finished. If you need closure, keep one anchor object or final equation visible.
+- Keep at most ONE primary idea on screen at a time unless multiple objects are intentionally grouped into a single composition.
+- Every segment should have a clear intro beat, one or more hold/explain beats, and a transition/closure beat.
+- For slower pacing, reduce simultaneous objects instead of only slowing animations.
 
 == TOOL USAGE ==
 - Prefer writing code directly using your built-in Manim knowledge.
@@ -271,9 +274,7 @@ Embedded style snippets you can reuse directly:
 
 def _get_model_for_complexity(complexity: str = "complex") -> str:
     """Return the appropriate model name based on segment complexity."""
-    if complexity in ("simple", "medium"):
-        return CLAUDE_SONNET
-    return CLAUDE_OPUS
+    return resolve_stage_model("code", complexity=complexity).model
 
 
 def _get_tool_budget(complexity: str = "complex", *, fix: bool = False) -> int:
@@ -348,6 +349,7 @@ def _build_tools() -> list[dict]:
                 },
                 "required": ["query"],
             },
+            "cache_control": {"type": "ephemeral"},
         },
     ]
 
@@ -370,115 +372,37 @@ def _dispatch_tool_call(name: str, input_args: dict) -> str:
 
 
 def _send_and_extract(
-    client: anthropic.Anthropic,
-    model: str,
-    system: str | list[dict],
+    complexity: str,
+    system_sections: list[str],
     user_message: str,
     max_tool_calls: int,
     tool_call_counts: dict[str, int] | None = None,
     token_counter: dict | None = None,
     on_status: object | None = None,
+    *,
+    fix: bool = False,
 ) -> str:
-    """Send a message via Anthropic Messages API, handle tool calls,
+    """Send a message via the configured provider, handle tool calls,
     and return the final text with code fences stripped."""
-    messages: list[dict] = [{"role": "user", "content": user_message}]
     tools = _build_tools() if max_tool_calls > 0 else []
-    calls = 0
+    primary = resolve_stage_model("code", complexity=complexity, fix=fix)
+    fallback = resolve_fallback_stage_model("code", complexity=complexity, fix=fix)
+    _log.debug("prompting provider=%s model=%s", primary.provider, primary.model)
 
-    _log.debug("prompting model (%s)…", model)
-
-    while True:
-        kwargs: dict = {
-            "model": model,
-            "max_tokens": 8192,
-            "temperature": 0.2,
-            "system": system,
-            "messages": messages,
-        }
-        if tools and calls < max_tool_calls:
-            kwargs["tools"] = tools
-
-        # Retry with exponential backoff on rate limits (429)
-        _MAX_RATE_LIMIT_RETRIES = 5
-        for _attempt in range(_MAX_RATE_LIMIT_RETRIES):
-            try:
-                response = client.messages.create(**kwargs)
-                break
-            except anthropic.RateLimitError as e:
-                if _attempt == _MAX_RATE_LIMIT_RETRIES - 1:
-                    raise
-                # Use retry-after header when available, else exponential backoff
-                wait = 2 ** (_attempt + 1)
-                resp = getattr(e, "response", None)
-                if resp:
-                    ra = getattr(resp, "headers", {}).get("retry-after")
-                    if ra:
-                        try:
-                            wait = max(wait, float(ra))
-                        except ValueError:
-                            pass
-                msg = f"Rate limited (429), retrying in {wait:.0f}s (attempt {_attempt + 1}/{_MAX_RATE_LIMIT_RETRIES})"
-                _log.warning(msg)
-                if callable(on_status):
-                    on_status(msg)
-                time.sleep(wait)
-
-        # Track token usage from this API call
-        if token_counter is not None:
-            try:
-                token_counter["input_tokens"] += getattr(response.usage, "input_tokens", 0)
-                token_counter["output_tokens"] += getattr(response.usage, "output_tokens", 0)
-                token_counter["api_calls"] += 1
-                token_counter["cache_creation_input_tokens"] += getattr(
-                    response.usage, "cache_creation_input_tokens", 0
-                ) or 0
-                token_counter["cache_read_input_tokens"] += getattr(
-                    response.usage, "cache_read_input_tokens", 0
-                ) or 0
-            except Exception:
-                pass  # Don't let tracking failures break the pipeline
-
-        # Extract text blocks and tool use blocks
-        text_parts: list[str] = []
-        tool_use_blocks: list = []
-        for block in response.content:
-            if block.type == "text":
-                text_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_use_blocks.append(block)
-
-        # If no tool calls or budget exhausted, return the text
-        if response.stop_reason != "tool_use" or not tool_use_blocks or calls >= max_tool_calls:
-            raw_text = "\n".join(text_parts)
-            return _strip_code_fences(raw_text)
-
-        # Process tool calls
-        # Append assistant message to history
-        messages.append({"role": "assistant", "content": response.content})
-
-        tool_results = []
-        for block in tool_use_blocks:
-            calls += 1
-            _log.debug("tool call %d/%d  %s  %s", calls, max_tool_calls, block.name, block.input)
-            if tool_call_counts is not None:
-                tool_call_counts[block.name] = tool_call_counts.get(block.name, 0) + 1
-
-            result = _dispatch_tool_call(block.name, block.input)
-
-            if calls >= max_tool_calls:
-                result += (
-                    "\n\nCRITICAL SYSTEM WARNING: You have exhausted all tool calls. "
-                    "Do NOT call any more functions. You MUST output the complete final "
-                    "Manim code NOW based on the information you have gathered."
-                )
-
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": result,
-            })
-
-        messages.append({"role": "user", "content": tool_results})
+    result = run_tool_completion(
+        primary=primary,
+        fallback=fallback,
+        system_sections=system_sections,
+        user_message=user_message,
+        tools=tools,
+        max_tool_calls=max_tool_calls,
+        tool_dispatcher=_dispatch_tool_call,
+        tool_call_counts=tool_call_counts,
+        token_counter=token_counter,
+        on_status=on_status if callable(on_status) else None,
+        cache_key_parts=("repair" if fix else "generate", primary.model, ",".join(tool["name"] for tool in tools)),
+    )
+    return _strip_code_fences(result.text)
 
 
 # ── public generators ─────────────────────────────────────────────────
@@ -495,15 +419,15 @@ def generate_manim_script(
     few_shot_example: str = "",
     token_counter: dict | None = None,
     on_status: object | None = None,
+    repair_feedback: str = "",
+    quality_mode: str = "balanced",
 ) -> Iterator[str]:
     """Yield the final generated code (single yield after tool calls resolve)."""
     model = _get_model_for_complexity(complexity)
     max_tool_calls = _get_tool_budget(complexity)
-    client = anthropic.Anthropic()
-
-    system = [
-        {"type": "text", "text": SYSTEM_INSTRUCTION, "cache_control": {"type": "ephemeral"}},
-        {"type": "text", "text": f"Hard tool budget for this segment: {max_tool_calls} total function calls."},
+    system_sections = [
+        SYSTEM_INSTRUCTION,
+        f"Hard tool budget for this segment: {max_tool_calls} total function calls.",
     ]
 
     # Build the prompt dynamically based on whether it's Lite (str) or Pro (dict)
@@ -541,6 +465,11 @@ def generate_manim_script(
             f"Variable Meanings (for your understanding):\n{vars_str}\n\n"
             f"### Visual Layout & Elements\n"
             f"Layout Instructions: {seg.get('layout_instructions', '')}\n"
+            f"Learning Goal: {seg.get('learning_goal', '')}\n"
+            f"Must Show: {', '.join(seg.get('must_show', []))}\n"
+            f"Carry Over From Previous: {seg.get('carry_over_from_previous', 'clean reset')}\n"
+            f"End State: {seg.get('end_state', '')}\n"
+            f"Visual Density: {seg.get('visual_density', 'medium')}\n"
             f"Elements to draw:\n{elements_str}\n\n"
             f"Element Color Mapping:\n{element_colors_str}\n\n"
             f"### DETAILED VISUAL & ANIMATION FLOW (follow this beat-by-beat)\n"
@@ -555,7 +484,26 @@ def generate_manim_script(
             f"- You MUST implement EVERY animation listed in Required Animations — do not skip any\n"
             f"- Follow the visual flow instructions PRECISELY — they are a beat-by-beat screenplay, not suggestions\n"
             f"- FadeOut elements that are no longer needed before introducing new ones\n"
+            f"- Keep at most one primary visual idea on screen at a time unless grouped intentionally\n"
+            f"- Preserve a meaningful anchor object in the final 1-2 seconds\n"
+            f"- Respect visual density={seg.get('visual_density', 'medium')} when deciding how many simultaneous objects to show\n"
             f"- Do NOT improvise or add elements not in the spec — faithfully implement what was planned\n\n"
+        )
+
+    if quality_mode == "polished":
+        prompt += (
+            "Quality mode is POLISHED. Favor the cleanest layout, strongest transitions, and most legible end frame even if it means simpler animation choices.\n\n"
+        )
+    elif quality_mode == "fast":
+        prompt += (
+            "Quality mode is FAST. Prefer simpler, reliable scenes and avoid ambitious density or expensive effects.\n\n"
+        )
+
+    if repair_feedback:
+        prompt += (
+            "### QUALITY REPAIR FEEDBACK\n"
+            "The previous version had concrete quality issues. Fix them directly in this new script:\n"
+            f"{repair_feedback}\n\n"
         )
 
     if audio_script and audio_duration > 0:
@@ -566,8 +514,9 @@ def generate_manim_script(
         prompt += (
             f"CRITICAL TIMING MATCH: The generated voiceover for this segment is exactly {audio_duration:.1f} seconds long.\n"
             f"The narrator will say: \"{audio_script}\"\n"
-            "You MUST time your animations (using `run_time` and `self.wait()`) so that the total scene duration perfectly matches or slightly exceeds the audio duration. "
+            "You MUST time your animations (using `run_time` and `self.wait()`) so that the total scene duration matches the audio duration as closely as possible, ideally within 0.5 seconds. "
             "Pace the visuals rhythmically to match the spoken sentences. DO NOT rush through the animations.\n"
+            "Do NOT fade to black or fully clear the screen before the final spoken sentence ends. The closing beat should remain visually informative.\n"
             f"{duration_hint}"
         )
 
@@ -580,7 +529,7 @@ def generate_manim_script(
     yield "looking up docs"  # signal to caller
 
     code = _send_and_extract(
-        client, model, system, prompt,
+        complexity, system_sections, prompt,
         max_tool_calls=max_tool_calls,
         tool_call_counts=tool_call_counts,
         token_counter=token_counter,
@@ -589,7 +538,7 @@ def generate_manim_script(
     if not code:
         _log.debug("falling back to tool-less generation (model=%s)", model)
         code = _send_and_extract(
-            client, model, system, prompt,
+            complexity, system_sections, prompt,
             max_tool_calls=0,
             tool_call_counts=tool_call_counts,
             token_counter=token_counter,
@@ -653,11 +602,7 @@ def fix_manim_script(
     """
     model = _get_model_for_complexity(complexity)
     max_tool_calls = _get_tool_budget(complexity, fix=True)
-    client = anthropic.Anthropic()
-
-    system = [
-        {"type": "text", "text": SYSTEM_INSTRUCTION, "cache_control": {"type": "ephemeral"}},
-    ]
+    system_sections = [SYSTEM_INSTRUCTION]
 
     compact = _compact_error(error)
 
@@ -711,11 +656,12 @@ def fix_manim_script(
     yield "looking up docs"
 
     fixed = _send_and_extract(
-        client, model, system, prompt,
+        complexity, system_sections, prompt,
         max_tool_calls=max_tool_calls,
         tool_call_counts=tool_call_counts,
         token_counter=token_counter,
         on_status=on_status,
+        fix=True,
     )
     if fixed:
         yield fixed
@@ -735,6 +681,8 @@ def run_coder_agent(
     color_palette: dict[str, str] | None = None,
     segment_id: int | None = None,
     few_shot_example: str = "",
+    repair_feedback: str = "",
+    quality_mode: str = "balanced",
 ):
     """Generate a Manim script, execute it, self-correct up to *max_retries*.
 
@@ -745,7 +693,8 @@ def run_coder_agent(
         scene_class_name: The Manim Scene class name to generate.
         output_dir: Optional custom output directory for the rendered video.
     """
-    model_label = _get_model_for_complexity(complexity)
+    model_config = resolve_stage_model("code", complexity=complexity)
+    model_label = model_config.model
     _seg = f"[Seg {segment_id}] " if segment_id is not None else ""
     code = ""
     tool_call_counts: dict[str, int] = {}
@@ -756,6 +705,7 @@ def run_coder_agent(
         payload["tool_call_counts"] = counts
         payload["total_tool_calls"] = sum(counts.values())
         payload["token_usage"] = dict(coder_tokens)
+        payload["model_info"] = {"provider": model_config.provider, "model": model_label}
         return payload
 
     yield {
@@ -778,12 +728,14 @@ def run_coder_agent(
         few_shot_example=few_shot_example,
         token_counter=coder_tokens,
         on_status=_on_rate_limit,
+        repair_feedback=repair_feedback,
+        quality_mode=quality_mode,
     ):
         # Surface any rate-limit notifications collected during API calls
         while _rate_limit_msgs:
             yield {"status": f"{_seg}{_rate_limit_msgs.pop(0)}", "phase": "rate_limited"}
         if chunk == "looking up docs":
-            yield {"status": f"{_seg}Generating with Claude...", "phase": "docs"}
+            yield {"status": f"{_seg}Generating with {model_config.provider}:{model_label}...", "phase": "docs"}
             continue
         if chunk.startswith("spec_gaps:"):
             spec_gaps = chunk[len("spec_gaps:"):]
@@ -960,6 +912,8 @@ async def run_coder_agent_async(
     segment_id: int | None = None,
     on_update=None,
     few_shot_example: str = "",
+    repair_feedback: str = "",
+    quality_mode: str = "balanced",
 ) -> dict:
     """Async wrapper around ``run_coder_agent``.
 
@@ -984,6 +938,8 @@ async def run_coder_agent_async(
             color_palette=color_palette,
             segment_id=segment_id,
             few_shot_example=few_shot_example,
+            repair_feedback=repair_feedback,
+            quality_mode=quality_mode,
         ):
             if on_update:
                 try:

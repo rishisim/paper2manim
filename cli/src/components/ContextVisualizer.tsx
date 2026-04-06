@@ -9,6 +9,11 @@ import { useAppContext } from '../context/AppContext.js';
 
 // Approximate context window sizes for models
 const MODEL_CONTEXT_SIZES: Record<string, number> = {
+  'openai-default': 1_050_000,
+  'anthropic-legacy': 200_000,
+  'gpt-5.4': 1_050_000,
+  'gpt-5.3-codex': 400_000,
+  'gpt-5.4-mini': 400_000,
   'claude-opus-4-6': 200000,
   'claude-sonnet-4-6': 200000,
   'claude-haiku-4-5': 200000,

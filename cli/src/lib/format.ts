@@ -39,6 +39,60 @@ export function padProgress(pct: number): string {
  * Map raw Python tool names to human-readable Claude Code-style descriptions.
  * e.g. "fetch_manim_docs" → "Read Manim docs", "run_manim_code" → "Bash: manim render"
  */
+/** Format an ISO timestamp as a relative human-readable string. */
+export function formatRelativeDate(isoDate: string): string {
+  const date = new Date(isoDate);
+  if (isNaN(date.getTime())) return isoDate;
+
+  const diffMs = Date.now() - date.getTime();
+  const diffSecs = Math.floor(diffMs / 1000);
+
+  if (diffSecs < 60) return 'just now';
+  const diffMins = Math.floor(diffSecs / 60);
+  if (diffMins < 60) return `${diffMins}m ago`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays < 30) return `${diffDays}d ago`;
+  const diffMonths = Math.floor(diffDays / 30);
+  if (diffMonths < 12) return `${diffMonths}mo ago`;
+  return `${Math.floor(diffMonths / 12)}y ago`;
+}
+
+/** Render a text progress bar. Returns e.g. "████░░░░░░" */
+export function renderProgressBar(pct: number, width = 10): string {
+  const clamped = Math.max(0, Math.min(100, pct));
+  const filled = Math.round((clamped / 100) * width);
+  return '\u2588'.repeat(filled) + '\u2591'.repeat(width - filled);
+}
+
+/** Render an ASCII-safe determinate progress bar. */
+export function renderProgressBarAscii(pct: number, width = 10): string {
+  const clamped = Math.max(0, Math.min(100, pct));
+  const filled = Math.round((clamped / 100) * width);
+  return '='.repeat(filled) + '-'.repeat(Math.max(0, width - filled));
+}
+
+/** Render an ASCII-safe indeterminate progress bar with a moving window. */
+export function renderIndeterminateProgressBar(frame: number, width = 10): string {
+  const safeWidth = Math.max(6, width);
+  const markerWidth = Math.max(3, Math.floor(safeWidth / 4));
+  const travel = safeWidth - markerWidth;
+  const offset = travel <= 0 ? 0 : Math.abs(frame % (travel * 2) - travel);
+  let out = '';
+  for (let i = 0; i < safeWidth; i += 1) {
+    out += i >= offset && i < offset + markerWidth ? '=' : '-';
+  }
+  return out;
+}
+
+/** Format a USD cost value for compact display. */
+export function formatCost(usd: number): string {
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  if (usd < 1) return `$${usd.toFixed(3)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   fetch_manim_docs:          'Read Manim docs',
   fetch_manim_file:          'Read Manim source',
@@ -70,15 +124,17 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
 };
 
 /** Format a tool call for display. Returns "Read Manim docs: Axes/methods" style string. */
-export function formatToolCall(name: string, params?: Record<string, unknown>): string {
-  const displayName = TOOL_DISPLAY_NAMES[name] ?? name;
+export function formatToolCall(name: unknown, params?: Record<string, unknown>): string {
+  const safeName = typeof name === 'string' && name.trim().length > 0 ? name : 'unknown_tool';
+  const displayName = TOOL_DISPLAY_NAMES[safeName] ?? safeName;
 
-  if (!params || Object.keys(params).length === 0) {
+  const safeParams = (params && typeof params === 'object') ? params : undefined;
+  if (!safeParams || Object.keys(safeParams).length === 0) {
     return displayName;
   }
 
   // Build a compact param hint
-  const values = Object.values(params)
+  const values = Object.values(safeParams)
     .slice(0, 2)
     .map(v => {
       const s = String(v);
@@ -92,7 +148,7 @@ export function formatToolCall(name: string, params?: Record<string, unknown>): 
 
   // For "Bash" style, show the command
   if (displayName.startsWith('Bash')) {
-    const cmd = params.command ?? params.cmd ?? values[0];
+    const cmd = safeParams.command ?? safeParams.cmd ?? values[0];
     return `Bash: ${String(cmd).slice(0, 60)}`;
   }
 

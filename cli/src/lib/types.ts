@@ -79,7 +79,7 @@ export interface Settings {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  model: 'claude-opus-4-6',
+  model: 'openai-default',
   theme: 'dark',
   defaultMode: 'default',
   outputStyle: 'verbose',
@@ -135,6 +135,7 @@ export interface AppDispatch {
   setQuality: (q: 'low' | 'medium' | 'high') => void;
   startPipeline: (concept: string) => void;
   resumePipeline: (dir: string) => void;
+  retryPipeline: () => void;
   compactLogs: (instructions?: string) => void;
   exportSession: (filename?: string) => string | null;
   killPipeline: () => void;
@@ -170,6 +171,7 @@ export interface PipelineUpdate {
   segment_status?: string;
   segment_phase?: string;
   segment_final?: boolean;
+  code?: string;
 
   // Streaming playback (emitted when a segment's stitch completes)
   playable_segment?: string;
@@ -183,17 +185,24 @@ export interface PipelineUpdate {
   tool_call_counts?: Record<string, number>;
   total_tool_calls?: number;
   stitch_errors?: string[];
+  failed_segments?: Array<{ id: number; title: string; stage: string; error: string }>;
 
   // Token summary (emitted with the final "done" update)
   token_summary?: {
     total_input_tokens: number;
     total_output_tokens: number;
+    cached_input_tokens?: number;
     total_api_calls: number;
     tts_api_calls?: number;
     estimated_cost_usd: number;
+    estimated_cache_savings_usd?: number;
+    fallback_invocations?: number;
+    model_profile?: Record<string, string>;
     breakdown?: Record<string, {
+      model?: string;
       input_tokens: number;
       output_tokens: number;
+      cached_input_tokens?: number;
       api_calls: number;
       cost_usd: number;
     }>;
@@ -231,6 +240,7 @@ export interface PipelineArgs {
   is_lite?: boolean;
   skip_audio?: boolean;
   resume_dir?: string;
+  force_restart?: boolean;
   questionnaire_answers?: Record<string, unknown>;
   render_timeout?: number;
   tts_timeout?: number;
@@ -261,8 +271,12 @@ export interface SegmentState {
   finishedAt?: number;
   // Agent activity (Claude Code-style display)
   isThinking?: boolean;
+  thinkingText?: string;
+  lastStatus?: string;
   lastToolCall?: { name: string; params: Record<string, unknown> };
   lastToolResult?: { name: string; output: string };
+  /** First actionable hint shown when a segment fails. */
+  failHint?: string;
 }
 
 /** A project entry from the workspace. */
@@ -275,6 +289,37 @@ export interface Project {
   progress_done: number;
   progress_total: number;
   progress_desc: string;
+  // Enriched metadata (optional for backward compat)
+  created_at?: string;
+  total_segments?: number;
+  total_time_secs?: number | null;
+  estimated_cost_usd?: number | null;
+  has_video?: boolean;
+  video_path?: string | null;
+  video_size_mb?: number | null;
+}
+
+/** UX-facing project badge state for workspace and onboarding surfaces. */
+export type ProjectStateBadge = 'completed' | 'in_progress' | 'attention';
+
+/** Recommended default action for a project row. */
+export type ProjectPrimaryAction = 'resume' | 'rerun' | 'open_video' | 'view_summary';
+
+/** Runtime activity grouping for status stream readability. */
+export type ActivityGroup = 'doing' | 'checking' | 'fixing' | 'done';
+
+/** Runtime activity severity to signal confidence and risk. */
+export type ActivitySeverity = 'normal' | 'warning' | 'critical';
+
+/** Progress display mode for run UI components. */
+export type ProgressMode = 'determinate' | 'indeterminate';
+
+/** Settings panel row with effective value and whether current scope overrides it. */
+export interface EffectiveSettingRow {
+  key: keyof Settings;
+  effectiveValue: string;
+  scopeValue: string;
+  scopeOverride: boolean;
 }
 
 /** A tool call log entry. */

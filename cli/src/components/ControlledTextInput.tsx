@@ -15,6 +15,7 @@ interface ControlledTextInputProps {
   value: string;
   onChange: (value: string) => void;
   onSubmit: (value: string) => void;
+  onEmptySubmit?: () => void;
   onSlashMode?: (partialCommand: string) => void;
   onBashMode?: (command: string) => void;
   onFileRef?: (partial: string) => void;
@@ -23,18 +24,31 @@ interface ControlledTextInputProps {
   focus?: boolean;
   /** When true the slash-command overlay is visible — suppress up/down so only the overlay navigates. */
   slashModeActive?: boolean;
+  /** When true, skip command-history handling for Up/Down and allow custom navigation callbacks. */
+  disableHistoryNavigation?: boolean;
+  /** Optional section-level navigation callback for Up arrow. */
+  onNavigateUp?: () => void;
+  /** Optional section-level navigation callback for Down arrow. */
+  onNavigateDown?: () => void;
+  /** Keep the input text after Enter instead of clearing it. */
+  clearOnSubmit?: boolean;
 }
 
 export function ControlledTextInput({
   value,
   onChange,
   onSubmit,
+  onEmptySubmit,
   onSlashMode,
   onBashMode,
   placeholder,
   isDisabled = false,
   focus = true,
   slashModeActive = false,
+  disableHistoryNavigation = false,
+  onNavigateUp,
+  onNavigateDown,
+  clearOnSubmit = true,
 }: ControlledTextInputProps) {
   const { themeColors, commandHistory } = useAppContext();
   const [cursor, setCursor] = useState(value.length);
@@ -58,16 +72,17 @@ export function ControlledTextInput({
   const liveCursorRef = useRef(value.length);
   const liveSlashModeRef = useRef(slashModeActive);
 
-  // Sync value ref when the parent re-renders with updated props (e.g. history navigation)
-  useEffect(() => { liveValueRef.current = value; liveCursorRef.current = value.length; }, [value]);
+  // Sync value ref when the parent re-renders with updated props.
+  // Keep cursor stable instead of snapping to end on every edit.
+  useEffect(() => {
+    liveValueRef.current = value;
+    const clamped = Math.min(liveCursorRef.current, value.length);
+    liveCursorRef.current = clamped;
+    setCursor(prev => Math.min(prev, value.length));
+  }, [value]);
   // Sync slash mode ref SYNCHRONOUSLY during render so useInput handlers always see the
   // current value (useEffect is deferred and the ref can be stale by the time Enter fires).
   liveSlashModeRef.current = slashModeActive;
-
-  // Keep cursor at end when value changes externally
-  useEffect(() => {
-    setCursor(value.length);
-  }, [value.length]);
 
   const insertAt = useCallback((str: string, pos: number, insert: string): string => {
     return str.slice(0, pos) + insert + str.slice(pos);
@@ -173,12 +188,21 @@ export function ControlledTextInput({
           setHistoryIdx(-1);
           return;
         }
-        liveValueRef.current = '';
-        liveCursorRef.current = 0;
         onSubmit(trimmed);
-        onChange('');
-        setCursor(0);
+        if (clearOnSubmit) {
+          liveValueRef.current = '';
+          liveCursorRef.current = 0;
+          onChange('');
+          setCursor(0);
+        } else {
+          const endPos = liveValueRef.current.length;
+          liveCursorRef.current = endPos;
+          setCursor(endPos);
+        }
         setHistoryIdx(-1);
+      }
+      else {
+        onEmptySubmit?.();
       }
       return;
     }
@@ -196,6 +220,11 @@ export function ControlledTextInput({
 
     // Up arrow — navigate history backwards
     if (key.upArrow) {
+      if (onNavigateUp) {
+        onNavigateUp();
+        return;
+      }
+      if (disableHistoryNavigation) return;
       const len = commandHistory.length;
       if (len === 0) return;
       const newIdx = historyIdx === -1 ? len - 1 : Math.max(0, historyIdx - 1);
@@ -210,6 +239,11 @@ export function ControlledTextInput({
 
     // Down arrow — navigate history forwards
     if (key.downArrow) {
+      if (onNavigateDown) {
+        onNavigateDown();
+        return;
+      }
+      if (disableHistoryNavigation) return;
       if (historyIdx === -1) return;
       const newIdx = historyIdx + 1;
       if (newIdx >= commandHistory.length) {

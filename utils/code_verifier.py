@@ -16,7 +16,8 @@ import json
 import re
 from dataclasses import dataclass, field
 
-import anthropic
+from agents.config import resolve_fallback_stage_model, resolve_stage_model
+from utils.llm_provider import run_text_completion
 
 # ── Result types ────────────────────────────────────────────────────
 
@@ -28,6 +29,7 @@ class VerifyResult:
     passed: bool
     issues: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
+    static_issues: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -85,9 +87,6 @@ Output ONLY valid JSON:
 
 Set "smooth" to false only for clear transition problems. Max 2 issues."""
 
-MODEL = "claude-sonnet-4-6"
-
-
 # ── Helpers ─────────────────────────────────────────────────────────
 
 def _parse_json_response(raw: str) -> dict:
@@ -117,6 +116,28 @@ def _get_code_head(code: str, n_lines: int = 40) -> str:
     return "\n".join(lines[:n_lines])
 
 
+def static_quality_check(code: str) -> list[str]:
+    """Flag obvious clutter/layout risks before expensive rendering."""
+    issues: list[str] = []
+
+    play_calls = len(re.findall(r"\bself\.play\(", code))
+    create_calls = len(re.findall(r"\b(Create|Write|FadeIn|GrowArrow|TransformMatchingTex|AnimationGroup|LaggedStart)\(", code))
+    fadeout_calls = len(re.findall(r"\bFadeOut\(", code))
+    move_to_origin_calls = len(re.findall(r"\.move_to\(ORIGIN\)", code))
+    label_origin_risks = len(re.findall(r"(label|text)\w*\s*=.*?\.move_to\(ORIGIN\)", code, flags=re.IGNORECASE))
+
+    if play_calls >= 6 and fadeout_calls == 0:
+        issues.append("Scene has many animation beats but no FadeOut cleanup, which risks cluttered transitions.")
+    if create_calls >= 10 and fadeout_calls <= 1:
+        issues.append("Many objects are introduced with very little cleanup; simplify or clear zones between ideas.")
+    if move_to_origin_calls >= 4:
+        issues.append("Repeated .move_to(ORIGIN) suggests unrelated objects may overlap in the main zone.")
+    if label_origin_risks:
+        issues.append("A label/text object is moved to ORIGIN instead of being placed relative to its target.")
+
+    return issues
+
+
 # ── Single-segment verification ────────────────────────────────────
 
 def verify_segment_code(
@@ -124,6 +145,7 @@ def verify_segment_code(
     code: str,
     segment_context: str = "",
     audio_duration: float = 0.0,
+    token_counter: dict | None = None,
 ) -> VerifyResult:
     """Verify a single segment's Manim code for potential visual issues.
 
@@ -142,22 +164,30 @@ def verify_segment_code(
     if audio_duration > 0:
         prompt += f"\n\nTarget audio duration: {audio_duration:.1f}s"
 
+    static_issues = static_quality_check(code)
+
     try:
-        client = anthropic.Anthropic()
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            system=_VERIFY_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
+        result = run_text_completion(
+            primary=resolve_stage_model("verify"),
+            fallback=resolve_fallback_stage_model("verify"),
+            system_sections=[_VERIFY_SYSTEM],
+            user_content=prompt,
+            max_output_tokens=1024,
+            token_counter=token_counter,
+            cache_key_parts=("verify",),
         )
-        raw = response.content[0].text or ""
+        raw = result.text or ""
         data = _parse_json_response(raw)
+        combined_issues = list(static_issues)
+        combined_issues.extend(data.get("issues", []))
+        passed = data.get("passed", True) and not static_issues
 
         return VerifyResult(
             segment_id=segment_id,
-            passed=data.get("passed", True),
-            issues=data.get("issues", []),
+            passed=passed,
+            issues=combined_issues,
             suggestions=data.get("suggestions", []),
+            static_issues=static_issues,
         )
     except Exception as e:
         # If verification fails, pass by default (don't block the pipeline)
@@ -165,6 +195,7 @@ def verify_segment_code(
             segment_id=segment_id,
             passed=True,
             issues=[f"Code verifier error: {str(e)}"],
+            static_issues=static_issues,
         )
 
 
@@ -172,6 +203,7 @@ def verify_segment_code(
 
 def verify_code_transitions(
     segment_codes: dict[int, str],
+    token_counter: dict | None = None,
 ) -> list[TransitionVerifyResult]:
     """Check code-level transition smoothness between consecutive segments.
 
@@ -186,7 +218,6 @@ def verify_code_transitions(
         return []
 
     results: list[TransitionVerifyResult] = []
-    client = anthropic.Anthropic()
 
     for i in range(len(sorted_ids) - 1):
         id_a, id_b = sorted_ids[i], sorted_ids[i + 1]
@@ -202,13 +233,16 @@ def verify_code_transitions(
         )
 
         try:
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=512,
-                system=_TRANSITION_SYSTEM,
-                messages=[{"role": "user", "content": prompt}],
+            result = run_text_completion(
+                primary=resolve_stage_model("verify"),
+                fallback=resolve_fallback_stage_model("verify"),
+                system_sections=[_TRANSITION_SYSTEM],
+                user_content=prompt,
+                max_output_tokens=512,
+                token_counter=token_counter,
+                cache_key_parts=("verify-transition",),
             )
-            raw = response.content[0].text or ""
+            raw = result.text or ""
             data = _parse_json_response(raw)
 
             results.append(TransitionVerifyResult(

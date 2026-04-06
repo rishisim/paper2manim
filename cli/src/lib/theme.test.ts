@@ -107,7 +107,7 @@ describe('PROMPT_COLORS', () => {
 // ── stageConfig ──────────────────────────────────────────────────────────────
 
 describe('stageConfig', () => {
-  const EXPECTED_STAGES = ['plan', 'tts', 'code', 'code_retry', 'verify', 'render', 'timing', 'concat', 'overlay', 'done'];
+  const EXPECTED_STAGES = ['plan', 'pipeline', 'tts', 'code', 'code_retry', 'verify', 'render', 'stitch', 'timing', 'concat', 'subtitles', 'overlay', 'done'];
 
   it('covers all expected pipeline stages', () => {
     for (const stage of EXPECTED_STAGES) {

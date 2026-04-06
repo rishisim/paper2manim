@@ -19,6 +19,30 @@ def _size_based_timeout(paths: list[str], base: int = 120) -> int:
     return max(base, int(total_mb * 2))
 
 
+def _probe_duration(path: str, timeout: int = 15) -> float | None:
+    """Return media duration in seconds via ffprobe, or ``None`` on failure."""
+    if not os.path.exists(path):
+        return None
+
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            return None
+        return float((result.stdout or "").strip())
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -> Iterator[dict]:
     """
     Stitches an mp4 video and a wav/mp3 audio file together using ffmpeg.
@@ -40,21 +64,108 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
         }
         return
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        video_path,
-        "-i",
-        audio_path,
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-movflags",
-        "+faststart",
-        output_path,
-    ]
+    video_duration = _probe_duration(video_path)
+    audio_duration = _probe_duration(audio_path)
+    duration_tolerance = 0.15
+
+    if video_duration and audio_duration:
+        delta = audio_duration - video_duration
+        if delta > duration_tolerance:
+            yield {
+                "status": (
+                    f"Padding final video frame by {delta:.2f}s to keep visuals aligned "
+                    "with narration..."
+                )
+            }
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                "-filter:v",
+                f"tpad=stop_mode=clone:stop_duration={delta:.3f}",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
+        elif -delta > duration_tolerance:
+            yield {
+                "status": (
+                    f"Trimming trailing video tail by {-delta:.2f}s so the segment ends "
+                    "with the narration..."
+                )
+            }
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-t",
+                f"{audio_duration:.3f}",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
+        else:
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
+    else:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ]
 
     yield {"status": "Executing ffmpeg command to stitch audio tracks..."}
     try:

@@ -1,6 +1,5 @@
 agents
-cli
+cli_fallback
 cli_launcher
 pipeline_runner
 utils
-workspace
