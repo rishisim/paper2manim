@@ -10,13 +10,63 @@ from __future__ import annotations
 
 import logging
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable
+import threading
 
 from utils.manim_runner import extract_class_name, run_manim_code
 
 logger = logging.getLogger(__name__)
+_EXECUTOR_LOCK = threading.Lock()
+_EXECUTOR: ProcessPoolExecutor | None = None
+_EXECUTOR_WORKERS = 0
+
+
+def _default_render_workers() -> int:
+    configured = (os.getenv("PAPER2MANIM_RENDER_WORKERS") or "").strip()
+    if configured:
+        try:
+            return max(1, int(configured))
+        except ValueError:
+            logger.warning("Invalid PAPER2MANIM_RENDER_WORKERS=%r; using default", configured)
+
+    cpu = os.cpu_count() or 4
+    return min(4, max(1, cpu - 1))
+
+
+def _resolve_worker_count(max_workers: int | None = None) -> int:
+    if max_workers is None:
+        return _default_render_workers()
+    return max(1, int(max_workers))
+
+
+def _get_executor(max_workers: int | None = None) -> ProcessPoolExecutor:
+    workers = _resolve_worker_count(max_workers)
+
+    global _EXECUTOR, _EXECUTOR_WORKERS
+    with _EXECUTOR_LOCK:
+        if _EXECUTOR is None or _EXECUTOR_WORKERS != workers:
+            if _EXECUTOR is not None:
+                _EXECUTOR.shutdown(wait=False, cancel_futures=False)
+            _EXECUTOR = ProcessPoolExecutor(max_workers=workers)
+            _EXECUTOR_WORKERS = workers
+        return _EXECUTOR
+
+
+def submit_render_job(job: RenderJob, max_workers: int | None = None) -> Future[RenderResult]:
+    """Submit a single render job to the shared executor."""
+    return _get_executor(max_workers).submit(_render_single, job)
+
+
+def reset_render_executor() -> None:
+    """Shutdown the shared executor. Intended for tests."""
+    global _EXECUTOR, _EXECUTOR_WORKERS
+    with _EXECUTOR_LOCK:
+        if _EXECUTOR is not None:
+            _EXECUTOR.shutdown(wait=False, cancel_futures=False)
+        _EXECUTOR = None
+        _EXECUTOR_WORKERS = 0
 
 
 @dataclass
@@ -88,28 +138,26 @@ def render_parallel(
     if not jobs:
         return []
 
-    if max_workers is None:
-        cpu = os.cpu_count() or 4
-        max_workers = min(len(jobs), max(1, cpu - 1))
+    max_workers = _resolve_worker_count(max_workers)
 
     results_map: dict[int, RenderResult] = {}
+    executor = _get_executor(max_workers)
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        future_to_id = {
-            executor.submit(_render_single, job): job.segment_id for job in jobs
-        }
+    future_to_id = {
+        executor.submit(_render_single, job): job.segment_id for job in jobs
+    }
 
-        for future in as_completed(future_to_id):
-            seg_id = future_to_id[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                logger.error("Future result retrieval failed for segment %d: %s", seg_id, exc)
-                result = RenderResult(segment_id=seg_id, success=False, error=str(exc))
+    for future in as_completed(future_to_id):
+        seg_id = future_to_id[future]
+        try:
+            result = future.result()
+        except Exception as exc:
+            logger.error("Future result retrieval failed for segment %d: %s", seg_id, exc)
+            result = RenderResult(segment_id=seg_id, success=False, error=str(exc))
 
-            results_map[seg_id] = result
-            if on_complete:
-                on_complete(result)
+        results_map[seg_id] = result
+        if on_complete:
+            on_complete(result)
 
     # Return in original job order
     return [results_map[job.segment_id] for job in jobs]

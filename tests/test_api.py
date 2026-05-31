@@ -1,7 +1,4 @@
-"""Tests for the agents.coder module — model config, tool definitions, and helpers.
-
-Does NOT make real API calls; all Anthropic interactions are mocked.
-"""
+"""Tests for the agents.coder module — model config, tool definitions, and helpers."""
 
 from __future__ import annotations
 
@@ -22,23 +19,23 @@ def test_model_constants_exist():
 
 def test_get_model_for_complexity_complex():
     from agents.coder import _get_model_for_complexity
-    from agents.config import CLAUDE_OPUS as MODEL_PRO
+    from agents.config import resolve_stage_model
 
-    assert _get_model_for_complexity("complex") == MODEL_PRO
+    assert _get_model_for_complexity("complex") == resolve_stage_model("code", complexity="complex").model
 
 
 def test_get_model_for_complexity_simple():
     from agents.coder import _get_model_for_complexity
-    from agents.config import CLAUDE_SONNET as MODEL_FAST
+    from agents.config import resolve_stage_model
 
-    assert _get_model_for_complexity("simple") == MODEL_FAST
+    assert _get_model_for_complexity("simple") == resolve_stage_model("code", complexity="simple").model
 
 
 def test_get_model_for_complexity_default():
     from agents.coder import _get_model_for_complexity
-    from agents.config import CLAUDE_OPUS as MODEL_PRO
+    from agents.config import resolve_stage_model
 
-    assert _get_model_for_complexity() == MODEL_PRO
+    assert _get_model_for_complexity() == resolve_stage_model("code", complexity="complex").model
 
 
 # ---------------------------------------------------------------------------
@@ -158,35 +155,23 @@ def test_dispatch_tool_call_search_web(mock_search):
 
 
 # ---------------------------------------------------------------------------
-# run_coder_agent yields expected structure (mocked API)
+# run_coder_agent yields expected structure (mocked generation)
 # ---------------------------------------------------------------------------
 
-def _make_mock_response(text: str = "from manim import *\nclass S(Scene):\n  def construct(self): pass"):
-    """Create a mock Anthropic Messages response with a single text block."""
-    block = MagicMock()
-    block.type = "text"
-    block.text = text
-    resp = MagicMock()
-    resp.content = [block]
-    resp.stop_reason = "end_turn"
-    return resp
-
-
 @patch("agents.coder.dry_run_manim_code")
-@patch("agents.coder.anthropic")
-def test_run_coder_agent_yields_status_dicts(mock_anthropic_mod, mock_run_manim):
+@patch("agents.coder.generate_manim_script")
+def test_run_coder_agent_yields_status_dicts(mock_generate, mock_run_manim):
     """run_coder_agent should yield dicts with 'status' and end with 'final'."""
     from agents.coder import run_coder_agent
 
-    # Mock the Anthropic client
-    mock_client = MagicMock()
-    mock_anthropic_mod.Anthropic.return_value = mock_client
-    mock_client.messages.create.return_value = _make_mock_response()
+    mock_generate.return_value = iter([
+        "looking up docs",
+        "from manim import *\nclass S(Scene):\n    def construct(self):\n        self.wait(1)\n",
+    ])
 
-    # Mock Manim execution: simulate success
     mock_run_manim.return_value = {
         "success": True,
-        "video_path": "/tmp/test.mp4",
+        "video_path": None,
         "error": None,
     }
 
@@ -203,17 +188,17 @@ def test_run_coder_agent_yields_status_dicts(mock_anthropic_mod, mock_run_manim)
 
 
 @patch("agents.coder.dry_run_manim_code")
-@patch("agents.coder.anthropic")
-def test_run_coder_agent_includes_tool_call_counts(mock_anthropic_mod, mock_run_manim):
+@patch("agents.coder.generate_manim_script")
+def test_run_coder_agent_includes_tool_call_counts(mock_generate, mock_run_manim):
     from agents.coder import run_coder_agent
 
-    mock_client = MagicMock()
-    mock_anthropic_mod.Anthropic.return_value = mock_client
-    mock_client.messages.create.return_value = _make_mock_response()
+    mock_generate.return_value = iter([
+        "from manim import *\nclass S(Scene):\n    def construct(self):\n        self.wait(1)\n",
+    ])
 
     mock_run_manim.return_value = {
         "success": True,
-        "video_path": "/tmp/test.mp4",
+        "video_path": None,
         "error": None,
     }
 

@@ -5,6 +5,7 @@
 
 import { spawnRunner } from './process.js';
 import type { PipelineArgs, QuestionDef, PipelineUpdate } from './types.js';
+import { getQuestionOptions } from './questionnaire.js';
 
 export async function runPrintMode(
   args: PipelineArgs,
@@ -28,7 +29,7 @@ export async function runPrintMode(
         const questions = msg.questions as QuestionDef[];
         const answers: Record<string, string> = {};
         for (const q of questions) {
-          answers[q.id] = q.default ?? (q.options[0] ?? '');
+          answers[q.id] = q.default ?? (getQuestionOptions(q)[0]?.value ?? '');
         }
         if (proc.stdin?.writable) {
           proc.stdin.write(JSON.stringify({ type: 'answers', answers }) + '\n');

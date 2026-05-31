@@ -5,7 +5,7 @@ import { formatDuration, renderProgressBar, renderProgressBarAscii, renderIndete
 import { useAppContext } from '../context/AppContext.js';
 import { useClaudeSpinner } from '../hooks/useClaudeSpinner.js';
 import { useTerminalWidth } from '../hooks/useTerminalWidth.js';
-import type { ActivityGroup, ActivitySeverity, ProgressMode } from '../lib/types.js';
+import type { ActivityGroup, ActivitySeverity, ProgressMode, ReasoningKind, RunEventRecord } from '../lib/types.js';
 
 export type ActivityKind = 'tool_call' | 'thinking' | 'status' | 'tool_result' | 'diff';
 
@@ -20,6 +20,9 @@ export interface ActivityLine {
   segmentId?: number;
   group?: ActivityGroup;
   severity?: ActivitySeverity;
+  eventId?: string;
+  event?: RunEventRecord;
+  reasoningKind?: ReasoningKind;
 }
 
 interface StatusBarProps {
@@ -162,6 +165,12 @@ export function getActivityKindLabel(kind: ActivityKind, compact: boolean): stri
   return kind === 'tool_call' ? 'tool' : kind === 'tool_result' ? 'out' : kind === 'thinking' ? 'think' : kind === 'diff' ? 'diff' : 'status';
 }
 
+export function reasoningLabel(kind: ReasoningKind | undefined): string {
+  if (kind === 'raw_reasoning') return 'Reasoning (model)';
+  if (kind === 'inferred_reasoning') return 'Inference (UI summary)';
+  return 'Status';
+}
+
 function buildFailureTransition(lines: ActivityLine[]): string | null {
   const latest = [...lines].reverse().find(line => (line.severity ?? inferSeverity(line.text)) === 'critical');
   if (!latest) return null;
@@ -273,6 +282,8 @@ function ActivityLineRow({ line, termWidth, verbose }: { line: ActivityLine; ter
     return (
       <Box paddingLeft={2}>
         <Text color={labelColor}>[{label}] </Text>
+        <Text color={themeColors.accent}>{reasoningLabel(line.reasoningKind)}</Text>
+        <Text color={themeColors.dim}> </Text>
         <Text color={textColor} italic>
           {truncatePreserveTail(line.text, termWidth, compact ? 8 : 12)}
           {repeat ? <Text color={themeColors.warn}>{repeat}</Text> : null}

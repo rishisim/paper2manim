@@ -70,8 +70,8 @@ def _emit(msg: dict) -> None:
             pass  # stdout itself is broken; nothing we can do
 
 
-def _read_stdin_line(timeout_seconds: float = 30.0) -> str | None:
-    """C8: Read one line from stdin with a timeout.
+def _read_stdin_line(timeout_seconds: float | None = 30.0) -> str | None:
+    """Read one line from stdin with an optional timeout.
 
     Returns the stripped line, or None if the timeout expired or EOF was reached.
     Uses select() on Unix; falls back to a blocking read on Windows (no select).
@@ -87,6 +87,273 @@ def _read_stdin_line(timeout_seconds: float = 30.0) -> str | None:
 
     line = sys.stdin.readline()
     return line.strip() if line else None
+
+
+def _default_questionnaire_answers() -> dict[str, str]:
+    return {
+        "video_length": "Medium (3-5 min)",
+        "target_audience": "Undergraduate",
+        "visual_style": "Let the AI decide",
+        "pacing": "Balanced",
+        "quality_mode": "balanced",
+        "narration_style": "standard",
+    }
+
+
+def _build_questionnaire() -> list[dict]:
+    return [
+        {
+            "id": "audience_profile",
+            "question": "Who is this video for?",
+            "helperText": "We will tune the vocabulary, assumed background, and examples to match the viewer.",
+            "stage": "goal",
+            "summaryLabel": "Audience",
+            "default": "undergraduate",
+            "options": [
+                {
+                    "value": "high_school",
+                    "label": "High school learner",
+                    "description": "More intuition, lighter jargon, and slower scaffolding.",
+                    "mapsTo": {"target_audience": "High school student", "narration_style": "intuitive"},
+                },
+                {
+                    "value": "undergraduate",
+                    "label": "Undergraduate",
+                    "description": "Balanced intuition and formalism for a typical college-level viewer.",
+                    "recommended": True,
+                    "mapsTo": {"target_audience": "Undergraduate", "narration_style": "standard"},
+                },
+                {
+                    "value": "advanced",
+                    "label": "Graduate / professional",
+                    "description": "Assumes stronger background and supports denser explanations.",
+                    "mapsTo": {"target_audience": "Graduate / Professional", "narration_style": "concise"},
+                },
+                {
+                    "value": "general",
+                    "label": "Curious general audience",
+                    "description": "Prioritizes accessibility and motivation over technical detail.",
+                    "mapsTo": {"target_audience": "General audience", "narration_style": "intuitive"},
+                },
+            ],
+        },
+        {
+            "id": "lesson_goal",
+            "question": "What should the video emphasize?",
+            "helperText": "This choice shapes the storyboard and what the visuals spend the most time on.",
+            "stage": "goal",
+            "summaryLabel": "Teaching focus",
+            "default": "intuition",
+            "options": [
+                {
+                    "value": "intuition",
+                    "label": "Build intuition first",
+                    "description": "Use diagrams and conceptual framing to make the idea click.",
+                    "recommended": True,
+                    "mapsTo": {"visual_style": "Geometric intuition", "narration_style": "intuitive"},
+                },
+                {
+                    "value": "derivation",
+                    "label": "Walk through the derivation",
+                    "description": "Spend more time unpacking the math step by step.",
+                    "mapsTo": {"visual_style": "Step-by-step derivation", "narration_style": "concise"},
+                },
+                {
+                    "value": "applications",
+                    "label": "Show why it matters",
+                    "description": "Anchor the explanation in real-world use cases and consequences.",
+                    "mapsTo": {"visual_style": "Real-world applications", "narration_style": "standard"},
+                },
+                {
+                    "value": "auto",
+                    "label": "Pick the best angle for me",
+                    "description": "Let the planner choose the clearest teaching approach for this topic.",
+                    "mapsTo": {"visual_style": "Let the AI decide", "narration_style": "standard"},
+                },
+            ],
+        },
+        {
+            "id": "depth_level",
+            "question": "How deep should the explanation go?",
+            "helperText": "Depth affects both runtime and pacing. You can still review everything before starting.",
+            "stage": "goal",
+            "summaryLabel": "Depth",
+            "default": "standard",
+            "options": [
+                {
+                    "value": "quick",
+                    "label": "Quick overview",
+                    "description": "Fast intuition, key idea, and a short runtime.",
+                    "mapsTo": {"video_length": "Short (1-2 min)", "pacing": "Fast and dense"},
+                },
+                {
+                    "value": "standard",
+                    "label": "Solid walkthrough",
+                    "description": "A balanced explanation with time for intuition and one core example.",
+                    "recommended": True,
+                    "mapsTo": {"video_length": "Medium (3-5 min)", "pacing": "Balanced"},
+                },
+                {
+                    "value": "deep",
+                    "label": "Deep dive",
+                    "description": "Longer runtime with more structure, context, and slower build-up.",
+                    "mapsTo": {"video_length": "Long (5-10 min)", "pacing": "Slow and exploratory"},
+                },
+            ],
+        },
+        {
+            "id": "production_priority",
+            "question": "What should we optimize for?",
+            "helperText": "Higher polish can improve visual quality, but it generally takes longer to finish.",
+            "stage": "refine",
+            "summaryLabel": "Production priority",
+            "default": "balanced",
+            "options": [
+                {
+                    "value": "fast",
+                    "label": "Finish faster",
+                    "description": "Prioritize turnaround time over extra refinement passes.",
+                    "mapsTo": {"quality_mode": "fast"},
+                },
+                {
+                    "value": "balanced",
+                    "label": "Balanced",
+                    "description": "A good default when you want solid quality without over-optimizing.",
+                    "recommended": True,
+                    "mapsTo": {"quality_mode": "balanced"},
+                },
+                {
+                    "value": "polished",
+                    "label": "Polish the result",
+                    "description": "Spend more time refining visuals and cleanup for a stronger final pass.",
+                    "mapsTo": {"quality_mode": "polished"},
+                },
+            ],
+        },
+        {
+            "id": "narration_feel",
+            "question": "What narration style should we use?",
+            "helperText": "Only shown when the audience or teaching angle suggests there is a meaningful tone choice to make.",
+            "stage": "refine",
+            "summaryLabel": "Narration",
+            "default": "guided",
+            "showWhen": {
+                "anyOf": [
+                    {"questionId": "audience_profile", "values": ["high_school", "general"]},
+                    {"questionId": "lesson_goal", "values": ["intuition", "applications"]},
+                ]
+            },
+            "options": [
+                {
+                    "value": "guided",
+                    "label": "Guided and intuitive",
+                    "description": "More conversational framing and connective tissue between ideas.",
+                    "recommended": True,
+                    "mapsTo": {"narration_style": "intuitive"},
+                },
+                {
+                    "value": "balanced",
+                    "label": "Standard teaching voice",
+                    "description": "Direct and explanatory without being too dense or too casual.",
+                    "mapsTo": {"narration_style": "standard"},
+                },
+                {
+                    "value": "compact",
+                    "label": "Compact and technical",
+                    "description": "Lean toward tighter wording and less narrative scaffolding.",
+                    "mapsTo": {"narration_style": "concise"},
+                },
+            ],
+        },
+    ]
+
+
+def _question_is_visible(question: dict, answers: dict[str, str]) -> bool:
+    show_when = question.get("showWhen")
+    if not show_when:
+        return True
+
+    def _matches(rule: dict) -> bool:
+        return answers.get(rule.get("questionId")) in set(rule.get("values", []))
+
+    all_of = show_when.get("allOf") or []
+    any_of = show_when.get("anyOf") or []
+    if all_of and any(not _matches(rule) for rule in all_of):
+        return False
+    if any_of and not any(_matches(rule) for rule in any_of):
+        return False
+    return True
+
+
+def _resolve_questionnaire_defaults(questions: list[dict], answers: dict[str, str] | None = None) -> dict[str, str]:
+    resolved = dict(answers or {})
+    for _ in range(len(questions) + 2):
+        changed = False
+        for question in questions:
+            if not _question_is_visible(question, resolved):
+                continue
+            if resolved.get(question["id"]):
+                continue
+            options = question.get("options") or []
+            fallback = question.get("default") or (options[0].get("value") if options else None)
+            if fallback:
+                resolved[question["id"]] = fallback
+                changed = True
+        if not changed:
+            break
+    return resolved
+
+
+def _question_lookup(questions: list[dict]) -> dict[str, dict]:
+    return {question["id"]: question for question in questions}
+
+
+def _translate_questionnaire_answers(raw_answers: dict[str, str], questions: list[dict]) -> dict[str, str]:
+    internal = _default_questionnaire_answers()
+    question_by_id = _question_lookup(questions)
+
+    for key, value in raw_answers.items():
+        if key in internal:
+            internal[key] = value
+            continue
+
+        question = question_by_id.get(key)
+        if not question:
+            continue
+        for option in question.get("options") or []:
+            if option.get("value") != value:
+                continue
+            internal.update(option.get("mapsTo") or {})
+            break
+
+    return internal
+
+
+def _build_preferences_summary(questions: list[dict], answers: dict[str, str]) -> dict:
+    visible_questions = [question for question in questions if _question_is_visible(question, answers)]
+    summary_items = []
+    summary_parts = []
+    for question in visible_questions:
+        answer = answers.get(question["id"])
+        label = question.get("summaryLabel") or question.get("question", "").rstrip(":")
+        selected = None
+        for option in question.get("options") or []:
+            if option.get("value") == answer:
+                selected = option
+                break
+        value = (selected or {}).get("summaryLabel") or (selected or {}).get("label") or answer or "Not set"
+        summary_items.append({
+            "id": question["id"],
+            "label": label,
+            "value": value,
+            "stage": question.get("stage", "goal"),
+        })
+        summary_parts.append(f"{label}: {value}")
+
+    return {
+        "summary": " | ".join(summary_parts),
+        "summary_items": summary_items,
+    }
 
 
 def _parse_summary_metadata(project_dir: str) -> dict:
@@ -262,14 +529,8 @@ def main() -> None:
     system_prompt_prefix: str = args.get("system_prompt_prefix") or ""
     max_turns: int = int(args.get("max_turns") or 0)
     model_override: str = args.get("model") or ""
-    default_questionnaire_answers = {
-        "video_length": "Medium (3-5 min)",
-        "target_audience": "Undergraduate",
-        "visual_style": "Let the AI decide",
-        "pacing": "Balanced",
-        "quality_mode": "balanced",
-        "narration_style": "standard",
-    }
+    default_questionnaire_answers = _default_questionnaire_answers()
+    questions = _build_questionnaire()
 
     # ── Resume mode: load concept from existing project ──────────────
     resume_dir: str | None = args.get("resume_dir")
@@ -297,92 +558,22 @@ def main() -> None:
         questionnaire_answers = default_questionnaire_answers.copy()
 
     if questionnaire_answers is None:
-        questions: list[dict] = [
-            {
-                "id": "video_length",
-                "question": "Video length:",
-                "options": ["Short (1-2 min)", "Medium (3-5 min)", "Long (5-10 min)"],
-                "default": "Medium (3-5 min)",
-            },
-            {
-                "id": "target_audience",
-                "question": "Target audience:",
-                "options": [
-                    "High school student",
-                    "Undergraduate",
-                    "Graduate / Professional",
-                    "General audience",
-                ],
-                "default": "Undergraduate",
-            },
-            {
-                "id": "visual_style",
-                "question": "Visual approach:",
-                "options": [
-                    "Geometric intuition",
-                    "Step-by-step derivation",
-                    "Real-world applications",
-                    "Let the AI decide",
-                ],
-                "default": "Let the AI decide",
-            },
-            {
-                "id": "pacing",
-                "question": "Pacing:",
-                "options": [
-                    "Fast and dense",
-                    "Balanced",
-                    "Slow and exploratory",
-                ],
-                "default": "Balanced",
-            },
-            {
-                "id": "quality_mode",
-                "question": "Quality mode:",
-                "options": [
-                    "fast",
-                    "balanced",
-                    "polished",
-                ],
-                "default": "balanced",
-            },
-            {
-                "id": "narration_style",
-                "question": "Narration style:",
-                "options": [
-                    "concise",
-                    "standard",
-                    "intuitive",
-                ],
-                "default": "standard",
-            },
-        ]
-
         _emit({"type": "questions", "questions": questions})
 
-        # C8: Wait for answers on stdin with a 30-second timeout
-        line = _read_stdin_line(timeout_seconds=30.0)
+        line = _read_stdin_line(timeout_seconds=None)
         if not line:
-            _emit({"type": "error", "message": "Timeout waiting for questionnaire answers (30s). Is the CLI still running?"})
+            _emit({"type": "error", "message": "Questionnaire input stream closed before answers were received."})
             sys.exit(1)
         try:
             msg = json.loads(line)
-            questionnaire_answers = msg.get("answers", {})
+            raw_answers = _resolve_questionnaire_defaults(questions, msg.get("answers", {}))
+            questionnaire_answers = _translate_questionnaire_answers(raw_answers, questions)
         except Exception as e:
             _emit({"type": "error", "message": f"Failed to parse questionnaire answers: {e}"})
             sys.exit(1)
 
-        # Emit preference summary for the UI to display
-        vl = questionnaire_answers.get("video_length", "Medium (3-5 min)")
-        ta = questionnaire_answers.get("target_audience", "Undergraduate")
-        vs = questionnaire_answers.get("visual_style", "Let the AI decide")
-        pa = questionnaire_answers.get("pacing", "Balanced")
-        qm = questionnaire_answers.get("quality_mode", "balanced")
-        ns = questionnaire_answers.get("narration_style", "standard")
-        _emit({
-            "type": "preferences_summary",
-            "summary": f"Creating a {vl} video for {ta} | Style: {vs} | Pacing: {pa} | Quality: {qm} | Narration: {ns}",
-        })
+        summary_payload = _build_preferences_summary(questions, raw_answers)
+        _emit({"type": "preferences_summary", **summary_payload})
 
     from agents.config import DEFAULT_MODEL_PROFILE, FALLBACK_MODEL_PROFILE, normalize_model_selection
 

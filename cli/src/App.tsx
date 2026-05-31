@@ -1,18 +1,15 @@
 import { execSync, execFileSync } from 'node:child_process';
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Box, Text, Static, useApp, useInput } from 'ink';
+import path from 'node:path';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { Box, Text, useApp, useInput } from 'ink';
 import { Banner } from './components/Banner.js';
 import { ConceptInput } from './components/ConceptInput.js';
 import { WelcomeScreen } from './components/WelcomeScreen.js';
 import { Questionnaire } from './components/Questionnaire.js';
-import { StagePanel } from './components/StagePanel.js';
-import { SegmentStatus } from './components/SegmentStatus.js';
-import { StatusBar, type ActivityLine, type ActivityKind } from './components/StatusBar.js';
-import { AgentActivityPanel } from './components/AgentActivityPanel.js';
-import { SummaryTable } from './components/SummaryTable.js';
-import { ErrorPanel } from './components/ErrorPanel.js';
-import { SuccessPanel } from './components/SuccessPanel.js';
+import { type ActivityLine, type ActivityKind } from './components/StatusBar.js';
+// RunTimeline removed — replaced by RunScreen
 import { WorkspaceDashboard } from './components/WorkspaceDashboard.js';
 import { FooterStatusLine } from './components/FooterStatusLine.js';
 import { PromptBar } from './components/PromptBar.js';
@@ -22,20 +19,24 @@ import { ContextVisualizer } from './components/ContextVisualizer.js';
 import { KeybindingsHelpOverlay } from './components/KeybindingsHelpOverlay.js';
 import { KeyboardShortcuts } from './components/KeyboardShortcuts.js';
 import { PermissionPrompt } from './components/PermissionPrompt.js';
+import { RunScreen, type RunScreenErrorInfo } from './components/RunScreen.js';
+import type { FeedItem, FeedItemInput } from './lib/feedItems.js';
 import { runHooks } from './lib/hooks.js';
 import { usePipeline } from './hooks/usePipeline.js';
 import { useElapsed } from './hooks/useElapsed.js';
 import { useTerminalWidth } from './hooks/useTerminalWidth.js';
+import { useTerminalHeight } from './hooks/useTerminalHeight.js';
 import { AppContextProvider, useAppContext } from './context/AppContext.js';
 import { exportSessionToText } from './lib/session.js';
 import { loadMemory } from './lib/memory.js';
+import { appendTrace, extractStoryboardTitles, inferWorkerRole, makeTraceEntry, reduceSegmentUpdate } from './lib/segmentBoard.js';
 import { getStageConfig, segmentPhaseLabels, cleanStatus, type StageName } from './lib/theme.js';
 import { formatDuration, formatToolCall } from './lib/format.js';
 import { summarizeToolOutput } from './components/StatusBar.js';
 import { buildCompactUnifiedDiff } from './lib/codeDiff.js';
 import { collapseRunLogsForRetry, getRunLogDedupeKey, sanitizeRunLogText } from './lib/runLog.js';
 import { resolveEffectiveVerbose } from './lib/verbose.js';
-import type { CompletedStage, ProgressMode, SegmentState, Settings, Session } from './lib/types.js';
+import type { BoardActivityDot, BoardRowModel, CompletedStage, ProgressMode, ReasoningKind, RunEventRecord, SegmentState, Settings, Session } from './lib/types.js';
 import { PERMISSION_MODES } from './lib/types.js';
 
 interface AppProps {
@@ -109,6 +110,96 @@ function classifyActivitySeverity(text: unknown): 'normal' | 'warning' | 'critic
   return 'normal';
 }
 
+function eventIdFor(event: Pick<RunEventRecord, 'run_id' | 'seq'>): string {
+  return `event:${event.run_id}:${event.seq}`;
+}
+
+function inferReasoningKindFromText(text: string): ReasoningKind {
+  return /generating|looking up|repairing|validating|verifying|applying|timing normalized/i.test(text)
+    ? 'inferred_reasoning'
+    : 'status_summary';
+}
+
+function reasoningLabel(kind: ReasoningKind): string {
+  if (kind === 'raw_reasoning') return 'Reasoning (model)';
+  if (kind === 'inferred_reasoning') return 'Inference (UI summary)';
+  return 'Status summary';
+}
+
+function buildToolPreview(name: string, output: string): string {
+  return `${name}: ${summarizeToolOutput(output, 132)}`;
+}
+
+function relativeAge(updatedAt: number | undefined, now: number): string | undefined {
+  if (!updatedAt) return undefined;
+  const seconds = Math.max(0, Math.round((now - updatedAt) / 1000));
+  return `${seconds}s`;
+}
+
+function compactCodePreview(code: string | undefined, maxLines: number): string[] | undefined {
+  if (!code) return undefined;
+  const lines = code.split('\n').slice(-maxLines).map(line => line.replace(/\t/g, '    '));
+  return lines.length > 0 ? lines : undefined;
+}
+
+function activityDotsForSegment(segment: SegmentState): BoardActivityDot[] {
+  const dots: BoardActivityDot[] = [];
+  if (segment.latestReasoningKind) dots.push('reasoning');
+  if (segment.lastToolCall || segment.lastToolResult) dots.push('tool');
+  if (segment.latestCodeSummary || segment.liveCode) dots.push('code');
+  if (segment.latestWarning) dots.push('warning');
+  if (segment.done) dots.push('done');
+  return dots;
+}
+
+function renderSingleLineBlock(text: string, maxLength: number): string {
+  const compact = text.replace(/\s+/g, ' ').trim();
+  if (compact.length <= maxLength) return compact;
+  return `${compact.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function compactToolPreview(segment: SegmentState, width: number): string | undefined {
+  const maxLength = width < 100 ? 24 : 34;
+  if (segment.lastToolResult?.output) {
+    return renderSingleLineBlock(summarizeToolOutput(segment.lastToolResult.output, maxLength), maxLength);
+  }
+  if (segment.lastToolCall) {
+    return renderSingleLineBlock(formatToolCall(segment.lastToolCall.name, segment.lastToolCall.params), maxLength);
+  }
+  return undefined;
+}
+
+function selectedEventDetailLines(event: RunEventRecord | undefined): string[] {
+  if (!event) return ['No event selected.'];
+  const lines: string[] = [];
+  lines.push(event.message);
+  if (event.source || event.worker_role || event.channel) {
+    lines.push('');
+    lines.push(`source: ${event.source ?? 'unknown'}`);
+    if (event.worker_role) lines.push(`worker: ${event.worker_role}`);
+    if (event.channel) lines.push(`channel: ${event.channel}`);
+  }
+  if (event.reasoning) {
+    lines.push('');
+    lines.push(`reasoning: ${reasoningLabel(event.reasoning.kind)}`);
+  }
+  if (event.tool) {
+    lines.push('');
+    lines.push(`tool: ${event.tool.name}`);
+    if (event.tool.output_preview) lines.push(`preview: ${event.tool.output_preview}`);
+  }
+  if (event.detail) {
+    lines.push('');
+    lines.push(...event.detail.split('\n').map(s => s.trimEnd()).filter(Boolean));
+  }
+  if (event.data && Object.keys(event.data).length > 0) {
+    lines.push('');
+    lines.push('data:');
+    lines.push(...JSON.stringify(event.data, null, 2).split('\n'));
+  }
+  return lines;
+}
+
 function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAudio = false, workspace = false, resumeDir, verbose, renderTimeout, ttsTimeout, systemPrompt, maxTurns }: Omit<AppProps, 'settings' | 'session' | 'gitBranch' | 'noSessionPersistence' | 'quality'> & { quality?: 'low'|'medium'|'high' }) {
   const { exit } = useApp();
   const {
@@ -135,10 +226,12 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
 
   const pipeline = usePipeline({ verbose, onTokenUsage: addTokenUsage });
   const termWidth = useTerminalWidth();
+  const termHeight = useTerminalHeight();
 
   const initialScreen: Screen = workspace ? 'workspace' : (initialConcept || resumeDir) ? 'running' : 'input';
   const [screen, setScreen] = useState<Screen>(initialScreen);
   const [concept, setConcept] = useState(initialConcept ?? '');
+  // runViewMode removed — RunScreen is the single view now
 
   // All rendered log items (scroll region via Static)
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
@@ -147,6 +240,72 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
   const activeRunLogStartRef = useRef(0);
   const [collapsedHistoryCount, setCollapsedHistoryCount] = useState(0);
   useEffect(() => { activeRunLogStartRef.current = activeRunLogStart; }, [activeRunLogStart]);
+
+  // Durable run-event journal (NDJSON). Keeps full history even when UI collapses.
+  const runIdRef = useRef(`run-${Date.now()}`);
+  const runSeqRef = useRef(0);
+  const runEventsRef = useRef<RunEventRecord[]>([]);
+  const runEventPathRef = useRef<string | null>(null);
+  const runProjectDirRef = useRef<string | null>(null);
+  const [runEventPathDisplay, setRunEventPathDisplay] = useState<string | null>(null);
+  const [runEventVersion, setRunEventVersion] = useState(0);
+  // Board navigation (used by RunScreen's SegmentListCompact)
+  const [boardSelectedSegmentId, setBoardSelectedSegmentId] = useState<number | undefined>(undefined);
+  const [boardScrollOffset, setBoardScrollOffset] = useState(0);
+  const [boardFollowMode, setBoardFollowMode] = useState(true);
+
+  const defaultRunEventPath = useCallback((runId: string) => {
+    const folder = path.join(process.cwd(), 'output', '.run_events');
+    if (!existsSync(folder)) mkdirSync(folder, { recursive: true });
+    return path.join(folder, `${runId}.ndjson`);
+  }, []);
+
+  const writeRunEvent = useCallback((event: RunEventRecord) => {
+    runEventsRef.current.push(event);
+    setRunEventVersion(v => v + 1);
+    const journalPath = runEventPathRef.current ?? defaultRunEventPath(runIdRef.current);
+    runEventPathRef.current = journalPath;
+    setRunEventPathDisplay(journalPath);
+    appendFileSync(journalPath, `${JSON.stringify(event)}\n`, 'utf-8');
+  }, [defaultRunEventPath]);
+
+  const switchRunEventPathToProject = useCallback((projectDir: string) => {
+    if (!projectDir) return;
+    if (runProjectDirRef.current === projectDir && runEventPathRef.current === path.join(projectDir, 'run_events.ndjson')) {
+      return;
+    }
+    if (!existsSync(projectDir)) return;
+    runProjectDirRef.current = projectDir;
+    const nextPath = path.join(projectDir, 'run_events.ndjson');
+    const payload = runEventsRef.current.map(ev => JSON.stringify(ev)).join('\n');
+    writeFileSync(nextPath, payload.length > 0 ? `${payload}\n` : '', 'utf-8');
+    runEventPathRef.current = nextPath;
+    setRunEventPathDisplay(nextPath);
+  }, []);
+
+  const addRunEvent = useCallback((event: Omit<RunEventRecord, 'run_id' | 'seq' | 'ts'>) => {
+    const record: RunEventRecord = {
+      run_id: runIdRef.current,
+      seq: runSeqRef.current++,
+      ts: new Date().toISOString(),
+      ...event,
+    };
+    writeRunEvent(record);
+    return record;
+  }, [writeRunEvent]);
+
+  const resetRunEventJournal = useCallback((label: string) => {
+    runIdRef.current = `run-${Date.now()}`;
+    runSeqRef.current = 0;
+    runEventsRef.current = [];
+    runProjectDirRef.current = null;
+    runEventPathRef.current = defaultRunEventPath(runIdRef.current);
+    setRunEventPathDisplay(runEventPathRef.current);
+    addRunEvent({ kind: 'run_marker', message: label, source: 'ui_derived' });
+    setBoardSelectedSegmentId(undefined);
+    setBoardScrollOffset(0);
+    setBoardFollowMode(true);
+  }, [addRunEvent, defaultRunEventPath]);
 
   const addLog = (entry: Omit<LogEntry, 'id'>) => {
     const id = `log-${logIdCounter.current++}`;
@@ -175,11 +334,86 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
   const [statusDetail, setStatusDetail] = useState('');
   const statusDetailRef = useRef('');
   const [completedStages, setCompletedStages] = useState<CompletedStage[]>([]);
+  const completedStagesRef = useRef<CompletedStage[]>([]);
+  // inspectRows removed — RunScreen replaces the inspect view
 
   // Activity stream (Claude Code-style) — recent activity lines for live display
   const [activityLines, setActivityLines] = useState<ActivityLine[]>([]);
   const activityIdCounter = useRef(0);
   const segmentCodeCacheRef = useRef<Map<number, string>>(new Map());
+
+  // ── Streaming feed state ─────────────────────────────────────
+  const [runState, setRunState] = useState<'active' | 'complete' | 'error'>('active');
+  const [segmentCodes, setSegmentCodes] = useState<Map<number, string>>(new Map());
+  const [codeRecentChanges, setCodeRecentChanges] = useState<Map<number, Set<number>>>(new Map());
+  const [feedItems, setFeedItems] = useState<FeedItem[]>([]);
+  const [feedScrollOffset, setFeedScrollOffset] = useState(0);
+  const feedAutoScroll = useRef(true);
+  const [feedExpandedItems, setFeedExpandedItems] = useState<Set<string>>(new Set());
+  const [feedSelectedIndex, setFeedSelectedIndex] = useState(0);
+  const feedIdCounter = useRef(0);
+
+  // Completion/error info for RunScreen
+  const [lastFinalUpdate, setLastFinalUpdate] = useState<import('./lib/types.js').PipelineUpdate | undefined>(undefined);
+  const [lastErrorInfo, setLastErrorInfo] = useState<RunScreenErrorInfo | undefined>(undefined);
+
+  const boardRows = useMemo(() => {
+    const now = Date.now();
+    return [...segments.values()]
+      .sort((a, b) => a.id - b.id)
+      .map((segment): BoardRowModel => ({
+        segmentId: segment.id,
+        title: segment.title,
+        state: segment.failed
+          ? 'failed'
+          : segment.done
+            ? 'done'
+            : segment.latestWarning
+              ? 'warning'
+              : segment.updatedAt
+                ? 'live'
+                : 'queued',
+        statusPipState: segment.failed
+          ? 'failed'
+          : segment.done
+            ? 'done'
+            : segment.latestWarning
+              ? 'warning'
+              : segment.updatedAt
+                ? 'live'
+                : 'queued',
+        currentAction: renderSingleLineBlock(segment.currentTask ?? segment.prettyPhase, termWidth < 96 ? 28 : 42),
+        primarySummary: renderSingleLineBlock(
+          [
+            segment.title ? `S${segment.id} ${segment.title}` : `S${segment.id}`,
+            renderSingleLineBlock(segment.currentTask ?? segment.prettyPhase, termWidth < 96 ? 24 : 38),
+          ].filter(Boolean).join(' · '),
+          termWidth < 96 ? 56 : 88,
+        ),
+        secondarySummary: [
+          segment.liveThinking
+            ? `${segment.latestReasoningKind === 'raw_reasoning' ? 'reasoning' : segment.latestReasoningKind === 'inferred_reasoning' ? 'inference' : 'status'} ${renderSingleLineBlock(segment.liveThinking, termWidth < 96 ? 26 : 40)}`
+            : undefined,
+          compactToolPreview(segment, termWidth),
+        ].filter(Boolean).join(' · ') || undefined,
+        reasoningLabel: segment.latestReasoningKind === 'raw_reasoning' ? 'Reasoning' : segment.latestReasoningKind === 'inferred_reasoning' ? 'Inference' : undefined,
+        reasoningPreview: segment.liveThinking ? renderSingleLineBlock(segment.liveThinking, termWidth < 100 ? 26 : 36) : undefined,
+        toolPreview: compactToolPreview(segment, termWidth),
+        codePreview: compactCodePreview(segment.liveCode ?? segmentCodes.get(segment.id), termHeight < 28 ? 2 : 4),
+        selectedReasoningPreview: segment.liveThinking ? renderSingleLineBlock(segment.liveThinking, termWidth < 96 ? 140 : 220) : undefined,
+        selectedCodePreview: compactCodePreview(segment.liveCode ?? segmentCodes.get(segment.id), termHeight < 28 ? 3 : 5),
+        selectedToolPreview: segment.lastToolResult?.output
+          ? buildToolPreview(segment.lastToolResult.name, segment.lastToolResult.output)
+          : segment.lastToolCall
+            ? formatToolCall(segment.lastToolCall.name, segment.lastToolCall.params)
+            : undefined,
+        activityDots: activityDotsForSegment(segment),
+        updatedAgo: relativeAge(segment.updatedAt, now),
+        lastUpdatedAt: segment.updatedAt,
+        isExpandable: Boolean(segment.liveThinking || segment.liveCode || segment.lastToolResult || segment.lastToolCall || segment.latestCodeSummary),
+      }));
+  }, [segments, segmentCodes, termHeight, termWidth]);
+  const boardWindowRows = Math.max(4, termHeight < 28 ? termHeight - 10 : termHeight - 12);
 
   const setCurrentStageTracked = (next: StageName | null) => {
     currentStageRef.current = next;
@@ -207,12 +441,55 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
     const safeDetail = line.detail === undefined ? undefined : coerceText(line.detail);
     const mappedKind: ActivityKind = line.kind ?? line.type ?? 'status';
     const groupKey = line.groupKey ?? `${mappedKind}:${line.segmentId ?? 'global'}:${activityPrefix(safeText)}`;
+    let eventRecord: RunEventRecord | undefined = line.event;
+    if (!eventRecord) {
+      eventRecord = addRunEvent({
+        kind: 'activity',
+        message: safeText,
+        stage: currentStageRef.current,
+        segment_id: line.segmentId,
+        detail: safeDetail,
+        source: mappedKind === 'thinking'
+          ? line.reasoningKind === 'raw_reasoning' ? 'provider_stream' : 'ui_derived'
+          : mappedKind === 'tool_call' || mappedKind === 'tool_result'
+            ? 'tool_runtime'
+            : 'pipeline_status',
+        reasoning: mappedKind === 'thinking' && line.reasoningKind
+          ? { kind: line.reasoningKind, text: safeText }
+          : undefined,
+        data: {
+          activity_kind: mappedKind,
+          group_key: groupKey,
+          group: line.group,
+          severity: line.severity,
+        },
+      });
+    }
     setActivityLines(prev => {
       // Keep a rolling window of last 90 lines (collapsed later in StatusBar).
-      const next = [...prev, { id, ...line, text: safeText, detail: safeDetail, kind: mappedKind, groupKey }];
+      const next = [...prev, {
+        id,
+        ...line,
+        text: safeText,
+        detail: safeDetail,
+        kind: mappedKind,
+        groupKey,
+        eventId: eventRecord ? eventIdFor(eventRecord) : line.eventId,
+        event: eventRecord,
+      }];
       return next.length > 90 ? next.slice(-90) : next;
     });
+    return eventRecord;
   };
+
+  // ── Feed item builder ────────────────────────────────────────
+  const addFeedItem = useCallback((item: FeedItemInput) => {
+    const id = `feed-${feedIdCounter.current++}`;
+    setFeedItems(prev => [...prev, { ...item, id } as FeedItem]);
+    if (feedAutoScroll.current) {
+      setFeedScrollOffset(Infinity); // clamped by StreamingFeed
+    }
+  }, []);
 
   // Track previous segment phases to only log on phase transitions
   const prevSegPhases = useRef<Map<number, string>>(new Map());
@@ -277,6 +554,39 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
   useEffect(() => { stageStartTimeRef.current = stageStartTime; }, [stageStartTime]);
   useEffect(() => { statusDetailRef.current = statusDetail; }, [statusDetail]);
   useEffect(() => { segmentsRef.current = segments; }, [segments]);
+  useEffect(() => {
+    if (feedItems.length === 0) {
+      setFeedSelectedIndex(0);
+      return;
+    }
+    setFeedSelectedIndex(prev => Math.max(0, Math.min(prev, feedItems.length - 1)));
+  }, [feedItems.length]);
+  // Board follow-mode: auto-select the most active segment
+  useEffect(() => {
+    if (boardRows.length === 0) {
+      setBoardSelectedSegmentId(undefined);
+      setBoardScrollOffset(0);
+      return;
+    }
+    if (boardFollowMode) {
+      const live = [...boardRows]
+        .sort((a, b) => {
+          const stateRank = (row: BoardRowModel) => row.state === 'live' ? 4 : row.state === 'warning' ? 3 : row.state === 'queued' ? 2 : row.state === 'done' ? 1 : 0;
+          const rankGap = stateRank(b) - stateRank(a);
+          if (rankGap !== 0) return rankGap;
+          return (b.lastUpdatedAt ?? 0) - (a.lastUpdatedAt ?? 0);
+        })[0];
+      if (live) setBoardSelectedSegmentId(live.segmentId);
+      const selectedIndex = live ? boardRows.findIndex(row => row.segmentId === live.segmentId) : 0;
+      setBoardScrollOffset(Math.max(0, Math.min(selectedIndex, Math.max(0, boardRows.length - boardWindowRows))));
+      return;
+    }
+    setBoardSelectedSegmentId(prev => {
+      if (prev !== undefined && boardRows.some(row => row.segmentId === prev)) return prev;
+      return boardRows[0]?.segmentId;
+    });
+    setBoardScrollOffset(prev => Math.max(0, Math.min(prev, Math.max(0, boardRows.length - boardWindowRows))));
+  }, [boardRows, boardFollowMode, boardWindowRows]);
 
   // Inline messages (e.g. from slash command confirmations)
   const [inlineMessage, setInlineMessage] = useState<{text: string; color?: string} | null>(null);
@@ -307,6 +617,20 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const escPressTime = useRef<number>(0);
+
+  const syncBoardViewport = useCallback((nextIndex: number) => {
+    if (boardRows.length === 0) return;
+    const clamped = Math.max(0, Math.min(nextIndex, boardRows.length - 1));
+    const target = boardRows[clamped];
+    setBoardSelectedSegmentId(target?.segmentId);
+    setBoardFollowMode(false);
+    setBoardScrollOffset(prev => {
+      if (clamped < prev) return clamped;
+      const pageEnd = prev + boardWindowRows - 1;
+      if (clamped > pageEnd) return Math.max(0, clamped - boardWindowRows + 1);
+      return prev;
+    });
+  }, [boardRows, boardWindowRows]);
 
   useInput((_input, key) => {
     // Ctrl+C — cancel pipeline / exit
@@ -395,10 +719,31 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
       return;
     }
 
-    // ? — toggle keyboard help overlay
-    if (_input === '?' && screen === 'running') {
-      setShowHelp(h => !h);
-      return;
+    const isRunScreen = screen === 'running';
+    if (isRunScreen) {
+      // ? — toggle help overlay
+      if (_input === '?') {
+        setShowHelp(h => !h);
+        return;
+      }
+
+      // Segment navigation (↑↓ / j/k)
+      const currentIndex = boardSelectedSegmentId !== undefined
+        ? boardRows.findIndex(row => row.segmentId === boardSelectedSegmentId)
+        : 0;
+      const safeIndex = currentIndex >= 0 ? currentIndex : 0;
+      if (key.downArrow || _input === 'j') {
+        syncBoardViewport(safeIndex + 1);
+        return;
+      }
+      if (key.upArrow || _input === 'k') {
+        syncBoardViewport(safeIndex - 1);
+        return;
+      }
+      if (_input === 'g' || _input === 'G') {
+        setBoardFollowMode(true);
+        return;
+      }
     }
 
     // Navigate back from secondary screens with Esc (handled per-screen via useInput in child components)
@@ -407,6 +752,7 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
   // Keep run markers concise to avoid duplicating banner metadata.
   const addRunMarker = (c: string, isResume = false) => {
     const prefix = isResume ? 'Resuming run' : 'Starting run';
+    resetRunEventJournal(`${prefix}: ${c}`);
     addLog({
       type: 'header',
       text: `${prefix}: ${c}`,
@@ -440,6 +786,12 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
     process.stdout.write(`\x1b]0;paper2manim: ${c.slice(0, 50)}\x07`);
     pipeline.start({ concept: c, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: buildSystemPrompt(), max_turns: maxTurns, model: currentModel });
     setScreen('running');
+    setRunState('active');
+    setLastFinalUpdate(undefined);
+    setLastErrorInfo(undefined);
+    setBoardSelectedSegmentId(undefined);
+    setBoardScrollOffset(0);
+    setBoardFollowMode(true);
   };
 
   // Handle questionnaire state
@@ -452,6 +804,12 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
   const handleQuestionnaireComplete = (answers: Record<string, string>) => {
     pipeline.answerQuestions(answers);
     setScreen('running');
+    setRunState('active');
+    setLastFinalUpdate(undefined);
+    setLastErrorInfo(undefined);
+    setBoardSelectedSegmentId(undefined);
+    setBoardScrollOffset(0);
+    setBoardFollowMode(true);
 
     // iTerm2 taskbar bounce — draw attention when pipeline starts
     process.stdout.write('\x1b]1337;RequestAttention=yes\x07');
@@ -472,10 +830,35 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
 
     for (const latest of unprocessed) {
     const stage = latest.stage as StageName;
+    if (latest.project_dir) {
+      switchRunEventPathToProject(latest.project_dir);
+    }
 
     // Track total segments
     if (latest.num_segments) {
       setTotalSegments(latest.num_segments);
+    }
+    if (latest.storyboard) {
+      const titles = extractStoryboardTitles(latest.storyboard);
+      if (titles.size > 0) {
+        setSegmentsTracked(prev => {
+          const next = new Map(prev);
+          for (const [segId, title] of titles.entries()) {
+            const existing = next.get(segId);
+            next.set(segId, existing ? { ...existing, title } : {
+              id: segId,
+              title,
+              phase: 'queued',
+              prettyPhase: 'Queued',
+              attempt: 1,
+              done: false,
+              failed: false,
+              startedAt: Date.now(),
+            });
+          }
+          return next;
+        });
+      }
     }
 
     // ── Stage transitions ───────────────────────────────────────
@@ -496,8 +879,19 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
           elapsed: stageElapsed,
           status: 'ok',
         };
-        setCompletedStages(prev => [...prev, completed]);
+        setCompletedStages(prev => { const next = [...prev, completed]; completedStagesRef.current = next; return next; });
         addLog({ type: 'stage-complete', stage: completed });
+        addRunEvent({
+          kind: 'stage_complete',
+          message: completed.summary,
+          stage: batchStage,
+          source: 'pipeline_status',
+          data: {
+            status: completed.status,
+            elapsed_seconds: stageElapsed,
+            error: completed.error,
+          },
+        });
       }
 
       // New stage header
@@ -511,7 +905,17 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
       setActivityLines([]);  // Clear activity stream on stage transition
       if (stage === 'plan' || stage === 'pipeline') {
         segmentCodeCacheRef.current = new Map();
+        setSegmentCodes(new Map());
+        setCodeRecentChanges(new Map());
       }
+      addRunEvent({
+        kind: 'stage_transition',
+        message: `Entered ${stage}`,
+        stage,
+        source: 'pipeline_status',
+      });
+      // Feed: new stage header
+      addFeedItem({ type: 'stage_header', stage, status: 'active' });
 
       if (stage === 'pipeline') {
         setSegmentsTracked(() => new Map());
@@ -521,7 +925,8 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
     }
 
     // ── Intermediate status updates ─────────────────────────────
-    // Show as regular status unless it's a segment-specific update
+    // Show as regular status unless it's a segment-specific update.
+    // Feed: only show meaningful status lines (containing data, not chatter).
     const hasSegmentId = latest.segment_id !== undefined;
     const isSegmentStage = PIPELINE_SUBSTAGES.has(stage) || stage === 'code_retry';
     if (latest.status && !(isSegmentStage && hasSegmentId)) {
@@ -529,45 +934,87 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
       setStatusDetailTracked(cleaned);
       batchStatusDetail = cleaned;
       if (cleaned) {
-        addActivity({
-          kind: 'status',
+        const reasoningKind = inferReasoningKindFromText(cleaned);
+        const statusLine = {
+          kind: 'status' as const,
           text: cleaned,
           group: classifyActivityGroup(cleaned),
           severity: classifyActivitySeverity(cleaned),
+        };
+        const event = addRunEvent({
+          kind: 'status',
+          message: cleaned,
+          stage,
+          source: 'pipeline_status',
+          reasoning: reasoningKind === 'status_summary' ? undefined : { kind: reasoningKind, text: cleaned },
         });
+        addActivity({ ...statusLine, event, eventId: eventIdFor(event) });
+        addFeedItem({ type: 'activity', line: { ...statusLine, id: '', event, eventId: eventIdFor(event) }, event, eventId: eventIdFor(event) });
       }
-      // Status lines are shown in the live activity stream; avoid duplicating in static log.
     }
 
     // ── Tool call events for ALL stages (Claude Code-style) ─────
     if (latest.tool_call && stage !== 'code' && stage !== 'code_retry') {
       const tc = latest.tool_call;
       const displayText = formatToolCall(tc.name, tc.params);
-      addActivity({
-        kind: 'tool_call',
+      const event = addRunEvent({
+        kind: 'activity',
+        message: displayText,
+        stage,
+        source: 'tool_runtime',
+        tool: { name: tc.name, params: tc.params },
+      });
+      const toolLine = {
+        kind: 'tool_call' as const,
         text: displayText,
         group: classifyActivityGroup(displayText),
         severity: classifyActivitySeverity(displayText),
-      });
+      };
+      addActivity({ ...toolLine, event, eventId: eventIdFor(event) });
+      addFeedItem({ type: 'activity', line: { ...toolLine, id: '', event, eventId: eventIdFor(event) }, event, eventId: eventIdFor(event) });
     }
     if (latest.tool_result && stage !== 'code' && stage !== 'code_retry') {
       const out = latest.tool_result.output?.trim() || '(no output)';
-      addActivity({
-        kind: 'tool_result',
-        text: `${latest.tool_result.name}: ${summarizeToolOutput(out)}`,
+      const preview = buildToolPreview(latest.tool_result.name, out);
+      const event = addRunEvent({
+        kind: 'activity',
+        message: preview,
+        stage,
+        source: 'tool_runtime',
         detail: out,
-        group: 'done',
-        severity: classifyActivitySeverity(out),
+        tool: {
+          name: latest.tool_result.name,
+          output_preview: summarizeToolOutput(out),
+        },
       });
+      const resultLine = {
+        kind: 'tool_result' as const,
+        text: preview,
+        detail: out,
+        group: 'done' as const,
+        severity: classifyActivitySeverity(out),
+      };
+      addActivity({ ...resultLine, event, eventId: eventIdFor(event) });
+      addFeedItem({ type: 'activity', line: { ...resultLine, id: '', event, eventId: eventIdFor(event) }, event, eventId: eventIdFor(event) });
     }
 
-    // ── Thinking events for ALL stages ──────────────────────────
     if (latest.thinking !== undefined && stage !== 'code' && stage !== 'code_retry') {
       if (latest.thinking) {
         const thinkText = typeof latest.thinking === 'string'
           ? latest.thinking.slice(0, 120)
           : 'Reasoning...';
-        addActivity({ kind: 'thinking', text: thinkText, group: 'checking' });
+        const reasoningKind: ReasoningKind = latest.stream_event?.channel === 'thinking' ? 'raw_reasoning' : 'inferred_reasoning';
+        const event = addRunEvent({
+          kind: 'activity',
+          message: `${reasoningLabel(reasoningKind)}: ${thinkText}`,
+          stage,
+          source: reasoningKind === 'raw_reasoning' ? 'provider_stream' : 'ui_derived',
+          channel: latest.stream_event?.channel,
+          reasoning: { kind: reasoningKind, text: thinkText },
+        });
+        const thinkLine = { kind: 'thinking' as const, text: thinkText, group: 'checking' as const, reasoningKind };
+        addActivity({ ...thinkLine, event, eventId: eventIdFor(event) });
+        addFeedItem({ type: 'activity', line: { ...thinkLine, id: '', event, eventId: eventIdFor(event) }, event, eventId: eventIdFor(event) });
       }
     }
 
@@ -594,55 +1041,20 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
         if (attemptMatch) attempt = parseInt(attemptMatch[1]!, 10);
 
         const now = Date.now();
-        const startedAt = existing?.startedAt ?? now;
-        const segState: SegmentState = {
-          id: segId,
+        const segState = reduceSegmentUpdate(existing ? { ...existing, id: segId } : { id: segId, phase, prettyPhase, attempt, done: false, failed: false }, {
+          stage,
           phase,
           prettyPhase,
+          status: latest.status ? cleanStatus(latest.status) : undefined,
+          error: latest.error,
+          now,
           attempt,
-          done: phase === 'done',
-          failed: phase === 'failed',
-          startedAt,
-          finishedAt: (phase === 'done' || phase === 'failed') ? now : existing?.finishedAt,
-          // Carry forward agent activity from previous state
-          isThinking: existing?.isThinking,
-          thinkingText: existing?.thinkingText,
-          lastStatus: existing?.lastStatus,
-          lastToolCall: existing?.lastToolCall,
-          lastToolResult: existing?.lastToolResult,
-          failHint: existing?.failHint,
-        };
-
-        // Update agent activity based on pipeline event
-        if (latest.thinking !== undefined) {
-          segState.isThinking = !!latest.thinking;
-          segState.thinkingText = typeof latest.thinking === 'string' ? latest.thinking : undefined;
-          if (latest.thinking) segState.lastToolCall = undefined;
-        }
-        if (latest.tool_call) {
-          segState.isThinking = false;
-          segState.thinkingText = undefined;
-          segState.lastToolCall = latest.tool_call;
-        }
-        if (latest.tool_result) {
-          segState.lastToolResult = latest.tool_result;
-        }
-        if (latest.status) {
-          segState.lastStatus = cleanStatus(latest.status);
-        }
-        if (phase === 'failed') {
-          segState.failHint = extractFailureHint(latest.error)
-            ?? extractFailureHint(latest.segment_status)
-            ?? extractFailureHint(latest.status)
-            ?? segState.failHint;
-        }
-        // Clear activity on completion
-        if (phase === 'done' || phase === 'failed') {
-          segState.isThinking = false;
-          segState.thinkingText = undefined;
-          segState.lastToolCall = undefined;
-          segState.lastToolResult = undefined;
-        }
+          thinking: latest.thinking,
+          toolCall: latest.tool_call,
+          toolResult: latest.tool_result,
+          streamEvent: latest.stream_event,
+        });
+        const startedAt = segState.startedAt ?? now;
         if (phase === 'done' || phase === 'failed') {
           segElapsed = Math.max(0, (now - startedAt) / 1000);
         }
@@ -656,9 +1068,36 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
       const prevPhase = prevSegPhases.current.get(segId);
       if (phase !== prevPhase) {
         prevSegPhases.current.set(segId, phase);
+        addRunEvent({
+          kind: phase === 'done' || phase === 'failed' ? 'segment_terminal' : 'segment_phase',
+          message: `Segment ${segId}: ${prettyPhase}`,
+          stage,
+          segment_id: segId,
+          source: 'pipeline_status',
+          worker_role: inferWorkerRole(stage, phase, latest.status),
+          data: {
+            previous_phase: prevPhase,
+            phase,
+            attempt: attemptMatch ? parseInt(attemptMatch[1]!, 10) : 1,
+            status: latest.status,
+          },
+        });
 
         const attemptNum = attemptMatch ? parseInt(attemptMatch[1]!, 10) : 1;
         const attemptStr = attemptNum > 1 ? ` on attempt ${attemptNum}` : '';
+
+        // Feed: segment header — only show completions/failures (not every "running" transition)
+        const segStatus = phase === 'done' ? 'done' as const : phase === 'failed' ? 'failed' as const : 'active' as const;
+        if (phase === 'done' || phase === 'failed' || runState === 'active' || verboseLiveRef.current) {
+          addFeedItem({
+            type: 'segment_header',
+            segmentId: segId,
+            label: `Segment ${segId}: ${prettyPhase}`,
+            status: segStatus,
+            elapsed: segElapsed,
+            attempt: attemptNum,
+          });
+        }
 
         if (phase === 'done') {
           const elapsedSecs = segElapsed ?? 0;
@@ -697,33 +1136,72 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
       if (latest.tool_call) {
         const tc = latest.tool_call;
         const displayText = formatToolCall(tc.name, tc.params);
-        addActivity({
-          kind: 'tool_call',
+        const event = addRunEvent({
+          kind: 'activity',
+          message: `Seg ${segId}: ${displayText}`,
+          stage,
+          segment_id: segId,
+          source: 'tool_runtime',
+          worker_role: inferWorkerRole(stage, phase, latest.status),
+          tool: { name: tc.name, params: tc.params },
+        });
+        const segToolLine = {
+          kind: 'tool_call' as const,
           text: `Seg ${segId}: ${displayText}`,
           segmentId: segId,
           group: classifyActivityGroup(displayText),
           severity: classifyActivitySeverity(displayText),
-        });
+        };
+        addActivity({ ...segToolLine, event, eventId: eventIdFor(event) });
+        addFeedItem({ type: 'activity', line: { ...segToolLine, id: '', event, eventId: eventIdFor(event) }, segmentId: segId, event, eventId: eventIdFor(event) });
       }
       if (latest.tool_result) {
         const out = latest.tool_result.output?.trim() || '(no output)';
-        addActivity({
-          kind: 'tool_result',
-          text: `Seg ${segId}: ${latest.tool_result.name}: ${summarizeToolOutput(out)}`,
+        const preview = buildToolPreview(latest.tool_result.name, out);
+        const event = addRunEvent({
+          kind: 'activity',
+          message: `Seg ${segId}: ${preview}`,
+          stage,
+          segment_id: segId,
+          source: 'tool_runtime',
+          worker_role: inferWorkerRole(stage, phase, latest.status),
+          detail: out,
+          tool: {
+            name: latest.tool_result.name,
+            output_preview: summarizeToolOutput(out),
+          },
+        });
+        const segResultLine = {
+          kind: 'tool_result' as const,
+          text: `Seg ${segId}: ${preview}`,
           detail: out,
           segmentId: segId,
-          group: 'done',
+          group: 'done' as const,
           severity: classifyActivitySeverity(out),
-        });
+        };
+        addActivity({ ...segResultLine, event, eventId: eventIdFor(event) });
+        addFeedItem({ type: 'activity', line: { ...segResultLine, id: '', event, eventId: eventIdFor(event) }, segmentId: segId, event, eventId: eventIdFor(event) });
       }
 
-      // Thinking events during code stages
       if (latest.thinking !== undefined) {
         if (latest.thinking) {
           const thinkText = typeof latest.thinking === 'string'
             ? `Seg ${segId}: ${latest.thinking.slice(0, 100)}`
             : `Seg ${segId}: Reasoning...`;
-          addActivity({ kind: 'thinking', text: thinkText, segmentId: segId, group: 'checking' });
+          const reasoningKind: ReasoningKind = latest.stream_event?.channel === 'thinking' ? 'raw_reasoning' : 'inferred_reasoning';
+          const event = addRunEvent({
+            kind: 'activity',
+            message: `${reasoningLabel(reasoningKind)}: ${thinkText}`,
+            stage,
+            segment_id: segId,
+            source: reasoningKind === 'raw_reasoning' ? 'provider_stream' : 'ui_derived',
+            worker_role: inferWorkerRole(stage, phase, latest.status),
+            channel: latest.stream_event?.channel,
+            reasoning: { kind: reasoningKind, text: thinkText },
+          });
+          const segThinkLine = { kind: 'thinking' as const, text: thinkText, segmentId: segId, group: 'checking' as const, reasoningKind };
+          addActivity({ ...segThinkLine, event, eventId: eventIdFor(event) });
+          addFeedItem({ type: 'activity', line: { ...segThinkLine, id: '', event, eventId: eventIdFor(event) }, segmentId: segId, event, eventId: eventIdFor(event) });
         }
       }
 
@@ -743,18 +1221,115 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
             contextLines: termWidth < 100 ? 0 : 1,
           });
           if (diff.hasChanges) {
-            addActivity({
-              kind: 'diff',
+            const diffLine = {
+              kind: 'diff' as const,
               segmentId: segId,
               text: `Seg ${segId} code changes (${diff.summary})`,
               detail: diff.lines.join('\n'),
-              group: 'doing',
-              severity: 'normal',
+              group: 'doing' as const,
+              severity: 'normal' as const,
               groupKey: `diff:${segId}:${diff.dedupeKey}`,
+            };
+            const diffEvent = addRunEvent({
+              kind: 'activity',
+              message: diffLine.text,
+              stage,
+              segment_id: segId,
+              source: 'ui_derived',
+              worker_role: inferWorkerRole(stage, phase, latest.status),
+              channel: 'code',
+              detail: diffLine.detail,
+            });
+            addActivity({ ...diffLine, event: diffEvent, eventId: eventIdFor(diffEvent) });
+            addFeedItem({ type: 'activity', line: { ...diffLine, id: '', event: diffEvent, eventId: eventIdFor(diffEvent) }, segmentId: segId, event: diffEvent, eventId: eventIdFor(diffEvent) });
+            setSegmentsTracked(prev => {
+              const next = new Map(prev);
+              const existing = next.get(segId);
+              if (existing) {
+                next.set(segId, {
+                  ...existing,
+                  latestCodeSummary: diff.summary,
+                  trace: appendTrace(existing.trace, makeTraceEntry('code', `${diff.summary}`, existing.currentWorker, Date.now())),
+                });
+              }
+              return next;
             });
           }
           segmentCodeCacheRef.current.set(segId, nextCode);
+
+          // Update segmentCodes state
+          setSegmentCodes(prev => {
+            const next = new Map(prev);
+            next.set(segId, nextCode);
+            return next;
+          });
+
+          // Code snapshot for the feed (first time only — subsequent updates show as diffs)
+          if (!prevCode) {
+            const lineCount = nextCode.split('\n').length;
+            addFeedItem({
+              type: 'code_snapshot',
+              segmentId: segId,
+              code: nextCode,
+              summary: `Seg ${segId}: initial code (${lineCount} lines)`,
+            });
+            setSegmentsTracked(prev => {
+              const next = new Map(prev);
+              const existing = next.get(segId);
+              if (existing) {
+                next.set(segId, {
+                  ...existing,
+                  latestCodeSummary: `initial draft (${lineCount} lines)`,
+                  trace: appendTrace(existing.trace, makeTraceEntry('code', `initial draft (${lineCount} lines)`, existing.currentWorker, Date.now())),
+                });
+              }
+              return next;
+            });
+          }
+
+          // Track recently changed lines for gutter markers
+          const prevLines = prevCode.split('\n');
+          const nextLines = nextCode.split('\n');
+          const changedLineNums = new Set<number>();
+          for (let i = 0; i < nextLines.length; i++) {
+            if (i >= prevLines.length || prevLines[i] !== nextLines[i]) {
+              changedLineNums.add(i + 1); // 1-indexed
+            }
+          }
+          if (changedLineNums.size > 0) {
+            setCodeRecentChanges(prev => {
+              const next = new Map(prev);
+              const existing = next.get(segId) ?? new Set<number>();
+              for (const ln of changedLineNums) existing.add(ln);
+              next.set(segId, existing);
+              return next;
+            });
+            // Clear change markers after 3 seconds
+            setTimeout(() => {
+              setCodeRecentChanges(prev => {
+                const next = new Map(prev);
+                const existing = next.get(segId);
+                if (existing) {
+                  for (const ln of changedLineNums) existing.delete(ln);
+                  if (existing.size === 0) next.delete(segId);
+                  else next.set(segId, existing);
+                }
+                return next;
+              });
+            }, 3000);
+          }
+
         }
+      }
+
+      if ((stage === 'code' || stage === 'code_retry') && latest.stream_event?.channel === 'code' && latest.stream_event.snapshot) {
+        const snapshot = latest.stream_event.snapshot;
+        segmentCodeCacheRef.current.set(segId, snapshot);
+        setSegmentCodes(prev => {
+          const next = new Map(prev);
+          next.set(segId, snapshot);
+          return next;
+        });
       }
     } else if ((stage === 'code' || stage === 'code_retry') && latest.status) {
       // Code stage summary updates (not segment-specific)
@@ -774,16 +1349,67 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
           status: latest.error ? 'failed' : 'ok',
           error: latest.error,
         };
-        setCompletedStages(prev => [...prev, completed]);
+        setCompletedStages(prev => { const next = [...prev, completed]; completedStagesRef.current = next; return next; });
         addLog({ type: 'stage-complete', stage: completed });
+        addRunEvent({
+          kind: 'stage_complete',
+          message: completed.summary,
+          stage: batchStage,
+          source: 'pipeline_status',
+          data: {
+            status: completed.status,
+            elapsed_seconds: stageElapsed,
+            error: completed.error,
+          },
+        });
       }
       setCurrentStageTracked('done');
       batchStage = 'done';
+      addRunEvent({
+        kind: 'final',
+        message: latest.error ? 'Run finished with error' : 'Run finished successfully',
+        stage: 'done',
+        source: 'pipeline_status',
+        data: {
+          error: latest.error,
+          project_dir: latest.project_dir,
+          video_path: latest.video_path,
+          total_elapsed_seconds: latest.total_elapsed_seconds,
+          failed_segments: latest.failed_segments?.length ?? 0,
+        },
+      });
 
       if (latest.error) {
-        setScreen('error');
+        setRunState('error');
+        setLastErrorInfo({
+          message: latest.error,
+          failedSegments: latest.failed_segments,
+          projectDir: latest.project_dir,
+          videoPath: latest.video_path,
+          tokenSummary: latest.token_summary ? {
+            estimated_cost_usd: latest.token_summary.estimated_cost_usd,
+            total_api_calls: latest.token_summary.total_api_calls,
+          } : null,
+        });
+        // Feed: error summary (kept for event journal)
+        addFeedItem({
+          type: 'error',
+          message: latest.error,
+          failedSegments: latest.failed_segments,
+          projectDir: latest.project_dir,
+          videoPath: latest.video_path,
+          completedStages: [...(completedStagesRef.current ?? [])],
+          tokenSummary: latest.token_summary,
+        });
       } else {
-        setScreen('complete');
+        setRunState('complete');
+        setLastFinalUpdate(latest);
+        // Feed: completion summary (kept for event journal)
+        addFeedItem({
+          type: 'completion',
+          finalUpdate: latest,
+          completedStages: [...(completedStagesRef.current ?? [])],
+        });
 
         // Open video in default player
         if (latest.video_path) {
@@ -877,6 +1503,12 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
       addRunMarker(dir, true);
       pipeline.start({ concept: 'resume', max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: dir, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: buildSystemPrompt(), max_turns: maxTurns, model: currentModel });
       setScreen('running');
+      setRunState('active');
+      setLastFinalUpdate(undefined);
+      setLastErrorInfo(undefined);
+      setBoardSelectedSegmentId(undefined);
+      setBoardScrollOffset(0);
+      setBoardFollowMode(true);
     },
     retryPipeline: () => {
       const lastRunError = pipeline.finalUpdate?.error;
@@ -905,11 +1537,31 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
       segmentCodeCacheRef.current = new Map();
       prevSegPhases.current.clear();
       processedIdx.current = 0;
+      // Reset run state
+      setRunState('active');
+      setSegmentCodes(new Map());
+      setCodeRecentChanges(new Map());
+      setLastFinalUpdate(undefined);
+      setLastErrorInfo(undefined);
+      setBoardSelectedSegmentId(undefined);
+      setBoardScrollOffset(0);
+      setBoardFollowMode(true);
 
       addLog({
         type: 'log',
         text: `[Fixing] Retrying failed segments (${visibleHistory} prior run line${visibleHistory === 1 ? '' : 's'} collapsed)`,
         color: themeColors.warn,
+      });
+      addRunEvent({
+        kind: 'diagnostic',
+        message: 'Retry requested for failed run',
+        stage: currentStageRef.current,
+        source: 'ui_derived',
+        data: {
+          visible_history_collapsed: visibleHistory,
+          project_dir: projectDir,
+          last_error: lastRunError,
+        },
       });
       addRunMarker(concept || projectDir, true);
       pipeline.start({ concept: concept || 'resume', max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: projectDir, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: buildSystemPrompt(), max_turns: maxTurns, model: currentModel });
@@ -928,6 +1580,12 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
       });
       if (inlineMsgTimer.current) clearTimeout(inlineMsgTimer.current);
       setInlineMessage({ text: 'Log compacted.', color: themeColors.dim });
+      addRunEvent({
+        kind: 'diagnostic',
+        message: 'UI logs compacted by user command',
+        stage: currentStageRef.current,
+        source: 'ui_derived',
+      });
       inlineMsgTimer.current = setTimeout(() => setInlineMessage(null), 5000);
     },
     exportSession: (_filename) => {
@@ -957,6 +1615,8 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
             addRunMarker(project.concept, true);
             pipeline.start({ concept: project.concept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: project.dir, model: currentModel });
             setScreen('running');
+            setRunState('active');
+            setLastFinalUpdate(undefined); setLastErrorInfo(undefined); setBoardSelectedSegmentId(undefined); setBoardScrollOffset(0); setBoardFollowMode(true);
           }}
           promptPrefill={promptPrefill}
           onPromptPrefillConsumed={() => setPromptPrefill(undefined)}
@@ -987,12 +1647,16 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
             addRunMarker(resumeConcept, true);
             pipeline.start({ concept: resumeConcept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: resumeFromDir, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: buildSystemPrompt(), max_turns: maxTurns, model: currentModel });
             setScreen('running');
+            setRunState('active');
+            setLastFinalUpdate(undefined); setLastErrorInfo(undefined); setBoardSelectedSegmentId(undefined); setBoardScrollOffset(0); setBoardFollowMode(true);
           }}
           onRerun={(rerunConcept, rerunFromDir) => {
             setConcept(rerunConcept);
             addRunMarker(rerunConcept);
             pipeline.start({ concept: rerunConcept, max_retries: maxRetries, is_lite: isLite, skip_audio: skipAudio, resume_dir: rerunFromDir, force_restart: true, render_timeout: renderTimeout, tts_timeout: ttsTimeout, system_prompt_prefix: buildSystemPrompt(), max_turns: maxTurns, model: currentModel });
             setScreen('running');
+            setRunState('active');
+            setLastFinalUpdate(undefined); setLastErrorInfo(undefined); setBoardSelectedSegmentId(undefined); setBoardScrollOffset(0); setBoardFollowMode(true);
           }}
           onBack={() => {
             setScreen('input');
@@ -1028,139 +1692,30 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
     );
   }
 
-  // ── Running / Complete / Error screens ────────────────────────
-  const finalUpdate = pipeline.finalUpdate;
-
+  // ── Running / Complete / Error screens ──────────────────────
   return (
     <Box flexDirection="column" paddingX={1}>
-      {/* Banner rendered once at the top — NOT in Static to avoid double-render on screen transitions */}
-      <Banner concept={concept} />
-      {collapsedHistoryCount > 0 && (
-        <Box paddingLeft={1} marginBottom={1}>
-          <Text color={themeColors.muted}>
-            Previous run logs collapsed ({collapsedHistoryCount} line{collapsedHistoryCount === 1 ? '' : 's'} hidden)
-          </Text>
-        </Box>
-      )}
+      <RunScreen
+        concept={concept}
+        stage={currentStage}
+        elapsed={elapsed}
+        runState={runState}
+        segments={segments}
+        segmentCodes={segmentCodes}
+        boardRows={boardRows}
+        totalSegments={stageSegmentsTotal}
+        progressPct={progressPct}
+        progressMode={progressMode}
+        selectedSegmentId={boardSelectedSegmentId}
+        scrollOffset={boardScrollOffset}
+        completedStages={completedStages}
+        finalUpdate={lastFinalUpdate}
+        errorInfo={lastErrorInfo}
+      />
 
-      {/* Scrolling log region — concept header, completed stages, segment events */}
-      <Static items={logEntries.slice(activeRunLogStart)}>
-        {(entry) => {
-          if (entry.type === 'header') {
-            return (
-              <Box key={entry.id} marginBottom={1}>
-                <Text color={themeColors.dim}>{entry.text}</Text>
-              </Box>
-            );
-          }
-
-          if (entry.type === 'stage-complete' && entry.stage) {
-            return (
-              <Box key={entry.id}>
-                <StagePanel
-                  name={entry.stage.name}
-                  summary={entry.stage.summary}
-                  elapsed={entry.stage.elapsed}
-                  status={entry.stage.status}
-                  error={entry.stage.error}
-                />
-              </Box>
-            );
-          }
-
-          // Segment completion/failure line
-          return (
-            <Box key={entry.id} paddingLeft={3}>
-              <Text>
-                <Text color={entry.color ?? themeColors.dim}>
-                  {entry.icon ?? '│'}{' '}
-                </Text>
-                {entry.bold ? (
-                  <Text bold color={entry.color}>{entry.text}</Text>
-                ) : (
-                  <Text color={themeColors.dim}>{entry.text}</Text>
-                )}
-              </Text>
-            </Box>
-          );
-        }}
-      </Static>
-
-      {/* Live section: status bar activity stream + agent activity panel */}
-      {screen === 'running' && currentStage && currentStage !== 'done' && (
-        <>
-          <StatusBar
-            stage={currentStage}
-            elapsed={elapsed}
-            activity={activityLines}
-            segmentsCompleted={segmentsCompleted}
-            totalSegments={stageSegmentsTotal}
-            progressPct={progressPct}
-            progressMode={progressMode}
-            stageProgressPct={stageProgressPct}
-            hintText={runtimeHintText}
-            verbose={verboseLive}
-            maxLines={(currentStage === 'code' || currentStage === 'code_retry')
-              ? (verboseLive ? 6 : 3)
-              : 6}
-          />
-          <Box flexDirection="column" paddingLeft={1} marginTop={1}>
-            {(segments.size > 0 || currentStage === 'pipeline' || currentStage === 'tts' || currentStage === 'code' || currentStage === 'render' || currentStage === 'stitch' || currentStage === 'code_retry') && (
-              <>
-                <Text bold color={themeColors.primary}>Segment Health</Text>
-                {segments.size > 0 ? (
-                  <SegmentStatus segments={segments} verbose={verboseLive} />
-                ) : (
-                  <Box paddingLeft={2}>
-                    <Text color={themeColors.dim}>
-                      {waitingForFirstSegmentUpdate
-                        ? `Queued ${stageSegmentsTotal} segment${stageSegmentsTotal === 1 ? '' : 's'}; waiting for the first worker update...`
-                        : 'Preparing segment workers...'}
-                    </Text>
-                  </Box>
-                )}
-                {(currentStage === 'code' || currentStage === 'code_retry') && segments.size > 0 && (
-                  <AgentActivityPanel
-                    segments={segments}
-                    verbose={verboseLive}
-                  />
-                )}
-              </>
-            )}
-          </Box>
-        </>
-      )}
-
-      {showHelp && screen === 'running' && (
+      {/* Help overlay — post-run only */}
+      {showHelp && runState !== 'active' && (
         <KeyboardShortcuts verboseMode={verboseLive} />
-      )}
-
-      {/* Summary + success on completion */}
-      {screen === 'complete' && finalUpdate && (
-        <Box flexDirection="column">
-          <SummaryTable
-            stages={completedStages}
-            toolCallCounts={finalUpdate.tool_call_counts}
-            totalToolCalls={finalUpdate.total_tool_calls}
-            tokenSummary={finalUpdate.token_summary}
-          />
-          {finalUpdate.video_path && (
-            <SuccessPanel videoPath={finalUpdate.video_path} />
-          )}
-        </Box>
-      )}
-
-      {/* Error display */}
-      {screen === 'error' && (
-        <ErrorPanel
-          message={pipeline.errorMessage || 'Pipeline failed'}
-          failedSegments={pipeline.finalUpdate?.failed_segments}
-          numSegments={pipeline.finalUpdate?.num_segments}
-          videoPath={pipeline.finalUpdate?.video_path}
-          projectDir={pipeline.finalUpdate?.project_dir}
-          tokenSummary={pipeline.finalUpdate?.token_summary}
-          stages={completedStages}
-        />
       )}
 
       {/* Ctrl+C warning */}
@@ -1170,7 +1725,7 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
         </Box>
       )}
 
-      {/* Permission prompt (default mode) */}
+      {/* Permission prompt */}
       {pipeline.permissionPending && (
         <PermissionPrompt
           operation={pipeline.permissionPending.operation}
@@ -1181,17 +1736,18 @@ function AppInner({ initialConcept, maxRetries, isLite, quality = 'high', skipAu
         />
       )}
 
-      {/* Footer status line — always at bottom */}
+      {/* Footer */}
       <FooterStatusLine
         stage={currentStage}
         progress={progressPct}
         progressMode={progressMode}
         verboseModeOverride={verboseLive}
-        hintText={!verboseLive ? '? help · Ctrl+O verbose · Ctrl+C twice exits' : undefined}
+        hintText={runState === 'active'
+          ? '↑↓ select  ·  g follow  ·  Ctrl+C stop'
+          : '↑↓ select  ·  g follow  ·  ? help'}
         elapsedSeconds={elapsed}
         segmentsCompleted={segmentsCompleted}
         totalSegments={stageSegmentsTotal}
-        stageProgressPct={stageProgressPct}
       />
     </Box>
   );

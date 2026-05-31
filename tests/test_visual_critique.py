@@ -55,3 +55,33 @@ def test_critique_video_hard_fails_on_heuristic_overload(monkeypatch):
     result = visual_critique.critique_video("/tmp/demo.mp4")
     assert result.passed is False
     assert "overloaded" in result.issues[0].lower()
+
+
+def test_verify_transitions_reuses_boundary_frames_per_segment(monkeypatch):
+    extracted: list[str] = []
+
+    def fake_extract(video_path, output_dir=None):
+        extracted.append(video_path)
+        return (f"{video_path}.first.png", f"{video_path}.last.png")
+
+    def fake_run_text_completion(**kwargs):
+        return SimpleNamespace(text='{"smooth": true, "issues": []}')
+
+    monkeypatch.setattr(visual_critique, "_extract_boundary_frames", fake_extract)
+    monkeypatch.setattr(visual_critique, "_encode_image_base64", lambda path: "ZmFrZQ==")
+    monkeypatch.setattr(visual_critique, "run_text_completion", fake_run_text_completion)
+    monkeypatch.setattr(
+        visual_critique,
+        "resolve_stage_model",
+        lambda *args, **kwargs: SimpleNamespace(provider="openai", model="gpt", reasoning_effort="medium", cache_retention=None, cache_key_prefix="x"),
+    )
+    monkeypatch.setattr(visual_critique, "resolve_fallback_stage_model", lambda *args, **kwargs: None)
+
+    results = visual_critique.verify_transitions({
+        1: "/tmp/seg1.mp4",
+        2: "/tmp/seg2.mp4",
+        3: "/tmp/seg3.mp4",
+    })
+
+    assert len(results) == 2
+    assert extracted == ["/tmp/seg1.mp4", "/tmp/seg2.mp4", "/tmp/seg3.mp4"]

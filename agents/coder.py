@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from queue import Empty, Queue
 import re
-from typing import Iterator
+import threading
+from typing import Callable, Iterator
 
 from agents.config import (
     MAX_TOOL_CALLS_COMPLEX,
@@ -262,6 +264,8 @@ HARD RULES — violating these WILL produce overlapping elements:
 - Keep at most ONE primary idea on screen at a time unless multiple objects are intentionally grouped into a single composition.
 - Every segment should have a clear intro beat, one or more hold/explain beats, and a transition/closure beat.
 - For slower pacing, reduce simultaneous objects instead of only slowing animations.
+- Prefer a safe polished composition over ambitious density that would likely require repair.
+- Only use expensive features like `always_redraw`, heavy updaters, dense plotting, or 3D camera choreography when the structured spec explicitly allows them.
 
 == TOOL USAGE ==
 - Prefer writing code directly using your built-in Manim knowledge.
@@ -379,6 +383,8 @@ def _send_and_extract(
     tool_call_counts: dict[str, int] | None = None,
     token_counter: dict | None = None,
     on_status: object | None = None,
+    on_tool_event: object | None = None,
+    on_stream_event: object | None = None,
     *,
     fix: bool = False,
 ) -> str:
@@ -400,9 +406,63 @@ def _send_and_extract(
         tool_call_counts=tool_call_counts,
         token_counter=token_counter,
         on_status=on_status if callable(on_status) else None,
+        on_tool_event=on_tool_event if callable(on_tool_event) else None,
+        on_stream_event=on_stream_event if callable(on_stream_event) else None,
         cache_key_parts=("repair" if fix else "generate", primary.model, ",".join(tool["name"] for tool in tools)),
     )
     return _strip_code_fences(result.text)
+
+
+def _stream_model_call(
+    runner: Callable[..., str],
+    *,
+    emit_status: bool = False,
+    emit_tool_events: bool = False,
+    emit_stream_events: bool = False,
+) -> Iterator[dict[str, object]]:
+    """Run a blocking provider call in a worker thread and yield live events."""
+    event_queue: Queue[dict[str, object]] = Queue()
+    result_box: dict[str, object] = {"text": "", "error": None}
+
+    def _enqueue(event: dict[str, object]) -> None:
+        event_queue.put(event)
+
+    def _enqueue_status(message: str) -> None:
+        event_queue.put({"type": "status", "text": message})
+
+    def _worker() -> None:
+        try:
+            result_box["text"] = runner(
+                on_status=_enqueue_status if emit_status else None,
+                on_tool_event=_enqueue if emit_tool_events else None,
+                on_stream_event=_enqueue if emit_stream_events else None,
+            )
+        except Exception as exc:  # pragma: no cover - surfaced to caller
+            result_box["error"] = exc
+        finally:
+            event_queue.put({"type": "__done__"})
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+    while True:
+        try:
+            event = event_queue.get(timeout=0.05)
+        except Empty:
+            if not thread.is_alive():
+                break
+            continue
+        if event.get("type") == "__done__":
+            break
+        yield event
+
+    thread.join()
+    if result_box["error"] is not None:
+        raise result_box["error"]  # type: ignore[misc]
+
+    final_text = str(result_box.get("text") or "")
+    if final_text:
+        yield {"type": "final_text", "text": final_text}
 
 
 # ── public generators ─────────────────────────────────────────────────
@@ -419,9 +479,10 @@ def generate_manim_script(
     few_shot_example: str = "",
     token_counter: dict | None = None,
     on_status: object | None = None,
+    on_tool_event: object | None = None,
     repair_feedback: str = "",
     quality_mode: str = "balanced",
-) -> Iterator[str]:
+) -> Iterator[object]:
     """Yield the final generated code (single yield after tool calls resolve)."""
     model = _get_model_for_complexity(complexity)
     max_tool_calls = _get_tool_budget(complexity)
@@ -470,6 +531,10 @@ def generate_manim_script(
             f"Carry Over From Previous: {seg.get('carry_over_from_previous', 'clean reset')}\n"
             f"End State: {seg.get('end_state', '')}\n"
             f"Visual Density: {seg.get('visual_density', 'medium')}\n"
+            f"Scene Strategy: {seg.get('scene_strategy', 'clean_reset')}\n"
+            f"Render Risk: {seg.get('render_risk', 'medium')}\n"
+            f"Expensive Features Allowed: {seg.get('expensive_features_allowed', False)}\n"
+            f"Final Anchor Required: {seg.get('final_anchor_required', seg.get('end_state', 'keep a meaningful anchor visible'))}\n"
             f"Elements to draw:\n{elements_str}\n\n"
             f"Element Color Mapping:\n{element_colors_str}\n\n"
             f"### DETAILED VISUAL & ANIMATION FLOW (follow this beat-by-beat)\n"
@@ -487,6 +552,9 @@ def generate_manim_script(
             f"- Keep at most one primary visual idea on screen at a time unless grouped intentionally\n"
             f"- Preserve a meaningful anchor object in the final 1-2 seconds\n"
             f"- Respect visual density={seg.get('visual_density', 'medium')} when deciding how many simultaneous objects to show\n"
+            f"- Follow scene_strategy={seg.get('scene_strategy', 'clean_reset')} to keep the composition low-risk and readable\n"
+            f"- Treat final_anchor_required as mandatory and keep that object visible through the closing beat\n"
+            f"- If expensive_features_allowed is false, avoid 3D, always_redraw, custom updaters, and dense transform choreography\n"
             f"- Do NOT improvise or add elements not in the spec — faithfully implement what was planned\n\n"
         )
 
@@ -497,6 +565,10 @@ def generate_manim_script(
     elif quality_mode == "fast":
         prompt += (
             "Quality mode is FAST. Prefer simpler, reliable scenes and avoid ambitious density or expensive effects.\n\n"
+        )
+    else:
+        prompt += (
+            "Quality mode is BALANCED. Default to safe polished scenes: grouped layouts, one primary idea at a time, relative positioning, and simpler reliable transitions that should pass without repair.\n\n"
         )
 
     if repair_feedback:
@@ -528,22 +600,48 @@ def generate_manim_script(
 
     yield "looking up docs"  # signal to caller
 
-    code = _send_and_extract(
-        complexity, system_sections, prompt,
-        max_tool_calls=max_tool_calls,
-        tool_call_counts=tool_call_counts,
-        token_counter=token_counter,
-        on_status=on_status,
-    )
-    if not code:
-        _log.debug("falling back to tool-less generation (model=%s)", model)
-        code = _send_and_extract(
+    code = ""
+    for event in _stream_model_call(
+        lambda **callbacks: _send_and_extract(
             complexity, system_sections, prompt,
-            max_tool_calls=0,
+            max_tool_calls=max_tool_calls,
             tool_call_counts=tool_call_counts,
             token_counter=token_counter,
-            on_status=on_status,
-        )
+            on_status=callbacks.get("on_status"),
+            on_tool_event=callbacks.get("on_tool_event"),
+            on_stream_event=callbacks.get("on_stream_event"),
+        ),
+        emit_status=callable(on_status),
+        emit_tool_events=callable(on_tool_event),
+        emit_stream_events=True,
+    ):
+        event_type = event.get("type")
+        if event_type == "final_text":
+            code = str(event.get("text") or "")
+        else:
+            yield event
+
+    if not code:
+        _log.debug("falling back to tool-less generation (model=%s)", model)
+        for event in _stream_model_call(
+            lambda **callbacks: _send_and_extract(
+                complexity, system_sections, prompt,
+                max_tool_calls=0,
+                tool_call_counts=tool_call_counts,
+                token_counter=token_counter,
+                on_status=callbacks.get("on_status"),
+                on_tool_event=callbacks.get("on_tool_event"),
+                on_stream_event=callbacks.get("on_stream_event"),
+            ),
+            emit_status=callable(on_status),
+            emit_tool_events=callable(on_tool_event),
+            emit_stream_events=True,
+        ):
+            event_type = event.get("type")
+            if event_type == "final_text":
+                code = str(event.get("text") or "")
+            else:
+                yield event
 
     # Lightweight spec compliance check for Pro segments
     if code and isinstance(instructions, dict):
@@ -590,10 +688,13 @@ def fix_manim_script(
     complexity: str = "complex",
     tool_call_counts: dict[str, int] | None = None,
     on_status: object | None = None,
+    on_tool_event: object | None = None,
     original_instructions: str = "",
     repair_attempt: int = 0,
     token_counter: dict | None = None,
-) -> Iterator[str]:
+    max_tool_calls_override: int | None = None,
+    repair_goal: str = "runtime_error",
+) -> Iterator[object]:
     """Yield the corrected code after consulting docs.
 
     Args:
@@ -601,7 +702,11 @@ def fix_manim_script(
             Controls the escalating repair strategy hint appended to the prompt.
     """
     model = _get_model_for_complexity(complexity)
-    max_tool_calls = _get_tool_budget(complexity, fix=True)
+    max_tool_calls = (
+        max_tool_calls_override
+        if max_tool_calls_override is not None
+        else _get_tool_budget(complexity, fix=True)
+    )
     system_sections = [SYSTEM_INSTRUCTION]
 
     compact = _compact_error(error)
@@ -643,28 +748,238 @@ def fix_manim_script(
 
     strategy_section = _repair_hint(repair_attempt)
 
-    prompt = (
-        "The following Manim script failed. Fix the code and return the COMPLETE corrected Python file. "
-        f"You have a budget of {max_tool_calls} tool call(s) — use them to look up Manim docs or search for examples if the error is unfamiliar. "
-        "Fix directly if the error is obvious (e.g. typo, missing import).\n\n"
-        f"Error:\n{compact}{error_hints}\n\n"
-        f"Current code:\n{code}"
-        f"{context_section}"
-        f"{strategy_section}"
-    )
+    if repair_goal == "quality":
+        prompt = (
+            "The following Manim script already mostly works, but it needs a TARGETED repair. "
+            "Preserve the working structure and change only what is needed to fix the issue. "
+            "Return the COMPLETE corrected Python file. "
+            f"You have a budget of {max_tool_calls} tool call(s) — use docs lookup only if the fix truly requires API verification. "
+            "Prefer a minimal patch over a rewrite.\n\n"
+            f"Issue to fix:\n{compact}{error_hints}\n\n"
+            f"Current code:\n{code}"
+            f"{context_section}"
+            f"{strategy_section}"
+        )
+    else:
+        prompt = (
+            "The following Manim script failed. Fix the code and return the COMPLETE corrected Python file. "
+            f"You have a budget of {max_tool_calls} tool call(s) — use them to look up Manim docs or search for examples if the error is unfamiliar. "
+            "Fix directly if the error is obvious (e.g. typo, missing import).\n\n"
+            f"Error:\n{compact}{error_hints}\n\n"
+            f"Current code:\n{code}"
+            f"{context_section}"
+            f"{strategy_section}"
+        )
 
-    yield "looking up docs"
+    if max_tool_calls > 0:
+        yield "looking up docs"
 
-    fixed = _send_and_extract(
-        complexity, system_sections, prompt,
-        max_tool_calls=max_tool_calls,
-        tool_call_counts=tool_call_counts,
-        token_counter=token_counter,
-        on_status=on_status,
-        fix=True,
-    )
+    fixed = ""
+    for event in _stream_model_call(
+        lambda **callbacks: _send_and_extract(
+            complexity, system_sections, prompt,
+            max_tool_calls=max_tool_calls,
+            tool_call_counts=tool_call_counts,
+            token_counter=token_counter,
+            on_status=callbacks.get("on_status"),
+            on_tool_event=callbacks.get("on_tool_event"),
+            on_stream_event=callbacks.get("on_stream_event"),
+            fix=True,
+        ),
+        emit_status=callable(on_status),
+        emit_tool_events=callable(on_tool_event),
+        emit_stream_events=True,
+    ):
+        event_type = event.get("type")
+        if event_type == "final_text":
+            fixed = str(event.get("text") or "")
+        else:
+            yield event
     if fixed:
         yield fixed
+
+
+def run_code_patch_agent(
+    code: str,
+    repair_feedback: str,
+    complexity: str = "complex",
+    scene_class_name: str = "GeneratedScene",
+    segment_id: int | None = None,
+    original_instructions: str = "",
+):
+    """Patch an existing working script before falling back to full regeneration.
+
+    The first pass uses no external tool budget, then one fallback pass uses the
+    normal fix budget if the tool-free patch still fails validation or dry-run.
+    """
+    model_config = resolve_stage_model("code", complexity=complexity)
+    model_label = model_config.model
+    _seg = f"[Seg {segment_id}] " if segment_id is not None else ""
+    tool_call_counts: dict[str, int] = {}
+    coder_tokens = new_token_counter()
+    _rate_limit_msgs: list[str] = []
+    _tool_events: list[dict] = []
+
+    def _attach_tool_usage(payload: dict) -> dict:
+        counts = dict(sorted(tool_call_counts.items()))
+        payload["tool_call_counts"] = counts
+        payload["total_tool_calls"] = sum(counts.values())
+        payload["token_usage"] = dict(coder_tokens)
+        payload["model_info"] = {"provider": model_config.provider, "model": model_label}
+        return payload
+
+    def _on_rate_limit(msg: str) -> None:
+        _rate_limit_msgs.append(msg)
+
+    def _on_tool_event(event: dict) -> None:
+        _tool_events.append(event)
+
+    yield {
+        "status": f"{_seg}Applying targeted code repair via {model_label}...",
+        "phase": "patch",
+    }
+
+    current_code = code
+    current_issue = repair_feedback or "Refine the working scene while preserving its existing structure."
+    budgets = [0, _get_tool_budget(complexity, fix=True)]
+    attempted_budgets: set[int] = set()
+
+    for budget_index, budget in enumerate(budgets, start=1):
+        if budget in attempted_budgets:
+            continue
+        attempted_budgets.add(budget)
+
+        updated_code = ""
+        for chunk in fix_manim_script(
+            current_code,
+            current_issue,
+            complexity=complexity,
+            tool_call_counts=tool_call_counts,
+            on_status=_on_rate_limit,
+            on_tool_event=_on_tool_event,
+            original_instructions=original_instructions,
+            repair_attempt=budget_index - 1,
+            token_counter=coder_tokens,
+            max_tool_calls_override=budget,
+            repair_goal="quality",
+        ):
+            while _rate_limit_msgs:
+                yield {"status": f"{_seg}{_rate_limit_msgs.pop(0)}", "phase": "rate_limited"}
+            while _tool_events:
+                tool_event = _tool_events.pop(0)
+                yield {
+                    "status": f"{_seg}{tool_event.get('name', 'tool')}",
+                    "phase": "fix_docs",
+                    "tool_call": tool_event if tool_event.get("type") == "tool_call" else None,
+                    "tool_result": tool_event if tool_event.get("type") == "tool_result" else None,
+                }
+            if isinstance(chunk, dict):
+                if chunk.get("type") == "status":
+                    yield {
+                        "status": f"{_seg}{chunk.get('text', '')}",
+                        "phase": "rate_limited",
+                    }
+                elif chunk.get("type") in {"tool_call", "tool_result"}:
+                    yield {
+                        "status": f"{_seg}{chunk.get('name', 'tool')}",
+                        "phase": "fix_docs",
+                        "tool_call": chunk if chunk.get("type") == "tool_call" else None,
+                        "tool_result": chunk if chunk.get("type") == "tool_result" else None,
+                    }
+                elif chunk.get("type") == "text_delta":
+                    yield {
+                        "status": f"{_seg}Streaming targeted patch...",
+                        "phase": "apply_fix",
+                        "stream_event": {
+                            "channel": "code",
+                            "delta": chunk.get("text", ""),
+                            "snapshot": chunk.get("snapshot", ""),
+                        },
+                    }
+                elif chunk.get("type") == "thinking_delta":
+                    yield {
+                        "status": f"{_seg}Reasoning through the targeted patch...",
+                        "phase": "fix_docs",
+                        "thinking": chunk.get("snapshot") or chunk.get("text") or True,
+                        "stream_event": {
+                            "channel": "thinking",
+                            "delta": chunk.get("text", ""),
+                            "snapshot": chunk.get("snapshot", ""),
+                        },
+                    }
+                continue
+            if chunk == "looking up docs":
+                yield {
+                    "status": f"{_seg}Looking up docs for targeted patch...",
+                    "phase": "fix_docs",
+                }
+                continue
+            updated_code = chunk
+            yield {
+                "status": (
+                    f"{_seg}Applying targeted patch..."
+                    if budget == 0
+                    else f"{_seg}Applying fallback patch with docs..."
+                ),
+                "code": updated_code,
+                "phase": "apply_fix",
+            }
+
+        if not updated_code:
+            current_issue = "Empty model response while patching existing code."
+            continue
+
+        current_code = updated_code
+        validation = validate_manim_code(current_code)
+        if validation["errors"]:
+            current_issue = "Patched code failed validation:\n" + "\n".join(validation["errors"])
+            yield {
+                "status": (
+                    f"{_seg}Targeted patch failed validation; escalating..."
+                    if budget == 0
+                    else f"{_seg}Fallback patch still failed validation."
+                ),
+                "error": current_issue,
+                "phase": "self_correct",
+            }
+            continue
+
+        class_name = extract_class_name(current_code) or scene_class_name
+        yield {
+            "status": f"{_seg}Validating patched code...",
+            "code": current_code,
+            "phase": "execute",
+        }
+        result = dry_run_manim_code(current_code, class_name)
+        if result["success"]:
+            yield _attach_tool_usage({
+                "status": f"{_seg}Targeted patch validated. Code ready for HD render.",
+                "video_path": None,
+                "code_validated": True,
+                "code": current_code,
+                "phase": "done",
+                "final": True,
+            })
+            return
+
+        current_issue = result.get("error") or "Patched code failed dry-run validation."
+        yield {
+            "status": (
+                f"{_seg}Targeted patch failed dry-run; escalating..."
+                if budget == 0
+                else f"{_seg}Fallback patch failed dry-run."
+            ),
+            "error": current_issue,
+            "phase": "self_correct",
+        }
+
+    yield _attach_tool_usage({
+        "status": f"{_seg}Targeted code repair could not be validated.",
+        "error": current_issue,
+        "code": current_code,
+        "phase": "failed",
+        "final": True,
+    })
 
 
 # ── orchestrator ──────────────────────────────────────────────────────
@@ -714,9 +1029,13 @@ def run_coder_agent(
     }
     # Collect rate-limit notifications to surface as status updates
     _rate_limit_msgs: list[str] = []
+    _tool_events: list[dict] = []
 
     def _on_rate_limit(msg: str) -> None:
         _rate_limit_msgs.append(msg)
+
+    def _on_tool_event(event: dict) -> None:
+        _tool_events.append(event)
 
     spec_gaps = ""
     for chunk in generate_manim_script(
@@ -728,12 +1047,53 @@ def run_coder_agent(
         few_shot_example=few_shot_example,
         token_counter=coder_tokens,
         on_status=_on_rate_limit,
+        on_tool_event=_on_tool_event,
         repair_feedback=repair_feedback,
         quality_mode=quality_mode,
     ):
         # Surface any rate-limit notifications collected during API calls
         while _rate_limit_msgs:
             yield {"status": f"{_seg}{_rate_limit_msgs.pop(0)}", "phase": "rate_limited"}
+        while _tool_events:
+            tool_event = _tool_events.pop(0)
+            yield {
+                "status": f"{_seg}{tool_event.get('name', 'tool')}",
+                "phase": "docs",
+                "tool_call": tool_event if tool_event.get("type") == "tool_call" else None,
+                    "tool_result": tool_event if tool_event.get("type") == "tool_result" else None,
+                }
+        if isinstance(chunk, dict):
+            if chunk.get("type") == "status":
+                yield {"status": f"{_seg}{chunk.get('text', '')}", "phase": "rate_limited"}
+            elif chunk.get("type") in {"tool_call", "tool_result"}:
+                yield {
+                    "status": f"{_seg}{chunk.get('name', 'tool')}",
+                    "phase": "docs",
+                    "tool_call": chunk if chunk.get("type") == "tool_call" else None,
+                    "tool_result": chunk if chunk.get("type") == "tool_result" else None,
+                }
+            elif chunk.get("type") == "text_delta":
+                yield {
+                    "status": f"{_seg}Streaming code draft...",
+                    "phase": "generate",
+                    "stream_event": {
+                        "channel": "code",
+                        "delta": chunk.get("text", ""),
+                        "snapshot": chunk.get("snapshot", ""),
+                    },
+                }
+            elif chunk.get("type") == "thinking_delta":
+                yield {
+                    "status": f"{_seg}Reasoning about the draft...",
+                    "phase": "generate",
+                    "thinking": chunk.get("snapshot") or chunk.get("text") or True,
+                    "stream_event": {
+                        "channel": "thinking",
+                        "delta": chunk.get("text", ""),
+                        "snapshot": chunk.get("snapshot", ""),
+                    },
+                }
+            continue
         if chunk == "looking up docs":
             yield {"status": f"{_seg}Generating with {model_config.provider}:{model_label}...", "phase": "docs"}
             continue
@@ -783,12 +1143,53 @@ def run_coder_agent(
                     complexity=complexity,
                     tool_call_counts=tool_call_counts,
                     on_status=_on_rate_limit,
+                    on_tool_event=_on_tool_event,
                     original_instructions=original_instructions,
                     repair_attempt=attempt,
                     token_counter=coder_tokens,
                 ):
                     while _rate_limit_msgs:
                         yield {"status": f"{_seg}{_rate_limit_msgs.pop(0)}", "phase": "rate_limited"}
+                    while _tool_events:
+                        tool_event = _tool_events.pop(0)
+                        yield {
+                            "status": f"{_seg}{tool_event.get('name', 'tool')}",
+                            "phase": "fix_docs",
+                            "tool_call": tool_event if tool_event.get("type") == "tool_call" else None,
+                                "tool_result": tool_event if tool_event.get("type") == "tool_result" else None,
+                            }
+                    if isinstance(chunk, dict):
+                        if chunk.get("type") == "status":
+                            yield {"status": f"{_seg}{chunk.get('text', '')}", "phase": "rate_limited"}
+                        elif chunk.get("type") in {"tool_call", "tool_result"}:
+                            yield {
+                                "status": f"{_seg}{chunk.get('name', 'tool')}",
+                                "phase": "fix_docs",
+                                "tool_call": chunk if chunk.get("type") == "tool_call" else None,
+                                "tool_result": chunk if chunk.get("type") == "tool_result" else None,
+                            }
+                        elif chunk.get("type") == "text_delta":
+                            yield {
+                                "status": f"{_seg}Streaming repaired code...",
+                                "phase": "apply_fix",
+                                "stream_event": {
+                                    "channel": "code",
+                                    "delta": chunk.get("text", ""),
+                                    "snapshot": chunk.get("snapshot", ""),
+                                },
+                            }
+                        elif chunk.get("type") == "thinking_delta":
+                            yield {
+                                "status": f"{_seg}Reasoning through the fix...",
+                                "phase": "fix_docs",
+                                "thinking": chunk.get("snapshot") or chunk.get("text") or True,
+                                "stream_event": {
+                                    "channel": "thinking",
+                                    "delta": chunk.get("text", ""),
+                                    "snapshot": chunk.get("snapshot", ""),
+                                },
+                            }
+                        continue
                     if chunk == "looking up docs":
                         yield {"status": f"{_seg}Looking up docs for fix (attempt {attempt + 1}/{max_retries})...", "phase": "fix_docs"}
                         continue
@@ -861,12 +1262,53 @@ def run_coder_agent(
                 complexity=complexity,
                 tool_call_counts=tool_call_counts,
                 on_status=_on_rate_limit,
+                on_tool_event=_on_tool_event,
                 original_instructions=original_instructions,
                 repair_attempt=attempt,
                 token_counter=coder_tokens,
             ):
                 while _rate_limit_msgs:
                     yield {"status": f"{_seg}{_rate_limit_msgs.pop(0)}", "phase": "rate_limited"}
+                while _tool_events:
+                    tool_event = _tool_events.pop(0)
+                    yield {
+                        "status": f"{_seg}{tool_event.get('name', 'tool')}",
+                        "phase": "fix_docs",
+                        "tool_call": tool_event if tool_event.get("type") == "tool_call" else None,
+                            "tool_result": tool_event if tool_event.get("type") == "tool_result" else None,
+                        }
+                if isinstance(chunk, dict):
+                    if chunk.get("type") == "status":
+                        yield {"status": f"{_seg}{chunk.get('text', '')}", "phase": "rate_limited"}
+                    elif chunk.get("type") in {"tool_call", "tool_result"}:
+                        yield {
+                            "status": f"{_seg}{chunk.get('name', 'tool')}",
+                            "phase": "fix_docs",
+                            "tool_call": chunk if chunk.get("type") == "tool_call" else None,
+                            "tool_result": chunk if chunk.get("type") == "tool_result" else None,
+                        }
+                    elif chunk.get("type") == "text_delta":
+                        yield {
+                            "status": f"{_seg}Streaming repaired code...",
+                            "phase": "apply_fix",
+                            "stream_event": {
+                                "channel": "code",
+                                "delta": chunk.get("text", ""),
+                                "snapshot": chunk.get("snapshot", ""),
+                            },
+                        }
+                    elif chunk.get("type") == "thinking_delta":
+                        yield {
+                            "status": f"{_seg}Reasoning through the fix...",
+                            "phase": "fix_docs",
+                            "thinking": chunk.get("snapshot") or chunk.get("text") or True,
+                            "stream_event": {
+                                "channel": "thinking",
+                                "delta": chunk.get("text", ""),
+                                "snapshot": chunk.get("snapshot", ""),
+                            },
+                        }
+                    continue
                 if chunk == "looking up docs":
                     yield {"status": f"{_seg}Looking up docs for fix (attempt {attempt + 1}/{max_retries})...", "phase": "fix_docs"}
                     continue

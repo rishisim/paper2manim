@@ -1,9 +1,11 @@
 """Tests for pipeline resumability — skipping completed stages on re-run."""
 
+from concurrent.futures import Future
 import json
 import os
 
 import agents.pipeline as pipeline
+import pytest
 from utils.project_state import (
     load_project,
 )
@@ -83,28 +85,26 @@ def _apply_monkeypatches(monkeypatch):
         yield {"status": "concatenating"}
         yield {"final": True, "success": True, "output_path": final_output}
 
-    # render_parallel is used for HD rendering
-    def fake_render_parallel(jobs):
-        from utils.parallel_renderer import RenderResult
-        results = []
-        for job in jobs:
-            video_path = os.path.join(job.output_dir or "/tmp", f"hd_{job.segment_id}.mp4")
-            os.makedirs(os.path.dirname(video_path), exist_ok=True)
-            with open(video_path, "w") as f:
-                f.write("hd video")
-            results.append(RenderResult(
-                segment_id=job.segment_id,
-                success=True,
-                video_path=video_path,
-            ))
-        return results
+    def fake_submit_render_job(job):
+        video_path = os.path.join(job.output_dir or "/tmp", f"hd_{job.segment_id}.mp4")
+        os.makedirs(os.path.dirname(video_path), exist_ok=True)
+        with open(video_path, "w") as f:
+            f.write("hd video")
+        future: Future = Future()
+        future.set_result(type("RenderResult", (), {
+            "segment_id": job.segment_id,
+            "success": True,
+            "video_path": video_path,
+            "error": None,
+        })())
+        return future
 
     monkeypatch.setattr(pipeline, "run_math2manim_planner", fake_planner)
     monkeypatch.setattr(pipeline, "generate_voiceover_async", fake_tts_async)
     monkeypatch.setattr(pipeline, "run_coder_agent", fake_coder)
     monkeypatch.setattr(pipeline, "stitch_video_and_audio", fake_stitch)
     monkeypatch.setattr(pipeline, "concatenate_segments", fake_concat)
-    monkeypatch.setattr(pipeline, "render_parallel", fake_render_parallel)
+    monkeypatch.setattr(pipeline, "submit_render_job", fake_submit_render_job)
 
     return call_counts
 
@@ -354,3 +354,164 @@ def test_completed_project_is_not_resumed(monkeypatch, tmp_path):
     assert call_counts["planner"] == first_planner + 1
     resumed_msgs = [u for u in updates2 if u.get("resumed")]
     assert not resumed_msgs, "Should not resume a completed project"
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_stage_key"),
+    [
+        ("tts", "tts"),
+        ("code", "code"),
+        ("render", "hd_render"),
+        ("stitch", "stitch"),
+    ],
+)
+def test_stage_failures_are_flushed_to_project_state(monkeypatch, tmp_path, failure_stage, expected_stage_key):
+    storyboard = {
+        "theme_name": "Test",
+        "color_palette": {"Background": "#141414", "Primary": "#00AAFF"},
+        "segments": [
+            {
+                "id": 1,
+                "title": "Segment 1",
+                "learning_goal": "Explain one thing",
+                "must_show": ["eq1"],
+                "end_state": "eq1 visible",
+                "carry_over_from_previous": "clean reset",
+                "visual_density": "low",
+                "scene_strategy": "clean_reset",
+                "render_risk": "low",
+                "expensive_features_allowed": False,
+                "final_anchor_required": "Keep eq1 visible",
+                "audio_script": "audio 1",
+                "complexity": "simple",
+                "visual_instructions": "visual 1",
+                "equations_latex": [],
+                "variable_definitions": {},
+                "elements": [],
+                "element_colors": {},
+                "animations": [],
+                "layout_instructions": "",
+            }
+        ],
+    }
+
+    def fake_planner(*args, **kwargs):
+        yield {"status": "planning"}
+        yield {"final": True, "storyboard": storyboard}
+
+    async def fake_tts_async(script, audio_path):
+        if failure_stage == "tts":
+            return {"success": False, "audio_path": None, "duration": 0.0, "error": "tts failed"}
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+        with open(audio_path, "w", encoding="utf-8") as f:
+            f.write("audio")
+        return {"success": True, "audio_path": audio_path, "duration": 3.0}
+
+    def fake_coder(*args, **kwargs):
+        if failure_stage == "code":
+            yield {
+                "status": "code failed",
+                "phase": "failed",
+                "error": "code failed",
+                "final": True,
+                "tool_call_counts": {},
+                "token_usage": {},
+            }
+            return
+
+        yield {
+            "status": "code ok",
+            "phase": "done",
+            "code": (
+                "from manim import *\n"
+                "class Segment1Scene(Scene):\n"
+                "    def construct(self):\n"
+                "        self.wait(1.0)\n"
+            ),
+            "code_validated": True,
+            "final": True,
+            "tool_call_counts": {},
+            "token_usage": {},
+        }
+
+    def fake_submit_render_job(job):
+        future: Future = Future()
+        if failure_stage == "render":
+            future.set_result(type("RenderResult", (), {
+                "segment_id": job.segment_id,
+                "success": False,
+                "video_path": None,
+                "error": "render failed",
+            })())
+        else:
+            video_path = os.path.join(job.output_dir or str(tmp_path), f"hd_{job.segment_id}.mp4")
+            os.makedirs(os.path.dirname(video_path), exist_ok=True)
+            with open(video_path, "w", encoding="utf-8") as f:
+                f.write("video")
+            future.set_result(type("RenderResult", (), {
+                "segment_id": job.segment_id,
+                "success": True,
+                "video_path": video_path,
+                "error": None,
+            })())
+        return future
+
+    def fake_stitch(video_path, audio_path, output_path):
+        if failure_stage == "stitch":
+            yield {"final": True, "success": False, "error": "stitch failed"}
+            return
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("stitched")
+        yield {"final": True, "success": True, "output_path": output_path}
+
+    def fake_concat(paths, final_output):
+        with open(final_output, "w", encoding="utf-8") as f:
+            f.write("final")
+        yield {"final": True, "success": True, "output_path": final_output}
+
+    monkeypatch.setattr(pipeline, "run_math2manim_planner", fake_planner)
+    monkeypatch.setattr(pipeline, "generate_voiceover_async", fake_tts_async)
+    monkeypatch.setattr(pipeline, "run_coder_agent", fake_coder)
+    monkeypatch.setattr(pipeline, "submit_render_job", fake_submit_render_job)
+    monkeypatch.setattr(
+        pipeline,
+        "verify_segment_code",
+        lambda *args, **kwargs: type("VerifyResult", (), {
+            "segment_id": 1,
+            "passed": True,
+            "issues": [],
+            "suggestions": [],
+            "static_issues": [],
+            "verification_tier": "static",
+            "quality_risk": "low",
+            "expensive_features": [],
+        })(),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "critique_video",
+        lambda *args, **kwargs: type("CritiqueResult", (), {
+            "passed": True,
+            "score": 0.9,
+            "issues": [],
+            "suggestions": [],
+            "sub_scores": {},
+        })(),
+    )
+    monkeypatch.setattr(pipeline, "stitch_video_and_audio", fake_stitch)
+    monkeypatch.setattr(pipeline, "concatenate_segments", fake_concat)
+    monkeypatch.setattr(pipeline, "verify_code_transitions", lambda *args, **kwargs: [])
+    monkeypatch.setattr(pipeline, "critique_project_consistency", lambda *args, **kwargs: None)
+
+    updates = list(
+        pipeline.run_segmented_pipeline(
+            f"flush {failure_stage}",
+            output_base=str(tmp_path),
+            questionnaire_answers={"quality_mode": "balanced"},
+        )
+    )
+
+    final = updates[-1]
+    state = load_project(final["project_dir"])
+    assert state is not None
+    assert state["segments"]["1"][expected_stage_key]["done"] is False

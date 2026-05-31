@@ -188,6 +188,7 @@ def critique_video(
     num_frames: int = 4,
     model: str | None = None,
     token_counter: dict | None = None,
+    use_vision_model: bool = True,
 ) -> CritiqueResult:
     """Run visual critique on a rendered video.
 
@@ -211,14 +212,25 @@ def critique_video(
         )
 
     heuristic_issues, heuristic_sub_scores = _heuristic_frame_issues(frames)
+    heuristic_score = min(heuristic_sub_scores.values()) if heuristic_sub_scores else 0.0
     if any("mostly empty or black" in issue.lower() or "visually overloaded" in issue.lower() for issue in heuristic_issues):
         return CritiqueResult(
             passed=False,
-            score=min(heuristic_sub_scores.values()) if heuristic_sub_scores else 0.0,
+            score=heuristic_score,
             issues=heuristic_issues,
             suggestions=["Reduce clutter and preserve a clearer, meaningful composition."],
             sub_scores=heuristic_sub_scores,
             raw_feedback="Heuristic visual failure",
+        )
+    if not use_vision_model:
+        heuristic_pass = not heuristic_issues and heuristic_score >= 0.68
+        return CritiqueResult(
+            passed=heuristic_pass,
+            score=max(heuristic_score, 0.72 if heuristic_pass else heuristic_score),
+            issues=heuristic_issues,
+            suggestions=[] if heuristic_pass else ["Improve frame clarity, final anchor visibility, and visual breathing room."],
+            sub_scores=heuristic_sub_scores,
+            raw_feedback="Heuristic-only critique",
         )
 
     # Build vision API request
@@ -402,74 +414,73 @@ def verify_transitions(
 
     results: list[TransitionResult] = []
 
-    for i in range(len(sorted_ids) - 1):
-        id_a, id_b = sorted_ids[i], sorted_ids[i + 1]
-        path_a, path_b = segment_video_paths[id_a], segment_video_paths[id_b]
-
-        _, last_a = _extract_boundary_frames(path_a)
-        first_b, _ = _extract_boundary_frames(path_b)
-
-        if not last_a or not first_b:
-            results.append(TransitionResult(
-                segment_a_id=id_a, segment_b_id=id_b, smooth=True,
-                issues=["Could not extract boundary frames"],
-            ))
-            continue
-
-        try:
-            content: list[dict] = [
-                {"type": "text", "text": f"Reviewing transition from Segment {id_a} to Segment {id_b}."},
-                {"type": "text", "text": "LAST frame of outgoing segment:"},
-                {"type": "image_base64", "media_type": "image/png", "data": _encode_image_base64(last_a)},
-                {"type": "text", "text": "FIRST frame of incoming segment:"},
-                {"type": "image_base64", "media_type": "image/png", "data": _encode_image_base64(first_b)},
-            ]
-            primary = resolve_stage_model("vision")
-            if model:
-                primary = StageModelConfig(
-                    provider=infer_provider(model),
-                    model=model,
-                    reasoning_effort=primary.reasoning_effort,
-                    cache_retention=primary.cache_retention,
-                    cache_key_prefix=primary.cache_key_prefix,
-                )
-            result = run_text_completion(
-                primary=primary,
-                fallback=resolve_fallback_stage_model("vision"),
-                system_sections=[_TRANSITION_SYSTEM],
-                user_content=content,
-                max_output_tokens=512,
-                token_counter=token_counter,
-                cache_key_parts=("critique-transition",),
+    with tempfile.TemporaryDirectory(prefix="transition_frames_") as temp_dir:
+        boundary_frames: dict[int, tuple[str | None, str | None]] = {}
+        for seg_id in sorted_ids:
+            boundary_frames[seg_id] = _extract_boundary_frames(
+                segment_video_paths[seg_id],
+                output_dir=os.path.join(temp_dir, f"segment_{seg_id}"),
             )
 
-            import json as _json
-            import re as _re
-            raw = result.text or ""
-            text = raw.strip()
-            text = _re.sub(r"^```(?:json)?\s*", "", text)
-            text = _re.sub(r"\s*```$", "", text)
-            match = _re.search(r"\{.*\}", text, _re.DOTALL)
-            data = _json.loads(match.group(0)) if match else _json.loads(text)
+        for i in range(len(sorted_ids) - 1):
+            id_a, id_b = sorted_ids[i], sorted_ids[i + 1]
+            _, last_a = boundary_frames.get(id_a, (None, None))
+            first_b, _ = boundary_frames.get(id_b, (None, None))
 
-            results.append(TransitionResult(
-                segment_a_id=id_a,
-                segment_b_id=id_b,
-                smooth=data.get("smooth", True),
-                issues=data.get("issues", []),
-            ))
-        except Exception as e:
-            results.append(TransitionResult(
-                segment_a_id=id_a, segment_b_id=id_b, smooth=True,
-                issues=[f"Transition check error: {str(e)}"],
-            ))
-        finally:
-            for fp in [last_a, first_b]:
-                if fp:
-                    try:
-                        os.remove(fp)
-                    except OSError:
-                        pass
+            if not last_a or not first_b:
+                results.append(TransitionResult(
+                    segment_a_id=id_a, segment_b_id=id_b, smooth=True,
+                    issues=["Could not extract boundary frames"],
+                ))
+                continue
+
+            try:
+                content: list[dict] = [
+                    {"type": "text", "text": f"Reviewing transition from Segment {id_a} to Segment {id_b}."},
+                    {"type": "text", "text": "LAST frame of outgoing segment:"},
+                    {"type": "image_base64", "media_type": "image/png", "data": _encode_image_base64(last_a)},
+                    {"type": "text", "text": "FIRST frame of incoming segment:"},
+                    {"type": "image_base64", "media_type": "image/png", "data": _encode_image_base64(first_b)},
+                ]
+                primary = resolve_stage_model("vision")
+                if model:
+                    primary = StageModelConfig(
+                        provider=infer_provider(model),
+                        model=model,
+                        reasoning_effort=primary.reasoning_effort,
+                        cache_retention=primary.cache_retention,
+                        cache_key_prefix=primary.cache_key_prefix,
+                    )
+                result = run_text_completion(
+                    primary=primary,
+                    fallback=resolve_fallback_stage_model("vision"),
+                    system_sections=[_TRANSITION_SYSTEM],
+                    user_content=content,
+                    max_output_tokens=512,
+                    token_counter=token_counter,
+                    cache_key_parts=("critique-transition",),
+                )
+
+                import json as _json
+                import re as _re
+                raw = result.text or ""
+                text = raw.strip()
+                text = _re.sub(r"^```(?:json)?\s*", "", text)
+                text = _re.sub(r"\s*```$", "", text)
+                match = _re.search(r"\{.*\}", text, _re.DOTALL)
+                data = _json.loads(match.group(0)) if match else _json.loads(text)
+
+                results.append(TransitionResult(
+                    segment_a_id=id_a,
+                    segment_b_id=id_b,
+                    smooth=data.get("smooth", True),
+                    issues=data.get("issues", []),
+                ))
+            except Exception as e:
+                results.append(TransitionResult(
+                    segment_a_id=id_a, segment_b_id=id_b, smooth=True,
+                    issues=[f"Transition check error: {str(e)}"],
+                ))
 
     return results
 

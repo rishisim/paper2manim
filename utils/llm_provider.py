@@ -42,6 +42,8 @@ class ProviderResult:
 
 
 ToolDispatcher = Callable[[str, dict[str, Any]], str]
+ToolEventCallback = Callable[[dict[str, Any]], None]
+StreamEventCallback = Callable[[dict[str, Any]], None]
 
 
 def _hash_for_cache(*parts: str) -> str:
@@ -313,6 +315,8 @@ def run_tool_completion(
     tool_call_counts: dict[str, int] | None = None,
     token_counter: dict[str, Any] | None = None,
     on_status: Callable[[str], None] | None = None,
+    on_tool_event: ToolEventCallback | None = None,
+    on_stream_event: StreamEventCallback | None = None,
     cache_key_parts: Iterable[str] = (),
 ) -> ProviderResult:
     try:
@@ -326,6 +330,8 @@ def run_tool_completion(
             tool_call_counts=tool_call_counts,
             token_counter=token_counter,
             on_status=on_status,
+            on_tool_event=on_tool_event,
+            on_stream_event=on_stream_event,
             cache_key_parts=cache_key_parts,
         )
     except ProviderFailure as exc:
@@ -343,6 +349,8 @@ def run_tool_completion(
             tool_call_counts=tool_call_counts,
             token_counter=token_counter,
             on_status=on_status,
+            on_tool_event=on_tool_event,
+            on_stream_event=on_stream_event,
             cache_key_parts=cache_key_parts,
         )
         result.trace.used_fallback = True
@@ -373,6 +381,8 @@ def _run_single_tool_completion(
     tool_call_counts: dict[str, int] | None,
     token_counter: dict[str, Any] | None,
     on_status: Callable[[str], None] | None,
+    on_tool_event: ToolEventCallback | None,
+    on_stream_event: StreamEventCallback | None,
     cache_key_parts: Iterable[str],
 ) -> ProviderResult:
     if config.provider == "openai":
@@ -386,6 +396,8 @@ def _run_single_tool_completion(
             tool_call_counts=tool_call_counts,
             token_counter=token_counter,
             on_status=on_status,
+            on_tool_event=on_tool_event,
+            on_stream_event=on_stream_event,
             cache_key_parts=cache_key_parts,
         )
     return _run_anthropic_tool_completion(
@@ -398,6 +410,8 @@ def _run_single_tool_completion(
         tool_call_counts=tool_call_counts,
         token_counter=token_counter,
         on_status=on_status,
+        on_tool_event=on_tool_event,
+        on_stream_event=on_stream_event,
     )
 
 
@@ -412,6 +426,8 @@ def _run_openai_tool_completion(
     tool_call_counts: dict[str, int] | None,
     token_counter: dict[str, Any] | None,
     on_status: Callable[[str], None] | None,
+    on_tool_event: ToolEventCallback | None,
+    on_stream_event: StreamEventCallback | None,
     cache_key_parts: Iterable[str],
 ) -> ProviderResult:
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
@@ -445,6 +461,12 @@ def _run_openai_tool_completion(
         text, function_calls = _extract_openai_text(response)
 
         if not function_calls or calls >= max_tool_calls:
+            if callable(on_stream_event) and text:
+                snapshot = ""
+                for chunk_start in range(0, len(text), 24):
+                    delta = text[chunk_start:chunk_start + 24]
+                    snapshot += delta
+                    on_stream_event({"type": "text_delta", "text": delta, "snapshot": snapshot})
             return ProviderResult(text=text, trace=ProviderTrace(config.provider, config.model))
 
         tool_outputs: list[dict[str, Any]] = []
@@ -456,9 +478,13 @@ def _run_openai_tool_completion(
                 parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             except json.JSONDecodeError:
                 parsed_args = {}
+            if callable(on_tool_event):
+                on_tool_event({"type": "tool_call", "name": name, "input": parsed_args})
             if tool_call_counts is not None:
                 tool_call_counts[name] = tool_call_counts.get(name, 0) + 1
             result = tool_dispatcher(name, parsed_args)
+            if callable(on_tool_event):
+                on_tool_event({"type": "tool_result", "name": name, "output": result})
             if calls >= max_tool_calls:
                 result += (
                     "\n\nCRITICAL SYSTEM WARNING: You have exhausted all tool calls. "
@@ -483,6 +509,8 @@ def _run_anthropic_tool_completion(
     tool_call_counts: dict[str, int] | None,
     token_counter: dict[str, Any] | None,
     on_status: Callable[[str], None] | None,
+    on_tool_event: ToolEventCallback | None,
+    on_stream_event: StreamEventCallback | None,
 ) -> ProviderResult:
     client = anthropic.Anthropic()
     messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
@@ -501,6 +529,22 @@ def _run_anthropic_tool_completion(
 
         def _anthropic_call() -> Any:
             try:
+                if callable(on_stream_event):
+                    with client.messages.stream(**kwargs) as stream:
+                        for event in stream:
+                            if event.type == "text":
+                                on_stream_event({
+                                    "type": "text_delta",
+                                    "text": event.text,
+                                    "snapshot": event.snapshot,
+                                })
+                            elif event.type == "thinking":
+                                on_stream_event({
+                                    "type": "thinking_delta",
+                                    "text": event.thinking,
+                                    "snapshot": event.snapshot,
+                                })
+                        return stream.get_final_message()
                 return client.messages.create(**kwargs)
             except Exception as exc:  # pragma: no cover - normalized below
                 raise _classify_anthropic_error(exc) from exc
@@ -528,9 +572,13 @@ def _run_anthropic_tool_completion(
         tool_results = []
         for block in tool_use_blocks:
             calls += 1
+            if callable(on_tool_event):
+                on_tool_event({"type": "tool_call", "name": block.name, "input": block.input})
             if tool_call_counts is not None:
                 tool_call_counts[block.name] = tool_call_counts.get(block.name, 0) + 1
             result = tool_dispatcher(block.name, block.input)
+            if callable(on_tool_event):
+                on_tool_event({"type": "tool_result", "name": block.name, "output": result})
             if calls >= max_tool_calls:
                 result += (
                     "\n\nCRITICAL SYSTEM WARNING: You have exhausted all tool calls. "

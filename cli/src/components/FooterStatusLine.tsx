@@ -25,18 +25,13 @@ interface FooterStatusLineProps {
   elapsedSeconds?: number;
   segmentsCompleted?: number;
   totalSegments?: number;
-  stageProgressPct?: number;
 }
 
 interface FooterVisibility {
   showElapsed: boolean;
   showSegments: boolean;
-  showStagePct: boolean;
   showProgress: boolean;
   showTokens: boolean;
-  showStage: boolean;
-  showBranch: boolean;
-  showVerbose: boolean;
   showHint: boolean;
 }
 
@@ -45,17 +40,13 @@ export function getFooterProgressLabel(progress: number, progressMode: ProgressM
   return `${Math.round(progress)}%`;
 }
 
-export function getFooterVisibility(termWidth: number, isRunning: boolean, hasTokens: boolean, hasBranch: boolean, verboseMode: boolean): FooterVisibility {
+export function getFooterVisibility(termWidth: number, isRunning: boolean, hasTokens: boolean): FooterVisibility {
   return {
     showElapsed: isRunning && termWidth >= 60,
     showSegments: isRunning && termWidth >= 76,
-    showStagePct: isRunning && termWidth >= 96,
     showProgress: isRunning && termWidth >= 68,
-    showTokens: hasTokens && termWidth >= 128,
-    showStage: isRunning && termWidth >= 88,
-    showBranch: hasBranch && termWidth >= 140,
-    showVerbose: verboseMode && termWidth >= 148,
-    showHint: isRunning && termWidth >= 128,
+    showTokens: hasTokens && termWidth >= 160,
+    showHint: isRunning && termWidth >= 80,
   };
 }
 
@@ -68,7 +59,6 @@ export function FooterStatusLine({
   elapsedSeconds,
   segmentsCompleted,
   totalSegments,
-  stageProgressPct,
 }: FooterStatusLineProps) {
   const {
     themeColors,
@@ -115,13 +105,12 @@ export function FooterStatusLine({
     themeColors.dim;
 
   const isRunning = !!stage && stage !== 'done';
-  const effectiveVerboseMode = verboseModeOverride ?? verboseMode;
-  const visibility = getFooterVisibility(termWidth, isRunning, totalTokens > 0, !!gitBranch, effectiveVerboseMode);
-  const stagePct = Math.max(0, Math.min(100, Math.round(stageProgressPct ?? 0)));
+  const visibility = getFooterVisibility(termWidth, isRunning, totalTokens > 0);
   const segDone = Math.max(0, segmentsCompleted ?? 0);
 
   return (
-    <Box marginTop={1} paddingLeft={1}>
+    <Box flexDirection="column" marginTop={1} paddingLeft={1}>
+      {/* Line 1: status info */}
       <Text dimColor>
         <Text color={themeColors.muted}>{modelShort}</Text>
         <Text dimColor>{' · '}</Text>
@@ -130,10 +119,7 @@ export function FooterStatusLine({
           <Text><Text dimColor>{' · '}</Text><Text color={themeColors.muted}>{Math.round(elapsedSeconds)}s</Text></Text>
         )}
         {visibility.showSegments && totalSegments !== undefined && totalSegments > 0 && (
-          <Text><Text dimColor>{' · '}</Text><Text color={themeColors.primary}>{segDone}/{totalSegments}</Text></Text>
-        )}
-        {visibility.showStagePct && totalSegments !== undefined && totalSegments > 0 && (
-          <Text><Text dimColor>{' · '}</Text><Text color={themeColors.muted}>stage {stagePct}%</Text></Text>
+          <Text><Text dimColor>{' · '}</Text><Text color={themeColors.primary}>{segDone}/{totalSegments} done</Text></Text>
         )}
         {visibility.showProgress && progress !== undefined && (
           <Text>
@@ -146,19 +132,12 @@ export function FooterStatusLine({
         {visibility.showTokens && (
           <Text><Text dimColor>{' · '}</Text><Text color={tokenColor}>{tokenStr} tokens</Text></Text>
         )}
-        {visibility.showStage && (
-          <Text><Text dimColor>{' · '}</Text><Text color={themeColors.primary}>{stage}</Text></Text>
-        )}
-        {visibility.showBranch && (
-          <Text><Text dimColor>{' · '}</Text><Text color={themeColors.muted}>{gitBranch}</Text></Text>
-        )}
-        {visibility.showVerbose && (
-          <Text><Text dimColor>{' · '}</Text><Text color={themeColors.warn}>verbose</Text></Text>
-        )}
-        {visibility.showHint && hintText && (
-          <Text><Text dimColor>{' · '}</Text><Text color={themeColors.dim}>{hintText}</Text></Text>
-        )}
       </Text>
+
+      {/* Line 2: hint footnotes — always visible */}
+      {hintText && (
+        <Text color={themeColors.dim}>{hintText}</Text>
+      )}
     </Box>
   );
 }

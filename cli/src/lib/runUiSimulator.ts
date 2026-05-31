@@ -73,7 +73,7 @@ export function simulateRunUi(params: {
     progressBar,
     progressPct: clampedPct,
     progressMode,
-    footer: getFooterVisibility(width, running, hasTokens, hasBranch, verbose),
+    footer: getFooterVisibility(width, running, hasTokens),
     segments: segments.map(seg => formatSegmentViewModelForWidth(getSegmentLineViewModel(seg), width)),
   };
 }

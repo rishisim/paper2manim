@@ -2,60 +2,32 @@ import { describe, it, expect } from 'vitest';
 import { getFooterProgressLabel, getFooterVisibility } from './FooterStatusLine.js';
 
 describe('FooterStatusLine visibility', () => {
-  it('80 cols: keeps only high-priority run signals', () => {
-    const vis = getFooterVisibility(80, true, true, true, true);
+  it('80 cols running: shows elapsed, segments, progress, hint', () => {
+    const vis = getFooterVisibility(80, true, true);
     expect(vis.showElapsed).toBe(true);
     expect(vis.showSegments).toBe(true);
-    expect(vis.showStagePct).toBe(false);
     expect(vis.showProgress).toBe(true);
     expect(vis.showTokens).toBe(false);
-    expect(vis.showStage).toBe(false);
-    expect(vis.showBranch).toBe(false);
-    expect(vis.showVerbose).toBe(false);
+    expect(vis.showHint).toBe(true);
   });
 
-  it('100 cols: enables stage-local speed context but still hides branch/tokens', () => {
-    const vis = getFooterVisibility(100, true, true, true, true);
-    expect(vis.showElapsed).toBe(true);
-    expect(vis.showSegments).toBe(true);
-    expect(vis.showStagePct).toBe(true);
-    expect(vis.showProgress).toBe(true);
-    expect(vis.showTokens).toBe(false);
-    expect(vis.showStage).toBe(true);
-    expect(vis.showBranch).toBe(false);
-    expect(vis.showVerbose).toBe(false);
-  });
-
-  it('120 cols: shows expanded context including tokens and branch', () => {
-    const vis = getFooterVisibility(120, true, true, true, false);
-    expect(vis.showElapsed).toBe(true);
-    expect(vis.showSegments).toBe(true);
-    expect(vis.showStagePct).toBe(true);
-    expect(vis.showProgress).toBe(true);
-    expect(vis.showTokens).toBe(false);
-    expect(vis.showBranch).toBe(false);
-  });
-
-  it('140 cols: shows tokens and branch after progress-first fields', () => {
-    const vis = getFooterVisibility(140, true, true, true, false);
-    expect(vis.showProgress).toBe(true);
+  it('160+ cols: shows tokens', () => {
+    const vis = getFooterVisibility(160, true, true);
     expect(vis.showTokens).toBe(true);
-    expect(vis.showBranch).toBe(true);
-  });
-
-  it('shows verbose badge only when verbose is enabled', () => {
-    const on = getFooterVisibility(160, true, true, true, true);
-    const off = getFooterVisibility(160, true, true, true, false);
-    expect(on.showVerbose).toBe(true);
-    expect(off.showVerbose).toBe(false);
   });
 
   it('does not show run-only fields when not running', () => {
-    const vis = getFooterVisibility(140, false, true, true, true);
+    const vis = getFooterVisibility(140, false, true);
     expect(vis.showElapsed).toBe(false);
     expect(vis.showSegments).toBe(false);
-    expect(vis.showStagePct).toBe(false);
+    expect(vis.showProgress).toBe(false);
     expect(vis.showHint).toBe(false);
+  });
+
+  it('narrow terminal hides elapsed and segments', () => {
+    const vis = getFooterVisibility(55, true, true);
+    expect(vis.showElapsed).toBe(false);
+    expect(vis.showSegments).toBe(false);
   });
 });
 

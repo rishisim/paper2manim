@@ -182,10 +182,21 @@ export interface PipelineUpdate {
   video_path?: string;
   project_dir?: string;
   timings?: Array<[string, string, number]>;
+  total_elapsed_seconds?: number;
   tool_call_counts?: Record<string, number>;
   total_tool_calls?: number;
   stitch_errors?: string[];
   failed_segments?: Array<{ id: number; title: string; stage: string; error: string }>;
+  runtime_metrics?: {
+    planner_api_calls: number;
+    segment_repairs: number;
+    code_patch_repairs?: number;
+    full_regen_repairs?: number;
+    same_run_cache_hits: number;
+    stitch_reencode_count: number;
+    copy_trim_fast_paths?: number;
+    stitch_mode_by_segment?: Record<string, string>;
+  };
 
   // Token summary (emitted with the final "done" update)
   token_summary?: {
@@ -213,19 +224,142 @@ export interface PipelineUpdate {
   thinking?: string | boolean;
   tool_call?: { name: string; params: Record<string, unknown>; output?: string };
   tool_result?: { name: string; output: string };
+  stream_event?: {
+    channel: 'code' | 'thinking' | 'console';
+    delta: string;
+    snapshot?: string;
+  };
+  thinking_source?: 'raw_reasoning' | 'inferred_reasoning';
 }
 
-/** Questionnaire question from Python. */
+export type RunEventKind =
+  | 'run_marker'
+  | 'stage_transition'
+  | 'stage_complete'
+  | 'status'
+  | 'activity'
+  | 'segment_phase'
+  | 'segment_terminal'
+  | 'final'
+  | 'diagnostic';
+
+export type RunEventSource =
+  | 'provider_stream'
+  | 'tool_runtime'
+  | 'pipeline_status'
+  | 'ui_derived';
+
+export type ReasoningKind =
+  | 'raw_reasoning'
+  | 'inferred_reasoning'
+  | 'status_summary';
+
+export interface RunEventToolPayload {
+  name: string;
+  params?: Record<string, unknown>;
+  output_preview?: string;
+}
+
+export interface RunEventReasoningPayload {
+  kind: ReasoningKind;
+  text: string;
+}
+
+export interface InspectRow {
+  id: string;
+  event: RunEventRecord;
+  summary: string;
+  badges: string[];
+  preview?: string;
+  groupKey?: string;
+  isExpandable: boolean;
+}
+
+export type BoardRowState = 'live' | 'warning' | 'done' | 'failed' | 'queued';
+
+export type BoardActivityDot = 'reasoning' | 'tool' | 'code' | 'warning' | 'done';
+
+export interface BoardRowModel {
+  segmentId: number;
+  title?: string;
+  state: BoardRowState;
+  statusPipState: BoardRowState;
+  currentAction: string;
+  primarySummary: string;
+  secondarySummary?: string;
+  reasoningLabel?: string;
+  reasoningPreview?: string;
+  toolPreview?: string;
+  codePreview?: string[];
+  selectedReasoningPreview?: string;
+  selectedCodePreview?: string[];
+  selectedToolPreview?: string;
+  activityDots: BoardActivityDot[];
+  updatedAgo?: string;
+  lastUpdatedAt?: number;
+  isExpandable: boolean;
+}
+
+export interface RunEventRecord {
+  run_id: string;
+  seq: number;
+  ts: string;
+  kind: RunEventKind;
+  message: string;
+  stage?: StageName | null;
+  segment_id?: number;
+  detail?: string;
+  source?: RunEventSource;
+  worker_role?: WorkerRole;
+  channel?: 'code' | 'thinking' | 'console';
+  tool?: RunEventToolPayload;
+  reasoning?: RunEventReasoningPayload;
+  data?: Record<string, unknown>;
+}
+
+export type QuestionnaireStage = 'goal' | 'refine';
+
+export interface QuestionVisibilityRule {
+  questionId: string;
+  values: string[];
+}
+
+export interface QuestionVisibility {
+  allOf?: QuestionVisibilityRule[];
+  anyOf?: QuestionVisibilityRule[];
+}
+
+export interface QuestionOptionDef {
+  value: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+  summaryLabel?: string;
+  mapsTo?: Record<string, string>;
+}
+
 export interface QuestionDef {
   id: string;
   question: string;
-  options: string[];
+  options: Array<string | QuestionOptionDef>;
   default?: string;
+  helperText?: string;
+  stage?: QuestionnaireStage;
+  summaryLabel?: string;
+  showWhen?: QuestionVisibility;
+}
+
+export interface PreferencesSummaryItem {
+  id: string;
+  label: string;
+  value: string;
+  stage?: QuestionnaireStage;
 }
 
 /** Messages from Python runner (questionnaire + pipeline protocol). */
 export type RunnerMessage =
   | { type: 'questions'; questions: QuestionDef[] }
+  | { type: 'preferences_summary'; summary: string; summary_items?: PreferencesSummaryItem[] }
   | { type: 'pipeline'; update: PipelineUpdate }
   | { type: 'error'; message: string }
   | { type: 'token_usage'; input: number; output: number; cache_read?: number }
@@ -262,6 +396,7 @@ export interface CompletedStage {
 /** Per-segment state during code generation. */
 export interface SegmentState {
   id: number;
+  title?: string;
   phase: string;
   prettyPhase: string;
   attempt: number;
@@ -269,6 +404,21 @@ export interface SegmentState {
   failed: boolean;
   startedAt?: number;
   finishedAt?: number;
+  updatedAt?: number;
+  currentWorker?: WorkerRole;
+  currentTask?: string;
+  latestInference?: string;
+  latestCodeSummary?: string;
+  latestCheck?: string;
+  latestWarning?: string;
+  workerRoles?: WorkerRole[];
+  workerStates?: Partial<Record<WorkerRole, WorkerStatus>>;
+  completedBadges?: string[];
+  trace?: SegmentTraceEntry[];
+  liveCode?: string;
+  liveThinking?: string;
+  liveConsole?: string;
+  latestReasoningKind?: ReasoningKind;
   // Agent activity (Claude Code-style display)
   isThinking?: boolean;
   thinkingText?: string;
@@ -277,6 +427,39 @@ export interface SegmentState {
   lastToolResult?: { name: string; output: string };
   /** First actionable hint shown when a segment fails. */
   failHint?: string;
+}
+
+export type WorkerRole =
+  | 'planner'
+  | 'tts'
+  | 'coder'
+  | 'verifier'
+  | 'renderer'
+  | 'stitcher';
+
+export type WorkerStatus =
+  | 'queued'
+  | 'working'
+  | 'blocked'
+  | 'warning'
+  | 'done'
+  | 'failed';
+
+export type SegmentTraceCategory =
+  | 'status'
+  | 'inference'
+  | 'code'
+  | 'check'
+  | 'render'
+  | 'warning'
+  | 'completion';
+
+export interface SegmentTraceEntry {
+  id: string;
+  category: SegmentTraceCategory;
+  text: string;
+  ts: number;
+  workerRole?: WorkerRole;
 }
 
 /** A project entry from the workspace. */

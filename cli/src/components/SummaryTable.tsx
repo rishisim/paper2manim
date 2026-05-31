@@ -7,25 +7,33 @@ import type { CompletedStage, PipelineUpdate } from '../lib/types.js';
 
 interface SummaryTableProps {
   stages: CompletedStage[];
+  timings?: Array<[string, string, number]>;
+  totalElapsedSeconds?: number;
   toolCallCounts?: Record<string, number>;
   totalToolCalls?: number;
   tokenSummary?: PipelineUpdate['token_summary'];
 }
 
-export function SummaryTable({ stages, toolCallCounts, totalToolCalls, tokenSummary }: SummaryTableProps) {
+export function SummaryTable({ stages, timings, totalElapsedSeconds, toolCallCounts, totalToolCalls, tokenSummary }: SummaryTableProps) {
   const { themeColors } = useAppContext();
   const stageConfig = getStageConfig(themeColors);
-  const total = stages.reduce((sum, s) => sum + s.elapsed, 0);
+  const summaryRows = timings && timings.length > 0
+    ? timings.map(([name, status, elapsed]) => ({ label: name, status, elapsed }))
+    : stages.map(stage => {
+        const config = stageConfig[stage.name] ?? stageConfig.done;
+        return { label: config.label, status: stage.status, elapsed: stage.elapsed };
+      });
+  const total = totalElapsedSeconds ?? summaryRows.reduce((sum, row) => sum + row.elapsed, 0);
 
   return (
     <Box flexDirection="column" marginTop={1} paddingLeft={1}>
       <Text bold>Pipeline Summary</Text>
-      {stages.map((stage, i) => {
-        const config = stageConfig[stage.name] ?? stageConfig.done;
-        const icon = stage.status === 'ok' ? '✔' : '✘';
-        const iconColor = stage.status === 'ok' ? themeColors.success : themeColors.error;
+      {summaryRows.map((stage, i) => {
+        const isOk = stage.status !== 'failed';
+        const icon = isOk ? '✔' : '✘';
+        const iconColor = isOk ? themeColors.success : themeColors.error;
         const dur = formatDuration(stage.elapsed);
-        const label = config.label.padEnd(28);
+        const label = stage.label.padEnd(28);
 
         return (
           <Text key={i}>

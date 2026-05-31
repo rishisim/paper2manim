@@ -91,6 +91,7 @@ def test_stitch_ffmpeg_command_args(mock_run, tmp_path):
     updates = list(stitch_video_and_audio(str(video), str(audio), str(output)))
     final = updates[-1]
     assert final["success"] is True
+    assert final["stitch_mode"] == "copy"
 
     args, kwargs = mock_run.call_args
     cmd = args[0]
@@ -175,6 +176,7 @@ def test_stitch_pads_video_when_audio_is_longer(mock_run, tmp_path):
     updates = list(stitch_video_and_audio(str(video), str(audio), str(output)))
     final = updates[-1]
     assert final["success"] is True
+    assert final["stitch_mode"] == "pad"
 
     ffmpeg_cmd = mock_run.call_args_list[-1][0][0]
     assert "-filter:v" in ffmpeg_cmd
@@ -199,10 +201,62 @@ def test_stitch_trims_video_when_it_overshoots_audio(mock_run, tmp_path):
     updates = list(stitch_video_and_audio(str(video), str(audio), str(output)))
     final = updates[-1]
     assert final["success"] is True
+    assert final["stitch_mode"] == "trim"
 
     ffmpeg_cmd = mock_run.call_args_list[-1][0][0]
     assert "-t" in ffmpeg_cmd
     assert ffmpeg_cmd[ffmpeg_cmd.index("-t") + 1] == "6.500"
+    assert "-c:v" in ffmpeg_cmd and ffmpeg_cmd[ffmpeg_cmd.index("-c:v") + 1] == "libx264"
+
+
+@patch("utils.media_assembler.subprocess.run")
+def test_stitch_small_trim_uses_stream_copy_shortest(mock_run, tmp_path):
+    video = tmp_path / "v.mp4"
+    audio = tmp_path / "a.wav"
+    output = tmp_path / "out.mp4"
+    video.write_bytes(b"\x00" * 100)
+    audio.write_bytes(b"\x00" * 100)
+
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="6.9\n", stderr=""),
+        MagicMock(returncode=0, stdout="6.4\n", stderr=""),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+
+    updates = list(stitch_video_and_audio(str(video), str(audio), str(output)))
+    final = updates[-1]
+    assert final["success"] is True
+    assert final["stitch_mode"] == "copy"
+    assert final["copy_trim_fast_path"] is True
+
+    ffmpeg_cmd = mock_run.call_args_list[-1][0][0]
+    assert "-shortest" in ffmpeg_cmd
+    assert "-c:v" in ffmpeg_cmd and ffmpeg_cmd[ffmpeg_cmd.index("-c:v") + 1] == "copy"
+
+
+@patch("utils.media_assembler.subprocess.run")
+def test_stitch_small_trim_falls_back_to_reencode_when_copy_fails(mock_run, tmp_path):
+    video = tmp_path / "v.mp4"
+    audio = tmp_path / "a.wav"
+    output = tmp_path / "out.mp4"
+    video.write_bytes(b"\x00" * 100)
+    audio.write_bytes(b"\x00" * 100)
+
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="6.9\n", stderr=""),
+        MagicMock(returncode=0, stdout="6.4\n", stderr=""),
+        MagicMock(returncode=1, stdout="", stderr="copy trim failed"),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+
+    updates = list(stitch_video_and_audio(str(video), str(audio), str(output)))
+    final = updates[-1]
+    assert final["success"] is True
+    assert final["stitch_mode"] == "trim"
+    assert final["copy_trim_fast_path"] is False
+
+    ffmpeg_cmd = mock_run.call_args_list[-1][0][0]
+    assert "-t" in ffmpeg_cmd
     assert "-c:v" in ffmpeg_cmd and ffmpeg_cmd[ffmpeg_cmd.index("-c:v") + 1] == "libx264"
 
 
@@ -254,28 +308,51 @@ def test_concat_single_segment_creates_output_dir(tmp_path):
 
 @patch("utils.media_assembler.subprocess.run")
 def test_concat_multi_segment_normalizes_then_concats(mock_run, tmp_path):
-    """With multiple segments, should normalize first, then concat."""
+    """When fast concat fails, fall back to normalization and then concat."""
     seg1 = tmp_path / "seg1.mp4"
     seg2 = tmp_path / "seg2.mp4"
     seg1.write_bytes(b"vid1")
     seg2.write_bytes(b"vid2")
     output = tmp_path / "final.mp4"
 
-    # All subprocess.run calls return success
-    mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    mock_run.side_effect = [
+        MagicMock(returncode=1, stdout="", stderr="concat mismatch"),
+        MagicMock(returncode=0, stdout="", stderr=""),
+        MagicMock(returncode=0, stdout="", stderr=""),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
 
     updates = list(concatenate_segments([str(seg1), str(seg2)], str(output)))
     final = updates[-1]
     assert final["success"] is True
 
-    # Should have multiple subprocess.run calls: normalize * 2 + concat * 1
-    assert mock_run.call_count >= 3
+    assert mock_run.call_count == 4
+    assert any("Trying fast concat" in u.get("status", "") for u in updates)
+    assert any("Normalizing 2 segments in parallel" in u.get("status", "") for u in updates)
 
     # The last call should be the concat
     last_call_args = mock_run.call_args_list[-1][0][0]
     assert "ffmpeg" in last_call_args[0]
     assert "-f" in last_call_args
     assert "concat" in last_call_args
+
+
+@patch("utils.media_assembler.subprocess.run")
+def test_concat_multi_segment_uses_fast_path_when_possible(mock_run, tmp_path):
+    seg1 = tmp_path / "seg1.mp4"
+    seg2 = tmp_path / "seg2.mp4"
+    seg1.write_bytes(b"vid1")
+    seg2.write_bytes(b"vid2")
+    output = tmp_path / "final.mp4"
+
+    mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+    updates = list(concatenate_segments([str(seg1), str(seg2)], str(output)))
+    final = updates[-1]
+    assert final["success"] is True
+    assert mock_run.call_count == 1
+    assert any("Trying fast concat" in u.get("status", "") for u in updates)
+    assert not any("Normalizing" in u.get("status", "") for u in updates)
 
 
 @patch("utils.media_assembler.subprocess.run")

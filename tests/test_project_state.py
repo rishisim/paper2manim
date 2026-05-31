@@ -113,6 +113,20 @@ def test_mark_stage_done(tmp_path):
     assert "storyboard.json" in state["stages"]["plan"]["artifacts"]
 
 
+def test_mark_stage_done_can_update_in_memory_state_without_persisting(tmp_path):
+    state = create_project(str(tmp_path), "X", "x")
+    updated = mark_stage_done(
+        str(tmp_path),
+        "plan",
+        artifacts=["storyboard.json"],
+        state=state,
+        persist=False,
+    )
+    assert updated["stages"]["plan"]["done"] is True
+    reloaded = load_project(str(tmp_path))
+    assert "plan" not in reloaded["stages"]
+
+
 def test_mark_stage_done_no_project_raises(tmp_path):
     with pytest.raises(ValueError, match="No project state found"):
         mark_stage_done(str(tmp_path), "plan")
@@ -139,6 +153,26 @@ def test_mark_segment_stage(tmp_path):
     state = mark_segment_stage(str(tmp_path), 1, "tts", done=True, artifacts=["seg1.wav"])
     assert state["segments"]["1"]["tts"]["done"] is True
     assert "seg1.wav" in state["segments"]["1"]["tts"]["artifacts"]
+
+
+def test_mark_segment_stage_can_batch_updates_in_memory(tmp_path):
+    state = create_project(str(tmp_path), "Z", "z", total_segments=3)
+    mark_segment_stage(
+        str(tmp_path),
+        1,
+        "tts",
+        done=True,
+        artifacts=["seg1.wav"],
+        metadata={"duration": 1.5},
+        state=state,
+        persist=False,
+    )
+    assert state["segments"]["1"]["tts"]["duration"] == 1.5
+    reloaded = load_project(str(tmp_path))
+    assert "1" not in reloaded["segments"]
+    save_project(str(tmp_path), state)
+    persisted = load_project(str(tmp_path))
+    assert persisted["segments"]["1"]["tts"]["duration"] == 1.5
 
 
 def test_mark_segment_stage_error(tmp_path):
@@ -188,6 +222,14 @@ def test_mark_project_complete(tmp_path):
     create_project(str(tmp_path), "C", "c")
     state = mark_project_complete(str(tmp_path))
     assert state["status"] == "completed"
+
+
+def test_mark_project_complete_can_update_in_memory_state_without_persisting(tmp_path):
+    state = create_project(str(tmp_path), "C", "c")
+    updated = mark_project_complete(str(tmp_path), state=state, persist=False)
+    assert updated["status"] == "completed"
+    reloaded = load_project(str(tmp_path))
+    assert reloaded["status"] == "in_progress"
 
 
 def test_mark_project_complete_no_project_raises(tmp_path):

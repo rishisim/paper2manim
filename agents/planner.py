@@ -3,7 +3,7 @@ import re
 from typing import Iterator, Literal
 
 from google import genai
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from agents.config import GEMINI_PLANNER_LITE
 
@@ -25,13 +25,24 @@ class SegmentLite(BaseModel):
     title: str = Field(min_length=1)
     visual_instructions: str = Field(min_length=1)
     audio_script: str = Field(min_length=1)
-    complexity: Literal["simple", "complex"] = Field(
+    complexity: Literal["simple", "medium", "complex"] = Field(
         default="complex",
         description=(
             "'simple' for intros, conclusions, basic text/diagrams. "
+            "'medium' for moderately dense derivations. "
             "'complex' for mathematical proofs, intricate animations."
         ),
     )
+
+    @field_validator("complexity", mode="before")
+    @classmethod
+    def _coerce_complexity(cls, value: object) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"simple", "intro", "easy", "low"}:
+            return "simple"
+        if raw in {"medium", "moderate", "mid", "intermediate"}:
+            return "medium"
+        return "complex"
 
 class SegmentedStoryboardLite(BaseModel):
     segments: list[SegmentLite] = Field(min_length=1)
@@ -50,6 +61,22 @@ class ProSegment(BaseModel):
     end_state: str = Field(description="What meaningful object or visual summary remains on screen at the end")
     carry_over_from_previous: str = Field(description="How this segment should acknowledge or reset previous visual state")
     visual_density: Literal["low", "medium", "high"] = Field(default="medium")
+    scene_strategy: Literal["clean_reset", "carry_anchor", "single_focus_derivation", "diagram_then_equation"] = Field(
+        default="clean_reset",
+        description="High-level scene composition strategy to reduce layout risk and preserve continuity.",
+    )
+    render_risk: Literal["low", "medium", "high"] = Field(
+        default="medium",
+        description="Planner estimate of whether this segment needs heavier downstream verification.",
+    )
+    expensive_features_allowed: bool = Field(
+        default=False,
+        description="Whether 3D, updaters, dense transforms, or other expensive features are justified.",
+    )
+    final_anchor_required: str = Field(
+        default="Keep the key equation or diagram visible at the end.",
+        description="Short description of the visual anchor that must remain visible through the final beat.",
+    )
 
     # Mathematical Rigor
     equations_latex: list[str] = Field(description="Raw LaTeX strings (double backslashes)")
@@ -65,7 +92,17 @@ class ProSegment(BaseModel):
     # Timing and Audio
     audio_script: str = Field()
     duration_hint_seconds: int = Field(description="Minimum time needed to digest the visuals")
-    complexity: Literal["simple", "complex"] = Field(default="complex")
+    complexity: Literal["simple", "medium", "complex"] = Field(default="complex")
+
+    @field_validator("complexity", mode="before")
+    @classmethod
+    def _coerce_complexity(cls, value: object) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"simple", "intro", "easy", "low"}:
+            return "simple"
+        if raw in {"medium", "moderate", "mid", "intermediate"}:
+            return "medium"
+        return "complex"
 
 class ProSegmentedStoryboard(BaseModel):
     theme_name: str = Field(description="e.g. 'Classic 3b1b', 'Dark Neon', 'Blueprint'")

@@ -12,6 +12,7 @@ Coordinates the full pipelined-parallel pipeline:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -21,7 +22,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from queue import Empty, Queue
 from typing import Any, Iterator
 
-from agents.coder import run_coder_agent
+from agents.coder import run_code_patch_agent, run_coder_agent
 from agents.config import (
     estimate_cache_savings,
     estimate_cost,
@@ -34,7 +35,7 @@ from agents.planner import plan_segmented_storyboard_lite
 from agents.planner_math2manim import run_math2manim_planner
 from utils.media_assembler import concatenate_segments, mux_subtitles, stitch_video_and_audio
 from utils.subtitle_generator import generate_combined_srt, write_srt
-from utils.parallel_renderer import RenderJob, render_parallel
+from utils.parallel_renderer import RenderJob, submit_render_job
 from utils.project_state import (
     create_project,
     is_segment_stage_done,
@@ -43,8 +44,9 @@ from utils.project_state import (
     mark_project_complete,
     mark_segment_stage,
     mark_stage_done,
+    save_project,
 )
-from utils.code_verifier import verify_code_transitions, verify_segment_code
+from utils.code_verifier import normalize_scene_timing, verify_code_transitions, verify_segment_code
 from utils.tts_engine import generate_voiceover_async
 from utils.visual_critique import critique_project_consistency, critique_video
 
@@ -64,6 +66,59 @@ def _slugify(text: str) -> str:
 
 def _has_valid_code(result: dict) -> bool:
     return bool(result.get("video_path")) or result.get("code_validated", False)
+
+
+def _normalize_code_for_fingerprint(code: str) -> str:
+    lines = [line.rstrip() for line in (code or "").splitlines() if line.strip()]
+    return "\n".join(lines)
+
+
+def _hash_text(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+
+
+def _build_verify_fingerprint(code: str, audio_duration: float, quality_mode: str, render_risk: str) -> str:
+    payload = f"{_normalize_code_for_fingerprint(code)}\n|audio={audio_duration:.2f}|mode={quality_mode}|risk={render_risk}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_critique_fingerprint(code: str, render_quality: str, audio_duration: float) -> str:
+    payload = f"{_normalize_code_for_fingerprint(code)}\n|render={render_quality}|audio={audio_duration:.2f}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _get_segment_stage_entry(state: dict[str, Any] | None, segment_id: int, stage: str) -> dict[str, Any]:
+    return (state or {}).get("segments", {}).get(str(segment_id), {}).get(stage, {}) or {}
+
+
+def _risk_rank(value: str) -> int:
+    return {"low": 0, "medium": 1, "high": 2}.get((value or "medium").lower(), 1)
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return max(minimum, default)
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return max(minimum, default)
+
+
+def _env_truthy(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _segment_concurrency(num_segments: int) -> int:
+    return max(1, min(num_segments, _env_int("PAPER2MANIM_SEGMENT_CONCURRENCY", 5)))
+
+
+def _verify_concurrency() -> int:
+    return _env_int("PAPER2MANIM_VERIFY_CONCURRENCY", 2)
+
+
+def _should_run_project_consistency_check(quality_mode: str) -> bool:
+    return quality_mode == "polished" or _env_truthy("PAPER2MANIM_ENABLE_PROJECT_CONSISTENCY_CHECK")
 
 
 def _quality_mode_settings(questionnaire_answers: dict | None) -> dict[str, Any]:
@@ -181,11 +236,13 @@ def _save_pipeline_summary(
     concept: str = "",
     tool_call_counts: dict[str, int] | None = None,
     token_summary: dict | None = None,
+    runtime_metrics: dict[str, Any] | None = None,
+    total_elapsed_seconds: float | None = None,
 ) -> str:
     """Write a plain-text pipeline summary to ``project_dir/pipeline_summary.txt``."""
     import time as _time
 
-    total = sum(e for _, _, e in timings)
+    total = total_elapsed_seconds if total_elapsed_seconds is not None else sum(e for _, _, e in timings)
     lines: list[str] = []
     lines.append("Pipeline Summary")
     lines.append("=" * 50)
@@ -215,6 +272,23 @@ def _save_pipeline_summary(
             lines.append("")
     else:
         lines.append("No tool calls recorded.")
+        lines.append("")
+
+    if runtime_metrics:
+        lines.append("Runtime Metrics")
+        lines.append("=" * 50)
+        lines.append(f"Planner API calls      : {runtime_metrics.get('planner_api_calls', 0)}")
+        lines.append(f"Segment repairs        : {runtime_metrics.get('segment_repairs', 0)}")
+        lines.append(f"Code patch repairs     : {runtime_metrics.get('code_patch_repairs', 0)}")
+        lines.append(f"Full regen repairs     : {runtime_metrics.get('full_regen_repairs', 0)}")
+        lines.append(f"Same-run cache hits    : {runtime_metrics.get('same_run_cache_hits', 0)}")
+        lines.append(f"Stitch re-encodes      : {runtime_metrics.get('stitch_reencode_count', 0)}")
+        lines.append(f"Copy-trim fast paths   : {runtime_metrics.get('copy_trim_fast_paths', 0)}")
+        stitch_modes = runtime_metrics.get("stitch_mode_by_segment") or {}
+        if stitch_modes:
+            lines.append("")
+            for seg_id, mode in sorted(stitch_modes.items(), key=lambda item: int(item[0])):
+                lines.append(f"  Segment {seg_id:<2} stitch : {mode}")
         lines.append("")
 
     if token_summary:
@@ -368,11 +442,64 @@ def run_segmented_pipeline(
     coding_tokens = new_token_counter()
     verification_tokens = new_token_counter()
     tts_api_calls = 0
+    overall_start = time.perf_counter()
+    runtime_metrics: dict[str, Any] = {
+        "planner_api_calls": 0,
+        "segment_repairs": 0,
+        "code_patch_repairs": 0,
+        "full_regen_repairs": 0,
+        "same_run_cache_hits": 0,
+        "stitch_reencode_count": 0,
+        "copy_trim_fast_paths": 0,
+        "stitch_mode_by_segment": {},
+    }
 
     # ── Resumability: look for an existing incomplete project ─────────
     resumed = False
     project_dir: str | None = None
     state: dict | None = None
+
+    def _flush_state() -> None:
+        if project_dir and state is not None:
+            save_project(project_dir, state)
+
+    def _record_stage_done(stage_name: str, artifacts: list[str] | None = None) -> None:
+        if project_dir is None:
+            return
+        mark_stage_done(project_dir, stage_name, artifacts=artifacts, state=state, persist=False)
+        _flush_state()
+
+    def _record_segment_stage(
+        segment_id: int,
+        stage_name: str,
+        *,
+        done: bool = True,
+        artifacts: list[str] | None = None,
+        error: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        flush: bool = True,
+    ) -> None:
+        if project_dir is None:
+            return
+        mark_segment_stage(
+            project_dir,
+            segment_id,
+            stage_name,
+            done=done,
+            artifacts=artifacts,
+            error=error,
+            metadata=metadata,
+            state=state,
+            persist=False,
+        )
+        if flush:
+            _flush_state()
+
+    def _record_project_complete() -> None:
+        if project_dir is None:
+            return
+        mark_project_complete(project_dir, state=state, persist=False)
+        _flush_state()
 
     if not force_restart:
         if resume_dir:
@@ -398,119 +525,33 @@ def run_segmented_pipeline(
                         "resumed": True,
                     }
 
-    # ── Step 1: Planning ──────────────────────────────────────────────
+    # ── Step 1: Planning + streaming segment execution ────────────────
 
     storyboard = None
+    partial_storyboard: dict[str, Any] | None = None
+    segments: list[dict[str, Any]] = []
+    num_segments = 0
     timings: list[tuple[str, str, float]] = []
-
-    if resumed and state and is_stage_done(state, "plan"):
-        # Try to load cached storyboard from disk
-        cached_sb = _load_storyboard(project_dir)
-        if cached_sb and "segments" in cached_sb:
-            storyboard = cached_sb
-            segments = storyboard["segments"]
-            num_segments = len(segments)
-            timings.append(("Plan", "skipped", 0.0))
-            yield {
-                "stage": "plan",
-                "status": f"Skipping (already completed) — {num_segments} segments",
-                "skipped": True,
-                "storyboard": storyboard,
-                "num_segments": num_segments,
-            }
-        else:
-            # Plan was marked done but storyboard file is missing/corrupt;
-            # must re-plan.
-            resumed = False
-            state = None
-
-    if storyboard is None:
-        yield {"stage": "plan", "status": "Starting segmented storyboard planning..."}
-        plan_start = time.perf_counter()
-
-        planner_func = plan_segmented_storyboard_lite if is_lite else run_math2manim_planner
-        planner_kwargs: dict = dict(
-            max_retries=max_retries,
-            previous_storyboard=previous_storyboard,
-            feedback=feedback,
-        )
-        if questionnaire_answers:
-            planner_kwargs["questionnaire_answers"] = questionnaire_answers
-        for update in planner_func(concept, **planner_kwargs):
-            if "status" in update:
-                yield {"stage": "plan", "status": update["status"]}
-            if update.get("final"):
-                if "error" in update:
-                    yield {"stage": "plan", "status": update["error"], "error": update["error"], "final": True}
-                    return
-                storyboard = update["storyboard"]
-                # Extract planner token usage
-                try:
-                    planner_tu = update.get("token_usage")
-                    if planner_tu:
-                        merge_token_usage(planning_tokens, planner_tu)
-                        merge_token_usage(pipeline_tokens, planner_tu)
-                except Exception:
-                    pass  # Never let token tracking crash the pipeline
-
-        if not storyboard:
-            yield {"stage": "plan", "status": "No storyboard generated.", "error": "Empty planner output.", "final": True}
-            return
-
-        segments = storyboard["segments"]
-        num_segments = len(segments)
-        plan_elapsed = time.perf_counter() - plan_start
-        timings.append(("Plan", "ok", plan_elapsed))
-        yield {
-            "stage": "plan",
-            "status": f"Storyboard planned: {num_segments} segments",
-            "storyboard": storyboard,
-            "num_segments": num_segments,
-        }
-
-        # Create project directory (only for fresh runs)
-        if project_dir is None:
-            project_dir = os.path.join(output_base, f"{slug}_{id(storyboard) % 10000:04d}")
-            state = create_project(project_dir, concept, slug, total_segments=num_segments)
-
-        mark_stage_done(project_dir, "plan", artifacts=[])
-        _save_storyboard(project_dir, storyboard)
-        # Reload state after marking stage done
-        state = load_project(project_dir)
-
-    # ── Step 2: Complexity downgrade heuristic ────────────────────────
-    # Moved before the parallel block — only reads segment data.
-
-    _3D_KEYWORDS = {"threedscene", "3d", "surface", "camera_rotation", "set_camera_orientation"}
-    _UPDATER_KEYWORDS = {"always_redraw", "valuetracker", "updater", "add_updater"}
-
-    for seg in segments:
-        if seg.get("complexity") != "complex":
-            continue
-        vis = (seg.get("visual_instructions") or "").lower()
-        eqs = seg.get("equations_latex", [])
-        anims = seg.get("animations", [])
-        has_3d = any(kw in vis for kw in _3D_KEYWORDS)
-        has_updaters = any(kw in vis for kw in _UPDATER_KEYWORDS)
-        if not has_3d and not has_updaters and len(eqs) <= 2 and len(anims) <= 5:
-            seg["complexity"] = "medium"
-
-    # ── Step 3: Pipelined-parallel per-segment processing ─────────────
-    #
-    # Each segment runs through TTS → Code → HD Render → Stitch inside
-    # its own thread.  All segments execute concurrently.  This replaces
-    # the old sequential-stage approach where ALL TTS had to finish
-    # before ANY code generation could start, etc.
-
     tts_results: dict[int, dict] = {}
     code_results: dict[int, dict] = {}
     tool_call_counts: dict[str, int] = {}
     stitch_errors: list[str] = []
-
-    theme_name = storyboard.get("theme_name", "")
-    color_palette = storyboard.get("color_palette", {})
+    segment_results: dict[int, dict] = {}
     status_queue: Queue[dict] = Queue()
     _state_lock = threading.Lock()
+    expensive_llm_gate = threading.Semaphore(_verify_concurrency())
+    theme_name = ""
+    color_palette: dict[str, str] = {}
+    plan_start = time.perf_counter()
+    pipeline_start: float | None = None
+    pipeline_executor: ThreadPoolExecutor | None = None
+    segment_futures: dict[Any, dict[str, Any]] = {}
+    scheduled_segment_ids: set[int] = set()
+    segments_done = 0
+    pipeline_announced = False
+
+    _3D_KEYWORDS = {"threedscene", "3d", "surface", "camera_rotation", "set_camera_orientation"}
+    _UPDATER_KEYWORDS = {"always_redraw", "valuetracker", "updater", "add_updater"}
 
     def _merge_tool_calls(counts: dict[str, int] | None) -> None:
         if not counts:
@@ -520,9 +561,134 @@ def run_segmented_pipeline(
                 continue
             tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + count
 
+    def _prepare_segment(seg: dict[str, Any]) -> dict[str, Any]:
+        seg.setdefault("scene_strategy", "clean_reset")
+        seg.setdefault("render_risk", "medium")
+        seg.setdefault("expensive_features_allowed", False)
+        seg.setdefault("final_anchor_required", seg.get("end_state", "Keep a meaningful anchor visible at the end."))
+        if seg.get("complexity") == "complex":
+            vis = (seg.get("visual_instructions") or "").lower()
+            eqs = seg.get("equations_latex", [])
+            anims = seg.get("animations", [])
+            has_3d = any(kw in vis for kw in _3D_KEYWORDS)
+            has_updaters = any(kw in vis for kw in _UPDATER_KEYWORDS)
+            if not has_3d and not has_updaters and len(eqs) <= 2 and len(anims) <= 5:
+                seg["complexity"] = "medium"
+        return seg
+
+    def _ensure_project_dir(total_segments: int, *, theme_override: str = "", palette_override: dict[str, str] | None = None) -> None:
+        nonlocal project_dir, state, partial_storyboard, theme_name, color_palette
+        if theme_override:
+            theme_name = theme_override
+        if palette_override:
+            color_palette = palette_override
+        if partial_storyboard is None:
+            partial_storyboard = {
+                "theme_name": theme_name,
+                "color_palette": color_palette,
+                "segments": [],
+            }
+        if project_dir is None:
+            project_seed = partial_storyboard if partial_storyboard else {"concept": concept, "segments": total_segments}
+            project_dir = os.path.join(output_base, f"{slug}_{id(project_seed) % 10000:04d}")
+            state = create_project(project_dir, concept, slug, total_segments=total_segments)
+
+    def _record_partial_segment(seg: dict[str, Any]) -> None:
+        nonlocal partial_storyboard
+        if partial_storyboard is None:
+            return
+        existing_segments = [s for s in partial_storyboard["segments"] if s.get("id") != seg["id"]]
+        existing_segments.append(seg)
+        existing_segments.sort(key=lambda item: item.get("id", 0))
+        partial_storyboard["segments"] = existing_segments
+
+    def _ensure_pipeline_executor(total_segments: int) -> bool:
+        nonlocal pipeline_executor, pipeline_start
+        if pipeline_executor is not None:
+            return False
+        pipeline_executor = ThreadPoolExecutor(max_workers=_segment_concurrency(total_segments))
+        pipeline_start = time.perf_counter()
+        return True
+
+    def _consume_segment_future(fut: Any, seg: dict[str, Any]) -> Iterator[dict]:
+        nonlocal segments_done
+        seg_id = seg["id"]
+        try:
+            seg_result = fut.result()
+        except Exception as exc:
+            seg_result = {
+                "segment_id": seg_id,
+                "tts_result": {"success": False},
+                "code_result": {"success": False, "error": str(exc)},
+                "stitch_path": None,
+                "stitch_error": str(exc),
+                "token_usage": None,
+                "tool_call_counts": None,
+                "tts_api_call": False,
+            }
+
+        segment_results[seg_id] = seg_result
+        segments_done += 1
+
+        has_code = _has_valid_code(seg_result["code_result"])
+        yield {
+            "stage": "code",
+            "segment_id": seg_id,
+            "status": (
+                f"Segment {seg_id}: complete ({segments_done}/{max(num_segments, len(scheduled_segment_ids))})"
+                if has_code
+                else f"Segment {seg_id}: failed ({segments_done}/{max(num_segments, len(scheduled_segment_ids))})"
+            ),
+            "segment_phase": "done" if has_code else "failed",
+            "segment_final": True,
+        }
+
+    def _drain_segment_activity(*, wait_for_completion: bool = False, poll_interval: float = 0.1) -> Iterator[dict]:
+        while True:
+            yielded = False
+            pending = set(segment_futures)
+            done = {fut for fut in pending if fut.done()}
+            if wait_for_completion and pending and not done:
+                done, _ = wait(pending, timeout=poll_interval, return_when=FIRST_COMPLETED)
+            status_updates = list(_drain_status_queue(status_queue))
+            if status_updates:
+                yielded = True
+                for msg in status_updates:
+                    yield msg
+            if done:
+                yielded = True
+                for fut in list(done):
+                    seg = segment_futures.pop(fut)
+                    yield from _consume_segment_future(fut, seg)
+            if not wait_for_completion or not segment_futures:
+                if not yielded:
+                    break
+                if not wait_for_completion:
+                    break
+
+    def _schedule_segment(seg: dict[str, Any]) -> bool:
+        nonlocal pipeline_announced, num_segments
+        seg_id = seg["id"]
+        if seg_id in scheduled_segment_ids:
+            return False
+        _prepare_segment(seg)
+        executor_created = _ensure_pipeline_executor(max(num_segments, len(scheduled_segment_ids) + 1))
+        if executor_created and not pipeline_announced:
+            pipeline_announced = True
+        scheduled_segment_ids.add(seg_id)
+        segment_futures[pipeline_executor.submit(_run_segment_pipeline, seg)] = seg  # type: ignore[union-attr]
+        return executor_created
+
     # ── Per-segment pipeline worker ──────────────────────────────────
 
-    def _run_segment_pipeline(seg: dict, few_shot_example: str = "", repair_feedback: str = "") -> dict:
+    def _run_segment_pipeline(
+        seg: dict,
+        few_shot_example: str = "",
+        repair_feedback: str = "",
+        existing_code: str = "",
+        existing_video_path: str | None = None,
+        rerun_mode: str = "full",
+    ) -> dict:
         """Run the full pipeline for one segment: TTS → Code → HD Render → Stitch.
 
         Returns a result dict with tts_result, code_result, stitch_path, etc.
@@ -546,26 +712,59 @@ def run_segmented_pipeline(
             "tts_api_call": False,
             "repair_attempted": False,
             "final_accepted_critique_score": None,
+            "verification_tier": "unverified",
+            "quality_risk": seg.get("render_risk", "medium"),
+            "critique_skipped": False,
+            "expensive_features": [],
+            "stitch_mode": None,
+            "timing_normalization": None,
         }
 
         # ── Phase 1: TTS ──────────────────────────────────────────
         if not skip_audio:
             audio_path = os.path.join(project_dir, f"segment_{seg_id}_audio.wav")
+            audio_script_hash = _hash_text(seg.get("audio_script", ""))
 
             # Check per-segment TTS cache
             cached_tts = False
-            if resumed and state and is_segment_stage_done(state, seg_id, "tts"):
-                if os.path.isfile(audio_path):
-                    result["tts_result"] = {"success": True, "audio_path": audio_path, "duration": 0.0}
+            existing_tts = tts_results.get(seg_id, {})
+            existing_hash = existing_tts.get("audio_script_hash")
+            same_script = existing_hash in {None, audio_script_hash}
+            if existing_tts.get("success") and existing_tts.get("audio_path") and same_script:
+                result["tts_result"] = {
+                    "success": True,
+                    "audio_path": existing_tts.get("audio_path"),
+                    "duration": existing_tts.get("duration", 0.0),
+                    "audio_script_hash": existing_hash or audio_script_hash,
+                }
+                cached_tts = True
+            elif state and is_segment_stage_done(state, seg_id, "tts"):
+                seg_info = state.get("segments", {}).get(str(seg_id), {}).get("tts", {})
+                cached_hash = seg_info.get("audio_script_hash")
+                cached_duration = seg_info.get("duration", 0.0)
+                hash_matches = cached_hash in {None, audio_script_hash}
+                if hash_matches and os.path.isfile(audio_path):
+                    result["tts_result"] = {
+                        "success": True,
+                        "audio_path": audio_path,
+                        "duration": cached_duration,
+                        "audio_script_hash": cached_hash or audio_script_hash,
+                    }
                     cached_tts = True
-                else:
-                    seg_info = state.get("segments", {}).get(str(seg_id), {}).get("tts", {})
+                elif hash_matches:
                     found = next((a for a in seg_info.get("artifacts", []) if a and os.path.isfile(a)), None)
                     if found:
-                        result["tts_result"] = {"success": True, "audio_path": found, "duration": 0.0}
+                        result["tts_result"] = {
+                            "success": True,
+                            "audio_path": found,
+                            "duration": cached_duration,
+                            "audio_script_hash": cached_hash or audio_script_hash,
+                        }
                         cached_tts = True
 
             if cached_tts:
+                if not resumed:
+                    runtime_metrics["same_run_cache_hits"] += 1
                 status_queue.put({
                     "stage": "tts", "segment_id": seg_id,
                     "status": f"Segment {seg_id}: TTS cached",
@@ -586,10 +785,19 @@ def run_segmented_pipeline(
                     tts_r = loop.run_until_complete(coro)
                     result["tts_result"] = tts_r
                     if tts_r.get("success"):
+                        result["tts_result"]["audio_script_hash"] = audio_script_hash
                         result["tts_api_call"] = True
                         with _state_lock:
-                            mark_segment_stage(project_dir, seg_id, "tts", done=True,
-                                               artifacts=[tts_r.get("audio_path", "")])
+                            _record_segment_stage(
+                                seg_id,
+                                "tts",
+                                done=True,
+                                artifacts=[tts_r.get("audio_path", "")],
+                                metadata={
+                                    "duration": tts_r.get("duration", 0.0),
+                                    "audio_script_hash": audio_script_hash,
+                                },
+                            )
                         status_queue.put({
                             "stage": "tts", "segment_id": seg_id,
                             "status": f"Segment {seg_id}: TTS done",
@@ -597,8 +805,7 @@ def run_segmented_pipeline(
                         })
                     else:
                         with _state_lock:
-                            mark_segment_stage(project_dir, seg_id, "tts", done=False,
-                                               error=tts_r.get("error", ""))
+                            _record_segment_stage(seg_id, "tts", done=False, error=tts_r.get("error", ""))
                         status_queue.put({
                             "stage": "tts", "segment_id": seg_id,
                             "status": f"Segment {seg_id}: TTS failed",
@@ -607,7 +814,7 @@ def run_segmented_pipeline(
                 except Exception as e:
                     result["tts_result"] = {"success": False, "error": str(e), "audio_path": None, "duration": 0}
                     with _state_lock:
-                        mark_segment_stage(project_dir, seg_id, "tts", done=False, error=str(e))
+                        _record_segment_stage(seg_id, "tts", done=False, error=str(e))
                     status_queue.put({
                         "stage": "tts", "segment_id": seg_id,
                         "status": f"Segment {seg_id}: TTS error",
@@ -642,27 +849,178 @@ def run_segmented_pipeline(
                     "segment_phase": update.get("phase", "running"),
                     "segment_final": bool(update.get("final")),
                     "code": update.get("code"),
+                    "thinking": update.get("thinking"),
+                    "stream_event": update.get("stream_event"),
+                    "tool_call": (
+                        {
+                            "name": update.get("tool_call", {}).get("name"),
+                            "params": update.get("tool_call", {}).get("input", {}),
+                        }
+                        if update.get("tool_call")
+                        else None
+                    ),
+                    "tool_result": (
+                        {
+                            "name": update.get("tool_result", {}).get("name"),
+                            "output": update.get("tool_result", {}).get("output", ""),
+                        }
+                        if update.get("tool_result")
+                        else None
+                    ),
                 })
             return last_update
 
-        def _verify_and_render(code_r: dict, render_quality: str) -> tuple[dict | None, dict | None]:
+        def _run_code_patch(base_code: str, extra_repair_feedback: str = "") -> dict:
+            original_instructions = seg["visual_instructions"] if isinstance(seg, dict) else str(seg)
+            last_update: dict = {}
+            for update in run_code_patch_agent(
+                code=base_code,
+                repair_feedback="\n\n".join(part for part in [repair_feedback, extra_repair_feedback] if part),
+                complexity=seg.get("complexity", "complex"),
+                scene_class_name=f"Segment{seg_id}Scene",
+                segment_id=seg_id,
+                original_instructions=original_instructions,
+            ):
+                last_update = update
+                status_queue.put({
+                    "stage": "code_retry", "segment_id": seg_id,
+                    "status": update.get("status", ""),
+                    "segment_phase": update.get("phase", "running"),
+                    "segment_final": bool(update.get("final")),
+                    "code": update.get("code"),
+                    "thinking": update.get("thinking"),
+                    "stream_event": update.get("stream_event"),
+                    "tool_call": (
+                        {
+                            "name": update.get("tool_call", {}).get("name"),
+                            "params": update.get("tool_call", {}).get("input", {}),
+                        }
+                        if update.get("tool_call")
+                        else None
+                    ),
+                    "tool_result": (
+                        {
+                            "name": update.get("tool_result", {}).get("name"),
+                            "output": update.get("tool_result", {}).get("output", ""),
+                        }
+                        if update.get("tool_result")
+                        else None
+                    ),
+                })
+            return last_update
+
+        def _absorb_code_update(update: dict) -> None:
+            if update.get("token_usage"):
+                result["token_usage"] = update.get("token_usage")
+            if update.get("tool_call_counts"):
+                result["tool_call_counts"] = update.get("tool_call_counts")
+
+        def _attempt_patch_then_regen(base_code: str, patch_feedback: str, *, allow_full_regen: bool = True) -> dict:
+            runtime_metrics["code_patch_repairs"] += 1
+            patched_update = _run_code_patch(base_code, patch_feedback)
+            _absorb_code_update(patched_update)
+            if _has_valid_code(patched_update):
+                return patched_update
+            if not allow_full_regen:
+                return patched_update
+            runtime_metrics["full_regen_repairs"] += 1
+            status_queue.put({
+                "stage": "code_retry", "segment_id": seg_id,
+                "status": f"Segment {seg_id}: targeted patch failed, falling back to full regeneration...",
+                "segment_phase": "running", "segment_final": False,
+            })
+            regenerated = _run_codegen(extra_repair_feedback=patch_feedback)
+            _absorb_code_update(regenerated)
+            return regenerated
+
+        def _verify_and_render(code_r: dict, render_quality: str, *, repaired: bool = False) -> tuple[dict | None, dict | None]:
             verify_result = None
             critique_result = None
             if code_r.get("code"):
-                verify_tokens = result.get("verify_token_usage") or new_token_counter()
-                status_queue.put({
-                    "stage": "verify", "segment_id": seg_id,
-                    "status": f"Segment {seg_id}: verifying code quality...",
-                    "segment_phase": "running", "segment_final": False,
-                })
-                verify_result = verify_segment_code(
-                    seg_id,
+                normalization = normalize_scene_timing(
                     code_r["code"],
-                    segment_context=seg.get("visual_instructions", ""),
-                    audio_duration=result["tts_result"].get("duration", 0.0) or 0.0,
-                    token_counter=verify_tokens,
+                    result["tts_result"].get("duration", 0.0) or 0.0,
                 )
-                result["verify_token_usage"] = verify_tokens
+                if normalization.changed and normalization.code != code_r["code"]:
+                    code_r["code"] = normalization.code
+                    result["timing_normalization"] = {
+                        "mode": normalization.mode,
+                        "estimated_before": normalization.estimated_before,
+                        "estimated_after": normalization.estimated_after,
+                        "residual_delta": normalization.residual_delta,
+                    }
+                    status_queue.put({
+                        "stage": "verify", "segment_id": seg_id,
+                        "status": (
+                            f"Segment {seg_id}: timing normalized via {normalization.mode} "
+                            f"(residual {abs(normalization.residual_delta or 0.0):.2f}s)"
+                        ),
+                        "segment_phase": "running", "segment_final": False,
+                    })
+                verify_tokens = result.get("verify_token_usage") or new_token_counter()
+                verify_fingerprint = _build_verify_fingerprint(
+                    code_r["code"],
+                    result["tts_result"].get("duration", 0.0) or 0.0,
+                    quality_settings["quality_mode"],
+                    seg.get("render_risk", "medium"),
+                )
+                with _state_lock:
+                    verify_entry = _get_segment_stage_entry(state, seg_id, "verify")
+                cached_verify = verify_entry.get("done") and verify_entry.get("fingerprint") == verify_fingerprint
+                if cached_verify:
+                    if not resumed:
+                        runtime_metrics["same_run_cache_hits"] += 1
+                    verify_result = type("CachedVerifyResult", (), {
+                        "segment_id": seg_id,
+                        "passed": verify_entry.get("passed", True),
+                        "issues": verify_entry.get("issues", []),
+                        "suggestions": verify_entry.get("suggestions", []),
+                        "static_issues": verify_entry.get("static_issues", []),
+                        "verification_tier": verify_entry.get("verification_tier", "static"),
+                        "quality_risk": verify_entry.get("quality_risk", seg.get("render_risk", "medium")),
+                        "expensive_features": verify_entry.get("expensive_features", []),
+                    })()
+                    status_queue.put({
+                        "stage": "verify", "segment_id": seg_id,
+                        "status": f"Segment {seg_id}: verification cached",
+                        "segment_phase": "done", "segment_final": True,
+                        "verification_tier": getattr(verify_result, "verification_tier", "static"),
+                        "quality_risk": getattr(verify_result, "quality_risk", seg.get("render_risk", "medium")),
+                        "skipped": True,
+                    })
+                else:
+                    status_queue.put({
+                        "stage": "verify", "segment_id": seg_id,
+                        "status": f"Segment {seg_id}: verifying code quality...",
+                        "segment_phase": "running", "segment_final": False,
+                    })
+                    with expensive_llm_gate:
+                        verify_result = verify_segment_code(
+                            seg_id,
+                            code_r["code"],
+                            segment_context=seg.get("visual_instructions", ""),
+                            audio_duration=result["tts_result"].get("duration", 0.0) or 0.0,
+                            token_counter=verify_tokens,
+                            quality_mode=quality_settings["quality_mode"],
+                            render_risk=seg.get("render_risk", "medium"),
+                        )
+                    result["verify_token_usage"] = verify_tokens
+                    with _state_lock:
+                        _record_segment_stage(
+                            seg_id,
+                            "verify",
+                            done=True,
+                            metadata={
+                                "fingerprint": verify_fingerprint,
+                                "passed": getattr(verify_result, "passed", True),
+                                "issues": list(getattr(verify_result, "issues", []) or []),
+                                "suggestions": list(getattr(verify_result, "suggestions", []) or []),
+                                "static_issues": list(getattr(verify_result, "static_issues", []) or []),
+                                "verification_tier": getattr(verify_result, "verification_tier", "static"),
+                                "quality_risk": getattr(verify_result, "quality_risk", seg.get("render_risk", "medium")),
+                                "expensive_features": list(getattr(verify_result, "expensive_features", []) or []),
+                            },
+                        )
                 status_queue.put({
                     "stage": "verify", "segment_id": seg_id,
                     "status": (
@@ -672,7 +1030,12 @@ def run_segmented_pipeline(
                     ),
                     "segment_phase": "done" if verify_result.passed else "failed",
                     "segment_final": True,
+                    "verification_tier": getattr(verify_result, "verification_tier", "static"),
+                    "quality_risk": getattr(verify_result, "quality_risk", seg.get("render_risk", "medium")),
                 })
+                result["verification_tier"] = getattr(verify_result, "verification_tier", "static")
+                result["quality_risk"] = getattr(verify_result, "quality_risk", seg.get("render_risk", "medium"))
+                result["expensive_features"] = list(getattr(verify_result, "expensive_features", []) or [])
 
             if _has_valid_code(code_r) and code_r.get("code"):
                 status_queue.put({
@@ -687,39 +1050,124 @@ def run_segmented_pipeline(
                     timeout_seconds=render_timeout_seconds or 300,
                     output_dir=seg_output_dir,
                 )
-                hd_results = render_parallel([hd_job])
-                hd_result = hd_results[0] if hd_results else None
+                try:
+                    hd_result = submit_render_job(hd_job).result()
+                except Exception as exc:
+                    hd_result = type("RenderFailure", (), {"success": False, "video_path": None, "error": str(exc)})()
                 if hd_result and hd_result.success and hd_result.video_path:
                     code_r["video_path"] = hd_result.video_path
                     with _state_lock:
-                        mark_segment_stage(project_dir, seg_id, "hd_render", done=True, artifacts=[hd_result.video_path])
+                        _record_segment_stage(
+                            seg_id,
+                            "hd_render",
+                            done=True,
+                            artifacts=[hd_result.video_path],
+                            metadata={
+                                "quality_risk": result["quality_risk"],
+                                "verification_tier": result["verification_tier"],
+                            },
+                        )
                     status_queue.put({
                         "stage": "render", "segment_id": seg_id,
                         "status": f"Segment {seg_id}: HD render done",
                         "segment_phase": "done", "segment_final": True,
                     })
-                    critique_tokens = result.get("verify_token_usage") or new_token_counter()
-                    critique_result = critique_video(
-                        hd_result.video_path,
-                        segment_context=seg.get("visual_instructions", ""),
-                        token_counter=critique_tokens,
+                    critique_needed = bool(
+                        repaired
+                        or (verify_result and not getattr(verify_result, "passed", True))
+                        or seg.get("render_risk", "medium") == "high"
+                        or result["expensive_features"]
                     )
-                    result["verify_token_usage"] = critique_tokens
-                    result["final_accepted_critique_score"] = critique_result.score
-                    status_queue.put({
-                        "stage": "verify", "segment_id": seg_id,
-                        "status": (
-                            f"Segment {seg_id}: visual critique passed"
-                            if critique_result.passed
-                            else f"Segment {seg_id}: visual critique warnings - {'; '.join(critique_result.issues[:2])}"
-                        ),
-                        "segment_phase": "done" if critique_result.passed else "failed",
-                        "segment_final": True,
-                    })
+                    critique_fingerprint = _build_critique_fingerprint(
+                        code_r["code"],
+                        render_quality,
+                        result["tts_result"].get("duration", 0.0) or 0.0,
+                    )
+                    with _state_lock:
+                        critique_entry = _get_segment_stage_entry(state, seg_id, "critique")
+                    cached_critique = critique_entry.get("done") and critique_entry.get("fingerprint") == critique_fingerprint
+                    if cached_critique:
+                        if not resumed:
+                            runtime_metrics["same_run_cache_hits"] += 1
+                        critique_result = type("CachedCritiqueResult", (), {
+                            "passed": critique_entry.get("passed", True),
+                            "score": critique_entry.get("score", 0.0),
+                            "issues": critique_entry.get("issues", []),
+                            "suggestions": critique_entry.get("suggestions", []),
+                            "sub_scores": critique_entry.get("sub_scores", {}),
+                        })()
+                        result["critique_skipped"] = critique_entry.get("critique_skipped", False)
+                    elif critique_needed:
+                        critique_tokens = result.get("verify_token_usage") or new_token_counter()
+                        with expensive_llm_gate:
+                            critique_result = critique_video(
+                                hd_result.video_path,
+                                segment_context=seg.get("visual_instructions", ""),
+                                token_counter=critique_tokens,
+                                use_vision_model=bool(
+                                    repaired
+                                    or seg.get("render_risk", "medium") == "high"
+                                    or not verify_result
+                                    or not getattr(verify_result, "passed", True)
+                                ),
+                            )
+                        result["verify_token_usage"] = critique_tokens
+                        with _state_lock:
+                            _record_segment_stage(
+                                seg_id,
+                                "critique",
+                                done=True,
+                                metadata={
+                                    "fingerprint": critique_fingerprint,
+                                    "passed": getattr(critique_result, "passed", True),
+                                    "score": getattr(critique_result, "score", 0.0),
+                                    "issues": list(getattr(critique_result, "issues", []) or []),
+                                    "suggestions": list(getattr(critique_result, "suggestions", []) or []),
+                                    "sub_scores": dict(getattr(critique_result, "sub_scores", {}) or {}),
+                                    "critique_skipped": False,
+                                },
+                            )
+                    else:
+                        result["critique_skipped"] = True
+                        critique_result = None
+                        with _state_lock:
+                            _record_segment_stage(
+                                seg_id,
+                                "critique",
+                                done=True,
+                                metadata={
+                                    "fingerprint": critique_fingerprint,
+                                    "passed": True,
+                                    "score": None,
+                                    "issues": [],
+                                    "suggestions": [],
+                                    "sub_scores": {},
+                                    "critique_skipped": True,
+                                },
+                            )
+                        status_queue.put({
+                            "stage": "verify", "segment_id": seg_id,
+                            "status": f"Segment {seg_id}: visual critique skipped (low risk)",
+                            "segment_phase": "done", "segment_final": True,
+                            "critique_skipped": True,
+                        })
+                    if critique_result is not None:
+                        result["final_accepted_critique_score"] = getattr(critique_result, "score", None)
+                        status_queue.put({
+                            "stage": "verify", "segment_id": seg_id,
+                            "status": (
+                                f"Segment {seg_id}: visual critique passed"
+                                if critique_result.passed
+                                else f"Segment {seg_id}: visual critique warnings - {'; '.join(critique_result.issues[:2])}"
+                            ),
+                            "segment_phase": "done" if critique_result.passed else "failed",
+                            "segment_final": True,
+                            "critique_skipped": False,
+                        })
                 else:
                     err = hd_result.error if hd_result else "Unknown"
                     with _state_lock:
-                        mark_segment_stage(project_dir, seg_id, "hd_render", done=False, error=err or "Unknown")
+                        _record_segment_stage(seg_id, "hd_render", done=False, error=err or "Unknown")
                     status_queue.put({
                         "stage": "render", "segment_id": seg_id,
                         "status": f"Segment {seg_id}: HD render failed, using preview",
@@ -729,8 +1177,16 @@ def run_segmented_pipeline(
 
         # ── Phase 2-3: Code generation, verification, render, repair ──
         code_cached = False
-        if resumed and state and is_segment_stage_done(state, seg_id, "code"):
-            seg_artifacts = state.get("segments", {}).get(str(seg_id), {}).get("code", {}).get("artifacts", [])
+        code_r = result["code_result"]
+        allow_cached_codegen = (
+            not repair_feedback
+            and not few_shot_example
+            and not existing_code
+            and rerun_mode == "full"
+        )
+        if allow_cached_codegen and state and is_segment_stage_done(state, seg_id, "code"):
+            code_entry = state.get("segments", {}).get(str(seg_id), {}).get("code", {})
+            seg_artifacts = code_entry.get("artifacts", [])
             video_found = None
             for art in seg_artifacts:
                 if art and os.path.isfile(art):
@@ -742,11 +1198,21 @@ def run_segmented_pipeline(
                         video_found = os.path.join(seg_output_dir, f_name)
                         break
             if video_found:
+                if not resumed:
+                    runtime_metrics["same_run_cache_hits"] += 1
                 result["code_result"] = {
-                    "success": True, "video_path": video_found,
-                    "code_validated": True, "code": "",
+                    "success": True,
+                    "video_path": video_found,
+                    "code_validated": True,
+                    "code": "",
                 }
                 code_cached = True
+                result["quality_risk"] = code_entry.get("quality_risk", result["quality_risk"])
+                result["verification_tier"] = code_entry.get("verification_tier", result["verification_tier"])
+                result["repair_attempted"] = code_entry.get("repair_attempted", False)
+                critique_entry = state.get("segments", {}).get(str(seg_id), {}).get("critique", {})
+                result["critique_skipped"] = critique_entry.get("critique_skipped", False)
+                result["final_accepted_critique_score"] = critique_entry.get("score")
                 status_queue.put({
                     "stage": "code", "segment_id": seg_id,
                     "status": f"Segment {seg_id}: code cached",
@@ -754,18 +1220,94 @@ def run_segmented_pipeline(
                     "skipped": True,
                 })
 
-        if not code_cached:
+        if rerun_mode == "stitch_only":
+            result["code_result"] = {
+                "success": True,
+                "video_path": existing_video_path,
+                "code_validated": bool(existing_video_path or existing_code),
+                "code": existing_code,
+            }
+            code_r = result["code_result"]
+        elif rerun_mode == "render_only" and existing_code:
+            result["code_result"] = {
+                "success": True,
+                "video_path": existing_video_path,
+                "code_validated": True,
+                "code": existing_code,
+            }
+            code_r = result["code_result"]
+            status_queue.put({
+                "stage": "code", "segment_id": seg_id,
+                "status": f"Segment {seg_id}: reusing validated code for render retry",
+                "segment_phase": "done", "segment_final": True,
+                "skipped": True,
+            })
+            verify_result, critique_result = _verify_and_render(code_r, quality_settings["base_render_quality"])
+            result["verify_result"] = verify_result
+            result["critique_result"] = critique_result
+        elif rerun_mode == "patch" and existing_code:
+            result["repair_attempted"] = True
+            status_queue.put({
+                "stage": "code_retry", "segment_id": seg_id,
+                "status": f"Segment {seg_id}: repairing existing code...",
+                "segment_phase": "running", "segment_final": False,
+            })
+            repaired_update = _attempt_patch_then_regen(existing_code, repair_feedback, allow_full_regen=True)
+            result["code_result"] = repaired_update
+            code_r = result["code_result"]
+            with _state_lock:
+                if _has_valid_code(code_r):
+                    _record_segment_stage(
+                        seg_id,
+                        "code",
+                        done=True,
+                        artifacts=[code_r.get("video_path", "")],
+                        metadata={
+                            "quality_risk": result["quality_risk"],
+                            "verification_tier": result["verification_tier"],
+                            "repair_attempted": True,
+                        },
+                    )
+                else:
+                    _record_segment_stage(seg_id, "code", done=False, error=code_r.get("error", "Code repair failed"))
+            repaired_verify, repaired_critique = _verify_and_render(
+                code_r,
+                quality_settings["repair_render_quality"],
+                repaired=True,
+            )
+            result["verify_result"] = repaired_verify
+            result["critique_result"] = repaired_critique
+            status_queue.put({
+                "stage": "code_retry", "segment_id": seg_id,
+                "status": (
+                    f"Segment {seg_id}: repair complete"
+                    if _has_valid_code(code_r)
+                    else f"Segment {seg_id}: repair failed"
+                ),
+                "segment_phase": "done" if _has_valid_code(code_r) else "failed",
+                "segment_final": True,
+            })
+        elif not code_cached:
             initial_update = _run_codegen()
             result["code_result"] = initial_update
-            result["token_usage"] = initial_update.get("token_usage")
-            result["tool_call_counts"] = initial_update.get("tool_call_counts")
+            _absorb_code_update(initial_update)
 
             has_code = _has_valid_code(initial_update)
             with _state_lock:
                 if has_code:
-                    mark_segment_stage(project_dir, seg_id, "code", done=True, artifacts=[initial_update.get("video_path", "")])
+                    _record_segment_stage(
+                        seg_id,
+                        "code",
+                        done=True,
+                        artifacts=[initial_update.get("video_path", "")],
+                        metadata={
+                            "quality_risk": seg.get("render_risk", "medium"),
+                            "verification_tier": "pending",
+                            "repair_attempted": False,
+                        },
+                    )
                 else:
-                    mark_segment_stage(project_dir, seg_id, "code", done=False, error=initial_update.get("error", "Code generation failed"))
+                    _record_segment_stage(seg_id, "code", done=False, error=initial_update.get("error", "Code generation failed"))
 
             code_r = result["code_result"]
             verify_result, critique_result = _verify_and_render(code_r, quality_settings["base_render_quality"])
@@ -776,13 +1318,17 @@ def run_segmented_pipeline(
                 critique_result
                 and (
                     not critique_result.passed
-                    or critique_result.score < quality_settings["critique_threshold"]
+                    or (
+                        getattr(critique_result, "score", None) is not None
+                        and critique_result.score < quality_settings["critique_threshold"]
+                    )
                 )
             )
             verify_needs_repair = bool(verify_result and not verify_result.passed)
 
             if quality_settings["allow_repair"] and _has_valid_code(code_r) and (verify_needs_repair or critique_needs_repair):
                 result["repair_attempted"] = True
+                runtime_metrics["segment_repairs"] += 1
                 repair_feedback = _build_repair_feedback(
                     verify_issues=(verify_result.issues if verify_result else []),
                     critique_issues=(critique_result.issues if critique_result else []),
@@ -792,17 +1338,31 @@ def run_segmented_pipeline(
                     "status": f"Segment {seg_id}: repairing quality issues...",
                     "segment_phase": "running", "segment_final": False,
                 })
-                repaired_update = _run_codegen(extra_repair_feedback=repair_feedback)
+                repaired_update = _attempt_patch_then_regen(code_r.get("code", ""), repair_feedback, allow_full_regen=True)
                 result["code_result"] = repaired_update
-                result["token_usage"] = repaired_update.get("token_usage") or result["token_usage"]
-                result["tool_call_counts"] = repaired_update.get("tool_call_counts") or result["tool_call_counts"]
                 code_r = result["code_result"]
-                repaired_verify, repaired_critique = _verify_and_render(code_r, quality_settings["repair_render_quality"])
+                repaired_verify, repaired_critique = _verify_and_render(
+                    code_r,
+                    quality_settings["repair_render_quality"],
+                    repaired=True,
+                )
                 result["verify_result"] = repaired_verify or verify_result
                 result["critique_result"] = repaired_critique or critique_result
                 with _state_lock:
                     if _has_valid_code(code_r):
-                        mark_segment_stage(project_dir, seg_id, "code", done=True, artifacts=[code_r.get("video_path", "")])
+                        _record_segment_stage(
+                            seg_id,
+                            "code",
+                            done=True,
+                            artifacts=[code_r.get("video_path", "")],
+                            metadata={
+                                "quality_risk": result["quality_risk"],
+                                "verification_tier": result["verification_tier"],
+                                "repair_attempted": True,
+                            },
+                        )
+                    else:
+                        _record_segment_stage(seg_id, "code", done=False, error=code_r.get("error", "Code repair failed"))
                 status_queue.put({
                     "stage": "code_retry", "segment_id": seg_id,
                     "status": (
@@ -819,20 +1379,27 @@ def run_segmented_pipeline(
         # ── Phase 4: Stitch ───────────────────────────────────────
         if not skip_audio:
             stitch_cached = False
-            if resumed and state and is_segment_stage_done(state, seg_id, "stitch"):
+            allow_cached_stitch = not repair_feedback and not few_shot_example and rerun_mode == "full"
+            if allow_cached_stitch and state and is_segment_stage_done(state, seg_id, "stitch"):
                 stitched_path = os.path.join(project_dir, f"segment_{seg_id}_stitched.mp4")
+                seg_stitch_info = state.get("segments", {}).get(str(seg_id), {}).get("stitch", {})
                 if os.path.isfile(stitched_path):
                     result["stitch_path"] = stitched_path
+                    result["stitch_mode"] = seg_stitch_info.get("stitch_mode")
                     stitch_cached = True
                 else:
-                    seg_stitch_info = state.get("segments", {}).get(str(seg_id), {}).get("stitch", {})
                     found_art = next((a for a in seg_stitch_info.get("artifacts", [])
                                       if a and os.path.isfile(a)), None)
                     if found_art:
                         result["stitch_path"] = found_art
+                        result["stitch_mode"] = seg_stitch_info.get("stitch_mode")
                         stitch_cached = True
 
             if stitch_cached:
+                if not resumed:
+                    runtime_metrics["same_run_cache_hits"] += 1
+                if result.get("stitch_mode"):
+                    runtime_metrics["stitch_mode_by_segment"][str(seg_id)] = result["stitch_mode"]
                 status_queue.put({
                     "stage": "stitch", "segment_id": seg_id,
                     "status": f"Segment {seg_id}: stitch cached",
@@ -841,7 +1408,7 @@ def run_segmented_pipeline(
                     "skipped": True,
                 })
             else:
-                video_path = code_r.get("video_path")
+                video_path = existing_video_path or code_r.get("video_path")
                 audio_path = result["tts_result"].get("audio_path")
                 tts_success = result["tts_result"].get("success", False)
 
@@ -850,9 +1417,16 @@ def run_segmented_pipeline(
                 elif not audio_path or not tts_success:
                     # No audio — use raw video
                     result["stitch_path"] = video_path
+                    result["stitch_mode"] = "raw"
+                    runtime_metrics["stitch_mode_by_segment"][str(seg_id)] = "raw"
                     with _state_lock:
-                        mark_segment_stage(project_dir, seg_id, "stitch", done=True,
-                                           artifacts=[video_path])
+                        _record_segment_stage(
+                            seg_id,
+                            "stitch",
+                            done=True,
+                            artifacts=[video_path],
+                            metadata={"stitch_mode": "raw"},
+                        )
                 else:
                     stitched_output = os.path.join(project_dir, f"segment_{seg_id}_stitched.mp4")
                     stitch_r = None
@@ -862,9 +1436,20 @@ def run_segmented_pipeline(
 
                     if stitch_r and stitch_r.get("success"):
                         result["stitch_path"] = stitch_r["output_path"]
+                        result["stitch_mode"] = stitch_r.get("stitch_mode")
+                        runtime_metrics["stitch_mode_by_segment"][str(seg_id)] = stitch_r.get("stitch_mode")
+                        if stitch_r.get("copy_trim_fast_path"):
+                            runtime_metrics["copy_trim_fast_paths"] += 1
+                        if stitch_r.get("stitch_mode") in {"pad", "trim"}:
+                            runtime_metrics["stitch_reencode_count"] += 1
                         with _state_lock:
-                            mark_segment_stage(project_dir, seg_id, "stitch", done=True,
-                                               artifacts=[stitch_r["output_path"]])
+                            _record_segment_stage(
+                                seg_id,
+                                "stitch",
+                                done=True,
+                                artifacts=[stitch_r["output_path"]],
+                                metadata={"stitch_mode": stitch_r.get("stitch_mode")},
+                            )
                         status_queue.put({
                             "stage": "stitch", "segment_id": seg_id,
                             "status": f"Segment {seg_id}: stitched",
@@ -876,74 +1461,161 @@ def run_segmented_pipeline(
                         result["stitch_error"] = f"Segment {seg_id}: stitch failed ({err}), using raw video"
                         result["stitch_path"] = video_path
                         with _state_lock:
-                            mark_segment_stage(project_dir, seg_id, "stitch", done=False, error=err)
+                            _record_segment_stage(seg_id, "stitch", done=False, error=err)
         else:
             # skip_audio: use video directly
             result["stitch_path"] = code_r.get("video_path")
+            result["stitch_mode"] = "raw"
+            runtime_metrics["stitch_mode_by_segment"][str(seg_id)] = "raw"
 
         return result
 
-    # ── Launch all segments concurrently ──────────────────────────────
-
-    yield {
-        "stage": "pipeline",
-        "status": f"Processing {num_segments} segments in parallel (TTS \u2192 Code \u2192 Render \u2192 Stitch)...",
-    }
-
-    pipeline_start = time.perf_counter()
-    segment_results: dict[int, dict] = {}
-    max_workers = max(1, min(5, num_segments))
-    segments_done = 0
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures_map: dict[Any, dict] = {}
-        for seg in segments:
-            futures_map[executor.submit(_run_segment_pipeline, seg)] = seg
-
-        for fut, seg in _iter_completed_futures(futures_map, status_queue):
-            if fut is None:
-                yield seg
-                continue
-            seg_id = seg["id"]
-            try:
-                seg_result = fut.result()
-            except Exception as exc:
-                seg_result = {
-                    "segment_id": seg_id,
-                    "tts_result": {"success": False},
-                    "code_result": {"success": False, "error": str(exc)},
-                    "stitch_path": None,
-                    "stitch_error": str(exc),
-                    "token_usage": None,
-                    "tool_call_counts": None,
-                    "tts_api_call": False,
-                }
-
-            segment_results[seg_id] = seg_result
-            segments_done += 1
-
-            has_code = _has_valid_code(seg_result["code_result"])
+    if resumed and state and is_stage_done(state, "plan"):
+        cached_sb = _load_storyboard(project_dir)
+        if cached_sb and "segments" in cached_sb:
+            storyboard = cached_sb
+            segments = storyboard["segments"]
+            num_segments = len(segments)
+            theme_name = storyboard.get("theme_name", "")
+            color_palette = storyboard.get("color_palette", {})
+            timings.append(("Plan", "skipped", 0.0))
             yield {
-                "stage": "code",
-                "segment_id": seg_id,
-                "status": (
-                    f"Segment {seg_id}: complete ({segments_done}/{num_segments})"
-                    if has_code
-                    else f"Segment {seg_id}: failed ({segments_done}/{num_segments})"
-                ),
-                "segment_phase": "done" if has_code else "failed",
-                "segment_final": True,
+                "stage": "plan",
+                "status": f"Skipping (already completed) — {num_segments} segments",
+                "skipped": True,
+                "storyboard": storyboard,
+                "num_segments": num_segments,
             }
+            _ensure_project_dir(num_segments, theme_override=theme_name, palette_override=color_palette)
+        else:
+            resumed = False
+            state = None
 
-        yield from _drain_status_queue(status_queue)
+    if storyboard is None:
+        yield {"stage": "plan", "status": "Starting segmented storyboard planning..."}
 
-    pipeline_elapsed = time.perf_counter() - pipeline_start
+        planner_func = plan_segmented_storyboard_lite if is_lite else run_math2manim_planner
+        planner_kwargs: dict = dict(
+            max_retries=max_retries,
+            previous_storyboard=previous_storyboard,
+            feedback=feedback,
+        )
+        if questionnaire_answers:
+            planner_kwargs["questionnaire_answers"] = questionnaire_answers
+
+        for update in planner_func(concept, **planner_kwargs):
+            partial_segment = update.get("segment_storyboard")
+            if partial_segment:
+                num_segments = max(num_segments, int(update.get("num_segments") or 0) or len(scheduled_segment_ids) + 1)
+                theme_name = update.get("theme_name", theme_name)
+                color_palette = update.get("color_palette", color_palette) or color_palette
+                _ensure_project_dir(num_segments, theme_override=theme_name, palette_override=color_palette)
+                _record_partial_segment(partial_segment)
+                created_executor = _schedule_segment(partial_segment)
+                if created_executor:
+                    yield {
+                        "stage": "pipeline",
+                        "status": f"Processing {num_segments} segments as storyboard segments become ready...",
+                        "num_segments": num_segments,
+                    }
+
+            if "status" in update:
+                if pipeline_announced:
+                    yield {"stage": "pipeline", "status": f"Planning: {update['status']}"}
+                else:
+                    yield {"stage": "plan", "status": update["status"]}
+
+            yield from _drain_segment_activity(wait_for_completion=False)
+
+            if update.get("final"):
+                if "error" in update:
+                    yield {"stage": "plan", "status": update["error"], "error": update["error"], "final": True}
+                    if pipeline_executor is not None:
+                        pipeline_executor.shutdown(wait=False, cancel_futures=False)
+                    return
+                storyboard = update["storyboard"]
+                segments = storyboard["segments"]
+                num_segments = len(segments)
+                theme_name = storyboard.get("theme_name", theme_name)
+                color_palette = storyboard.get("color_palette", color_palette) or color_palette
+                try:
+                    planner_tu = update.get("token_usage")
+                    if planner_tu:
+                        merge_token_usage(planning_tokens, planner_tu)
+                        merge_token_usage(pipeline_tokens, planner_tu)
+                        runtime_metrics["planner_api_calls"] = planner_tu.get("api_calls", planning_tokens["api_calls"])
+                except Exception:
+                    pass
+
+        if not storyboard:
+            yield {"stage": "plan", "status": "No storyboard generated.", "error": "Empty planner output.", "final": True}
+            if pipeline_executor is not None:
+                pipeline_executor.shutdown(wait=False, cancel_futures=False)
+            return
+
+        _ensure_project_dir(num_segments, theme_override=theme_name, palette_override=color_palette)
+        prioritized_segments = sorted(segments, key=lambda s: (-_risk_rank(s.get("render_risk", "medium")), s.get("id", 0)))
+        for seg in prioritized_segments:
+            _prepare_segment(seg)
+            if seg["id"] not in scheduled_segment_ids:
+                created_executor = _schedule_segment(seg)
+                if created_executor:
+                    yield {
+                        "stage": "pipeline",
+                        "status": f"Processing {num_segments} segments as storyboard segments become ready...",
+                        "num_segments": num_segments,
+                    }
+
+        plan_elapsed = time.perf_counter() - plan_start
+        timings.append(("Plan", "ok", plan_elapsed))
+        yield {
+            "stage": "plan" if not pipeline_announced else "pipeline",
+            "status": f"Storyboard planned: {num_segments} segments",
+            "storyboard": storyboard,
+            "num_segments": num_segments,
+        }
+
+        _record_stage_done("plan", artifacts=[])
+        _save_storyboard(project_dir, storyboard)
+    else:
+        prioritized_segments = sorted(segments, key=lambda s: (-_risk_rank(s.get("render_risk", "medium")), s.get("id", 0)))
+        for seg in prioritized_segments:
+            _prepare_segment(seg)
+            if seg["id"] not in scheduled_segment_ids:
+                created_executor = _schedule_segment(seg)
+                if created_executor:
+                    yield {
+                        "stage": "pipeline",
+                        "status": f"Processing {num_segments} segments as storyboard segments become ready...",
+                        "num_segments": num_segments,
+                    }
+
+    if pipeline_executor is None:
+        pipeline_announced = True
+        _ensure_pipeline_executor(max(1, num_segments))
+        yield {
+            "stage": "pipeline",
+            "status": f"Processing {num_segments} segments in parallel (TTS \u2192 Code \u2192 Render \u2192 Stitch)...",
+            "num_segments": num_segments,
+        }
+        prioritized_segments = sorted(segments, key=lambda s: (-_risk_rank(s.get("render_risk", "medium")), s.get("id", 0)))
+        for seg in prioritized_segments:
+            if seg["id"] not in scheduled_segment_ids:
+                _schedule_segment(seg)
+
+    yield from _drain_segment_activity(wait_for_completion=True)
+    if pipeline_executor is not None:
+        pipeline_executor.shutdown(wait=True, cancel_futures=False)
+
+    pipeline_elapsed = 0.0 if pipeline_start is None else time.perf_counter() - pipeline_start
 
     # ── Aggregate results from all workers ────────────────────────────
 
-    for seg_id, seg_r in segment_results.items():
+    def _merge_segment_execution_result(seg_id: int, seg_r: dict) -> None:
+        nonlocal tts_api_calls
         tts_results[seg_id] = seg_r.get("tts_result", {})
         code_results[seg_id] = seg_r.get("code_result", {})
+        segment_results[seg_id] = seg_r
 
         seg_tu = seg_r.get("token_usage")
         if seg_tu:
@@ -957,18 +1629,20 @@ def run_segmented_pipeline(
         if seg_r.get("tts_api_call"):
             tts_api_calls += 1
 
+    for seg_id, seg_r in segment_results.items():
+        _merge_segment_execution_result(seg_id, seg_r)
+
     code_ok = sum(1 for r in code_results.values() if _has_valid_code(r))
     tts_ok = sum(1 for r in tts_results.values() if r.get("success"))
 
     # Mark completed stages
     if tts_ok == num_segments:
-        mark_stage_done(project_dir, "tts", artifacts=[
+        _record_stage_done("tts", artifacts=[
             tts_results[seg["id"]].get("audio_path", "") for seg in segments
             if tts_results.get(seg["id"], {}).get("success")
         ])
     if code_ok == num_segments:
-        mark_stage_done(project_dir, "code", artifacts=[])
-    state = load_project(project_dir)
+        _record_stage_done("code", artifacts=[])
 
     timings.append(("Parallel Pipeline", "ok" if code_ok > 0 else "failed", pipeline_elapsed))
 
@@ -978,6 +1652,106 @@ def run_segmented_pipeline(
         "code_results": code_results,
         "tts_results": tts_results,
     }
+
+    # ── Step 3.0: Retry render-only / stitch-only failures ───────────
+    render_retry_ids = [
+        sid for sid, res in code_results.items()
+        if res.get("code") and not res.get("video_path")
+    ]
+    if render_retry_ids:
+        runtime_metrics["segment_repairs"] += len(render_retry_ids)
+        yield {
+            "stage": "render",
+            "status": f"Retrying HD render for {len(render_retry_ids)} segment(s) using existing code...",
+        }
+        with ThreadPoolExecutor(max_workers=_segment_concurrency(len(render_retry_ids))) as retry_executor:
+            retry_futures: dict[Any, dict] = {}
+            for seg in sorted(
+                [segment for segment in segments if segment["id"] in render_retry_ids],
+                key=lambda s: (-_risk_rank(s.get("render_risk", "medium")), s.get("id", 0)),
+            ):
+                sid = seg["id"]
+                retry_futures[retry_executor.submit(
+                    _run_segment_pipeline,
+                    seg,
+                    "",
+                    "",
+                    code_results.get(sid, {}).get("code", ""),
+                    None,
+                    "render_only",
+                )] = seg
+
+            for fut, seg in _iter_completed_futures(retry_futures, status_queue):
+                if fut is None:
+                    yield seg
+                    continue
+                sid = seg["id"]
+                try:
+                    rerun_result = fut.result()
+                except Exception as exc:
+                    rerun_result = {
+                        "segment_id": sid,
+                        "tts_result": tts_results.get(sid, {}),
+                        "code_result": code_results.get(sid, {}),
+                        "stitch_path": segment_results.get(sid, {}).get("stitch_path"),
+                        "stitch_error": str(exc),
+                        "token_usage": None,
+                        "tool_call_counts": None,
+                        "tts_api_call": False,
+                    }
+                _merge_segment_execution_result(sid, rerun_result)
+
+    stitch_retry_ids = [
+        sid for sid, seg_r in segment_results.items()
+        if seg_r.get("stitch_error")
+        and code_results.get(sid, {}).get("video_path")
+        and tts_results.get(sid, {}).get("success")
+    ]
+    if stitch_retry_ids:
+        runtime_metrics["segment_repairs"] += len(stitch_retry_ids)
+        yield {
+            "stage": "stitch",
+            "status": f"Retrying stitch for {len(stitch_retry_ids)} segment(s) using existing media...",
+        }
+        with ThreadPoolExecutor(max_workers=_segment_concurrency(len(stitch_retry_ids))) as retry_executor:
+            retry_futures: dict[Any, dict] = {}
+            for seg in sorted(
+                [segment for segment in segments if segment["id"] in stitch_retry_ids],
+                key=lambda s: (s.get("id", 0)),
+            ):
+                sid = seg["id"]
+                retry_futures[retry_executor.submit(
+                    _run_segment_pipeline,
+                    seg,
+                    "",
+                    "",
+                    code_results.get(sid, {}).get("code", ""),
+                    code_results.get(sid, {}).get("video_path"),
+                    "stitch_only",
+                )] = seg
+
+            for fut, seg in _iter_completed_futures(retry_futures, status_queue):
+                if fut is None:
+                    yield seg
+                    continue
+                sid = seg["id"]
+                try:
+                    rerun_result = fut.result()
+                except Exception as exc:
+                    rerun_result = {
+                        "segment_id": sid,
+                        "tts_result": tts_results.get(sid, {}),
+                        "code_result": code_results.get(sid, {}),
+                        "stitch_path": segment_results.get(sid, {}).get("stitch_path"),
+                        "stitch_error": str(exc),
+                        "token_usage": None,
+                        "tool_call_counts": None,
+                        "tts_api_call": False,
+                    }
+                _merge_segment_execution_result(sid, rerun_result)
+
+    code_ok = sum(1 for r in code_results.values() if _has_valid_code(r))
+    tts_ok = sum(1 for r in tts_results.values() if r.get("success"))
 
     # ── Step 3.1: Retry failed segments with few-shot ─────────────────
 
@@ -1004,11 +1778,13 @@ def run_segmented_pipeline(
                 seg["complexity"] = "complex"
 
         retry_results: dict[int, dict] = {}
-        retry_max_workers = max(1, min(5, len(failed_segs)))
+        retry_max_workers = _segment_concurrency(len(failed_segs))
+        runtime_metrics["segment_repairs"] += len(failed_segs)
+        runtime_metrics["full_regen_repairs"] += len(failed_segs)
 
         with ThreadPoolExecutor(max_workers=retry_max_workers) as retry_executor:
             retry_futures: dict[Any, dict] = {}
-            for seg in failed_segs:
+            for seg in sorted(failed_segs, key=lambda s: (-_risk_rank(s.get("render_risk", "medium")), s.get("id", 0))):
                 retry_futures[retry_executor.submit(
                     _run_segment_pipeline, seg, few_shot
                 )] = seg
@@ -1072,7 +1848,12 @@ def run_segmented_pipeline(
     }
     if len(final_code_map) >= 2:
         yield {"stage": "verify", "status": "Checking cross-segment code transitions..."}
-        transition_checks = verify_code_transitions(final_code_map, token_counter=verification_tokens)
+        transition_checks = verify_code_transitions(
+            final_code_map,
+            segment_specs={seg["id"]: seg for seg in segments},
+            quality_mode=quality_settings["quality_mode"],
+            token_counter=verification_tokens,
+        )
         transition_repairs = [check for check in transition_checks if not check.smooth]
 
         for check in transition_checks:
@@ -1094,6 +1875,7 @@ def run_segmented_pipeline(
                 if not target_seg:
                     continue
                 feedback = _build_repair_feedback(transition_issues=check.issues)
+                runtime_metrics["segment_repairs"] += 1
                 yield {
                     "stage": "code_retry",
                     "segment_id": check.segment_b_id,
@@ -1101,7 +1883,12 @@ def run_segmented_pipeline(
                     "segment_phase": "running",
                     "segment_final": False,
                 }
-                repaired = _run_segment_pipeline(target_seg, repair_feedback=feedback)
+                repaired = _run_segment_pipeline(
+                    target_seg,
+                    repair_feedback=feedback,
+                    existing_code=code_results.get(check.segment_b_id, {}).get("code", ""),
+                    rerun_mode="patch",
+                )
                 segment_results[check.segment_b_id] = repaired
                 code_results[check.segment_b_id] = repaired.get("code_result", {})
                 tts_results[check.segment_b_id] = repaired.get("tts_result", {})
@@ -1148,7 +1935,7 @@ def run_segmented_pipeline(
             if segment_results.get(seg["id"], {}).get("stitch_path")
         ]
         if code_ok > 0 and not stitch_errors:
-            mark_stage_done(project_dir, "stitch", artifacts=[])
+            _record_stage_done("stitch", artifacts=[])
 
     project_consistency = None
     segment_video_paths = {
@@ -1156,7 +1943,8 @@ def run_segmented_pipeline(
         for seg in segments
         if (segment_results.get(seg["id"], {}).get("stitch_path") or code_results.get(seg["id"], {}).get("video_path"))
     }
-    if len(segment_video_paths) >= 2:
+    run_project_consistency = _should_run_project_consistency_check(quality_settings["quality_mode"])
+    if len(segment_video_paths) >= 2 and run_project_consistency:
         yield {"stage": "verify", "status": "Checking project-level visual consistency before concat..."}
         project_consistency = critique_project_consistency(segment_video_paths, token_counter=verification_tokens)
         if project_consistency is not None:
@@ -1168,6 +1956,12 @@ def run_segmented_pipeline(
                     else f"Project-level consistency warnings - {'; '.join(project_consistency.issues[:2])}"
                 ),
             }
+    elif len(segment_video_paths) >= 2:
+        yield {
+            "stage": "verify",
+            "status": "Skipping project-level visual consistency check for this quality mode",
+            "skipped": True,
+        }
 
     # ── Build per-segment failure summary for error reporting ────────
 
@@ -1189,9 +1983,25 @@ def run_segmented_pipeline(
                 })
         return failures
 
+    def _segment_quality_summary() -> dict[int, dict[str, Any]]:
+        return {
+            sid: {
+                "repair_attempted": segment_results.get(sid, {}).get("repair_attempted", False),
+                "final_accepted_critique_score": segment_results.get(sid, {}).get("final_accepted_critique_score"),
+                "verification_tier": segment_results.get(sid, {}).get("verification_tier"),
+                "critique_skipped": segment_results.get(sid, {}).get("critique_skipped", False),
+                "quality_risk": segment_results.get(sid, {}).get("quality_risk"),
+                "stitch_mode": segment_results.get(sid, {}).get("stitch_mode"),
+                "timing_normalization": segment_results.get(sid, {}).get("timing_normalization"),
+            }
+            for sid in segment_results
+        }
+
     # ── Step 5: Concatenate all segments ──────────────────────────────
 
     if not valid_paths:
+        runtime_metrics["planner_api_calls"] = planning_tokens["api_calls"]
+        total_elapsed_seconds = time.perf_counter() - overall_start
         token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, verification_tokens, tts_api_calls)
         yield {
             "stage": "done",
@@ -1205,16 +2015,20 @@ def run_segmented_pipeline(
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
             "total_tool_calls": sum(tool_call_counts.values()),
             "token_summary": token_summary,
+            "runtime_metrics": runtime_metrics,
+            "total_elapsed_seconds": total_elapsed_seconds,
             "project_consistency": project_consistency,
-            "segment_quality": {
-                sid: {
-                    "repair_attempted": segment_results.get(sid, {}).get("repair_attempted", False),
-                    "final_accepted_critique_score": segment_results.get(sid, {}).get("final_accepted_critique_score"),
-                }
-                for sid in segment_results
-            },
+            "segment_quality": _segment_quality_summary(),
         }
-        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=token_summary)
+        _save_pipeline_summary(
+            timings,
+            project_dir,
+            concept,
+            tool_call_counts=tool_call_counts,
+            token_summary=token_summary,
+            runtime_metrics=runtime_metrics,
+            total_elapsed_seconds=total_elapsed_seconds,
+        )
         return
 
     final_output = os.path.join(project_dir, f"{slug}.mp4")
@@ -1222,9 +2036,19 @@ def run_segmented_pipeline(
     # Check if concat is already done from a previous run
     if resumed and state and is_stage_done(state, "concat") and os.path.isfile(final_output):
         timings.append(("Concat", "skipped", 0.0))
-        mark_project_complete(project_dir)
+        _record_project_complete()
+        runtime_metrics["planner_api_calls"] = planning_tokens["api_calls"]
+        total_elapsed_seconds = time.perf_counter() - overall_start
         token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, verification_tokens, tts_api_calls)
-        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=token_summary)
+        _save_pipeline_summary(
+            timings,
+            project_dir,
+            concept,
+            tool_call_counts=tool_call_counts,
+            token_summary=token_summary,
+            runtime_metrics=runtime_metrics,
+            total_elapsed_seconds=total_elapsed_seconds,
+        )
         yield {
             "stage": "concat",
             "status": "Skipping (already completed) — final video exists",
@@ -1242,14 +2066,10 @@ def run_segmented_pipeline(
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
             "total_tool_calls": sum(tool_call_counts.values()),
             "token_summary": token_summary,
+            "runtime_metrics": runtime_metrics,
+            "total_elapsed_seconds": total_elapsed_seconds,
             "project_consistency": project_consistency,
-            "segment_quality": {
-                sid: {
-                    "repair_attempted": segment_results.get(sid, {}).get("repair_attempted", False),
-                    "final_accepted_critique_score": segment_results.get(sid, {}).get("final_accepted_critique_score"),
-                }
-                for sid in segment_results
-            },
+            "segment_quality": _segment_quality_summary(),
         }
         return
 
@@ -1267,8 +2087,8 @@ def run_segmented_pipeline(
 
     if concat_result and concat_result.get("success"):
         timings.append(("Concat", "ok", concat_elapsed))
-        mark_stage_done(project_dir, "concat", artifacts=[final_output])
-        mark_project_complete(project_dir)
+        _record_stage_done("concat", artifacts=[final_output])
+        _record_project_complete()
 
         # ── Step 5.5: Generate subtitles ──────────────────────────────
         srt_path = None
@@ -1300,8 +2120,18 @@ def run_segmented_pipeline(
             except Exception as exc:
                 yield {"stage": "subtitles", "status": f"Subtitle generation failed: {exc}"}
 
+        runtime_metrics["planner_api_calls"] = planning_tokens["api_calls"]
+        total_elapsed_seconds = time.perf_counter() - overall_start
         token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, verification_tokens, tts_api_calls)
-        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=token_summary)
+        _save_pipeline_summary(
+            timings,
+            project_dir,
+            concept,
+            tool_call_counts=tool_call_counts,
+            token_summary=token_summary,
+            runtime_metrics=runtime_metrics,
+            total_elapsed_seconds=total_elapsed_seconds,
+        )
         yield {
             "stage": "done",
             "status": "Pipeline complete!",
@@ -1315,20 +2145,26 @@ def run_segmented_pipeline(
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
             "total_tool_calls": sum(tool_call_counts.values()),
             "token_summary": token_summary,
+            "runtime_metrics": runtime_metrics,
+            "total_elapsed_seconds": total_elapsed_seconds,
             "project_consistency": project_consistency,
-            "segment_quality": {
-                sid: {
-                    "repair_attempted": segment_results.get(sid, {}).get("repair_attempted", False),
-                    "final_accepted_critique_score": segment_results.get(sid, {}).get("final_accepted_critique_score"),
-                }
-                for sid in segment_results
-            },
+            "segment_quality": _segment_quality_summary(),
         }
     else:
         err = concat_result.get("error", "unknown") if concat_result else "unknown"
         timings.append(("Concat", "failed", concat_elapsed))
+        runtime_metrics["planner_api_calls"] = planning_tokens["api_calls"]
+        total_elapsed_seconds = time.perf_counter() - overall_start
         token_summary = _build_token_summary(pipeline_tokens, planning_tokens, coding_tokens, verification_tokens, tts_api_calls)
-        _save_pipeline_summary(timings, project_dir, concept, tool_call_counts=tool_call_counts, token_summary=token_summary)
+        _save_pipeline_summary(
+            timings,
+            project_dir,
+            concept,
+            tool_call_counts=tool_call_counts,
+            token_summary=token_summary,
+            runtime_metrics=runtime_metrics,
+            total_elapsed_seconds=total_elapsed_seconds,
+        )
         # If concat fails but we have segments, return the first one
         yield {
             "stage": "done",
@@ -1343,12 +2179,8 @@ def run_segmented_pipeline(
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
             "total_tool_calls": sum(tool_call_counts.values()),
             "token_summary": token_summary,
+            "runtime_metrics": runtime_metrics,
+            "total_elapsed_seconds": total_elapsed_seconds,
             "project_consistency": project_consistency,
-            "segment_quality": {
-                sid: {
-                    "repair_attempted": segment_results.get(sid, {}).get("repair_attempted", False),
-                    "final_accepted_critique_score": segment_results.get(sid, {}).get("final_accepted_critique_score"),
-                }
-                for sid in segment_results
-            },
+            "segment_quality": _segment_quality_summary(),
         }

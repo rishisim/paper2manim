@@ -68,9 +68,12 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
     audio_duration = _probe_duration(audio_path)
     duration_tolerance = 0.15
 
+    stitch_mode = "copy"
+    copy_trim_fast_path = False
     if video_duration and audio_duration:
         delta = audio_duration - video_duration
         if delta > duration_tolerance:
+            stitch_mode = "pad"
             yield {
                 "status": (
                     f"Padding final video frame by {delta:.2f}s to keep visuals aligned "
@@ -102,7 +105,36 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
                 "+faststart",
                 output_path,
             ]
+        elif -delta > duration_tolerance and -delta <= 1.0:
+            copy_trim_fast_path = True
+            yield {
+                "status": (
+                    f"Ending the segment at the narration boundary with stream copy "
+                    f"({-delta:.2f}s video overshoot)..."
+                )
+            }
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
         elif -delta > duration_tolerance:
+            stitch_mode = "trim"
             yield {
                 "status": (
                     f"Trimming trailing video tail by {-delta:.2f}s so the segment ends "
@@ -177,14 +209,59 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
                 "output_path": output_path,
                 "error": None,
                 "command": " ".join(cmd),
+                "stitch_mode": stitch_mode,
+                "copy_trim_fast_path": copy_trim_fast_path,
             }
             return
+        if copy_trim_fast_path and audio_duration:
+            yield {"status": "Stream-copy trim failed; falling back to re-encoded trim..."}
+            stitch_mode = "trim"
+            copy_trim_fast_path = False
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-t",
+                f"{audio_duration:.3f}",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=_size_based_timeout([video_path, audio_path]))
+            if result.returncode == 0:
+                yield {
+                    "final": True,
+                    "success": True,
+                    "output_path": output_path,
+                    "error": None,
+                    "command": " ".join(cmd),
+                    "stitch_mode": stitch_mode,
+                    "copy_trim_fast_path": copy_trim_fast_path,
+                }
+                return
         yield {
             "final": True,
             "success": False,
             "output_path": None,
             "error": result.stderr or result.stdout,
             "command": " ".join(cmd),
+            "stitch_mode": stitch_mode,
+            "copy_trim_fast_path": copy_trim_fast_path,
         }
     except subprocess.TimeoutExpired as exc:
         logger.error("ffmpeg stitch timed out: %s", exc)
@@ -194,6 +271,8 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
             "output_path": None,
             "error": str(exc),
             "command": " ".join(cmd),
+            "stitch_mode": stitch_mode,
+            "copy_trim_fast_path": copy_trim_fast_path,
         }
     except OSError as exc:
         logger.error("ffmpeg stitch failed: %s", exc)
@@ -203,6 +282,8 @@ def stitch_video_and_audio(video_path: str, audio_path: str, output_path: str) -
             "output_path": None,
             "error": str(exc),
             "command": " ".join(cmd),
+            "stitch_mode": stitch_mode,
+            "copy_trim_fast_path": copy_trim_fast_path,
         }
 
 
@@ -247,6 +328,45 @@ def concatenate_segments(
         return
 
     try:
+        # Fast path: try direct concat first. In the common case all segment
+        # outputs already share the same codec/profile because they came from
+        # the same Manim + stitch pipeline, so a remux is much faster than
+        # normalizing every segment.
+        with tempfile.TemporaryDirectory() as fast_dir:
+            fast_list_path = os.path.join(fast_dir, "concat_list.txt")
+            with open(fast_list_path, "w") as f:
+                for p in segment_video_paths:
+                    escaped = p.replace("'", "'\\''")
+                    f.write(f"file '{escaped}'\n")
+
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            fast_cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", fast_list_path,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                output_path,
+            ]
+            yield {"status": "Trying fast concat without segment normalization..."}
+            fast_result = subprocess.run(
+                fast_cmd,
+                capture_output=True,
+                text=True,
+                timeout=_size_based_timeout(segment_video_paths),
+            )
+            if fast_result.returncode == 0:
+                yield {
+                    "final": True,
+                    "success": True,
+                    "output_path": output_path,
+                    "error": None,
+                }
+                return
+
+            logger.info("Fast concat failed, falling back to normalization: %s", fast_result.stderr or fast_result.stdout)
+
         # First, re-encode all segments to a consistent format to avoid
         # concat issues from different resolutions/codecs/frame-rates
         with tempfile.TemporaryDirectory() as temp_dir:

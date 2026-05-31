@@ -10,6 +10,7 @@ import { App } from './App.js';
 import { runPrintMode } from './lib/printMode.js';
 import { loadSettings, flagsToSettingsOverrides } from './lib/settings.js';
 import { createSession, loadSession, getMostRecentSession } from './lib/session.js';
+import { installTerminalSafetyHooks } from './lib/terminalSafety.js';
 
 const cli = meow(
   `
@@ -175,6 +176,7 @@ if (cli.flags.settings) {
 }
 
 const settings = loadSettings({ ...flagOverrides, ...extraSettingsOverrides });
+installTerminalSafetyHooks();
 
 // ── Bootstrap session ─────────────────────────────────────────────────────────
 

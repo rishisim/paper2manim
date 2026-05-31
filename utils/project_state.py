@@ -69,18 +69,31 @@ def save_project(output_dir: str, state: dict[str, Any]) -> None:
     os.replace(tmp_path, state_path)
 
 
-def mark_stage_done(output_dir: str, stage_name: str, artifacts: list[str] = None) -> dict[str, Any]:
-    """Marks a specific stage as completed and saves the state."""
-    state = load_project(output_dir)
-    if not state:
+def _resolve_state(output_dir: str, state: dict[str, Any] | None = None) -> dict[str, Any]:
+    resolved = state if state is not None else load_project(output_dir)
+    if not resolved:
         raise ValueError(f"No project state found in {output_dir}")
+    return resolved
 
-    state["stages"][stage_name] = {
+
+def mark_stage_done(
+    output_dir: str,
+    stage_name: str,
+    artifacts: list[str] | None = None,
+    *,
+    state: dict[str, Any] | None = None,
+    persist: bool = True,
+) -> dict[str, Any]:
+    """Marks a specific stage as completed and optionally saves the state."""
+    resolved = _resolve_state(output_dir, state)
+
+    resolved["stages"][stage_name] = {
         "done": True,
         "artifacts": artifacts or []
     }
-    save_project(output_dir, state)
-    return state
+    if persist:
+        save_project(output_dir, resolved)
+    return resolved
 
 
 # ── Per-segment stage tracking ────────────────────────────────────────
@@ -92,31 +105,36 @@ def mark_segment_stage(
     done: bool = True,
     artifacts: list[str] | None = None,
     error: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    *,
+    state: dict[str, Any] | None = None,
+    persist: bool = True,
 ) -> dict[str, Any]:
     """Mark a per-segment stage (tts, code, render, stitch) as done/failed.
 
     State structure:
         ``state["segments"]["1"]["tts"] = {"done": True, "artifacts": [...]}``
     """
-    state = load_project(output_dir)
-    if not state:
-        raise ValueError(f"No project state found in {output_dir}")
+    resolved = _resolve_state(output_dir, state)
 
     seg_key = str(segment_id)
-    if "segments" not in state:
-        state["segments"] = {}
-    if seg_key not in state["segments"]:
-        state["segments"][seg_key] = {}
+    if "segments" not in resolved:
+        resolved["segments"] = {}
+    if seg_key not in resolved["segments"]:
+        resolved["segments"][seg_key] = {}
 
     entry: dict[str, Any] = {"done": done}
     if artifacts:
         entry["artifacts"] = artifacts
     if error:
         entry["error"] = error
+    if metadata:
+        entry.update(metadata)
 
-    state["segments"][seg_key][stage] = entry
-    save_project(output_dir, state)
-    return state
+    resolved["segments"][seg_key][stage] = entry
+    if persist:
+        save_project(output_dir, resolved)
+    return resolved
 
 
 def is_segment_stage_done(state: dict[str, Any], segment_id: int, stage: str) -> bool:
@@ -139,14 +157,18 @@ def get_segment_progress(state: dict[str, Any]) -> dict[str, dict]:
         }
     return result
 
-def mark_project_complete(output_dir: str) -> dict[str, Any]:
-    state = load_project(output_dir)
-    if not state:
-        raise ValueError(f"No project state found in {output_dir}")
+def mark_project_complete(
+    output_dir: str,
+    *,
+    state: dict[str, Any] | None = None,
+    persist: bool = True,
+) -> dict[str, Any]:
+    resolved = _resolve_state(output_dir, state)
 
-    state["status"] = "completed"
-    save_project(output_dir, state)
-    return state
+    resolved["status"] = "completed"
+    if persist:
+        save_project(output_dir, resolved)
+    return resolved
 
 def is_stage_done(state: dict[str, Any], stage_name: str) -> bool:
     """Checks if a stage is marked as done in the state."""
@@ -331,4 +353,3 @@ def delete_project(output_dir: str) -> bool:
             logger.warning("Failed to delete project %s: %s", output_dir, e)
             return False
     return False
-

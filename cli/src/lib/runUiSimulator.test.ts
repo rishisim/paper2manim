@@ -36,7 +36,6 @@ describe('runUiSimulator scenarios', () => {
     expect(state.rows.every(r => r.kindLabel.length <= 1)).toBe(true);
     expect(state.footer.showSegments).toBe(true);
     expect(state.footer.showTokens).toBe(false);
-    expect(state.footer.showBranch).toBe(false);
     expect(state.progressBar).toHaveLength(10);
     expect(state.progressPct).toBe(40);
   });
@@ -59,7 +58,6 @@ describe('runUiSimulator scenarios', () => {
     expect(state.activityMaxLines).toBe(5);
     expect(state.rows[0]?.count).toBeGreaterThanOrEqual(2);
     expect(state.rows.some(r => r.kindLabel === 'tool')).toBe(true);
-    expect(state.footer.showStagePct).toBe(true);
     expect(state.footer.showProgress).toBe(true);
     expect(state.progressBar).toHaveLength(14);
   });
@@ -87,7 +85,6 @@ describe('runUiSimulator scenarios', () => {
     });
     expect(state.activityMaxLines).toBe(6);
     expect(state.footer.showTokens).toBe(false);
-    expect(state.footer.showBranch).toBe(false);
     expect(state.segments[0]?.hint).toContain('Missing audio asset');
     expect(state.progressBar).toHaveLength(20);
   });
